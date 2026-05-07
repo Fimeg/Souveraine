@@ -1,0 +1,50 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Debug
+gdb.txt
+*.log
+
+# Environment
+.env
+.env.local
+
+# Build artifacts
+*.o
+*.so
+*.dylib
+*.dll
+*.rlib
+*.rmeta
+
+# Test
+*.profraw
+lcov.info
+
+# Temporary files
+*.tmp
+*.temp
+
+# Local development
+local.toml
+config.local.toml
+
+# Memory repos (should be external)
+.memer/
+**/.memer/
+
+# Web assets (if present)
+web/dist/

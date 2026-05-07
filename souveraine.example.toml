@@ -1,0 +1,69 @@
+# Souveraine Configuration
+# Everything is modular — enable/disable components as needed
+
+# === BIFROST INFERENCE ===
+[bifrost]
+# Bifrost is the OpenAI-compatible API gateway
+base_url = "http://10.10.20.120:3360"
+api_key = "sk-bf-ae0d5801-9936-4fa9-ac9e-e956ffce6cfa"
+virtual_key = ""  # x-bf-vk header if required by provider
+
+# Default model for conversation
+primary_model = "fireworks/accounts/fireworks/routers/kimi-k2p5-turbo"
+
+# Per-model configuration
+[bifrost.models.deepseek-v4-pro]
+context_limit = 128000
+output_limit = 8192
+archivist_threshold = 0.7
+
+[bifrost.models.kimi-k2p5-turbo]
+context_limit = 128000
+output_limit = 8192
+archivist_threshold = 0.7
+
+# === SUBCONSCIOUS (Inner Voice) ===
+[subconscious]
+n1_enabled = true
+n1_trigger = "EveryResponse"  # EveryResponse, EveryNResponses(5), TimeBased(60), Manual
+inbox_enabled = true
+
+# === REFLECTION (N+25 Deep Witness) ===
+[reflection]
+enabled = true
+message_interval = 25
+# Compaction trigger: "off", "step-count", or "compaction-event"
+trigger = "step-count"
+
+# === ARCHIVIST (N+100 Memory Compression) ===
+[archivist]
+enabled = true
+interval = 100
+threshold = 0.7
+# Can differ from conversation model
+compression_model = "auto"
+
+# === SUBAGENT (Fork/Spawn) ===
+[subagent]
+enabled = true
+max_concurrent = 3
+timeout = 300
+
+# === MEMORY ===
+[memory]
+git_enabled = true
+auto_commit = true
+base_path = "~/.pi/unified"
+
+# === WEBSOCKET SERVER ===
+[websocket]
+enabled = false
+port = 7373
+
+# === SENSORIUM ===
+[sensorium]
+primary_bandwidth = "high"
+
+[sensorium.discovery]
+low_urgency_only = true
+minimal_presence_mode = "breathing_color"

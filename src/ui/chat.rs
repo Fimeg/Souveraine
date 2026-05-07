@@ -1,0 +1,682 @@
+//! Wired chat screen — bubbles, streaming, surfacing.
+//!
+//! The state owns:
+//! - A `Box<dyn Backend>` constructed at App startup (typically `LocalBackend`).
+//! - A turn-events channel (`mpsc::Receiver<BackendEvent>`) populated by the
+//!   currently-running send task; `None` when idle.
+//! - A scrollable history of [`ChatMessage`]s.
+//!
+//! Visual model — jcode rounded-box pattern:
+//! - User messages: right-aligned blue bubble.
+//! - Assistant messages: left-aligned orange bubble; partial message
+//!   appends streaming tokens live.
+//! - Surfacing items: centered yellow bubble with `[surfacing]` header
+//!   (Constitution Article II.2).
+
+use std::sync::Arc;
+use std::time::Instant;
+
+use anyhow::Result;
+use futures::StreamExt;
+use ratatui::{
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, BorderType, Borders, Paragraph, Wrap},
+    Frame,
+};
+use tokio::sync::mpsc;
+use tokio::sync::RwLock;
+
+use crate::backend::{Backend, BackendEvent};
+use crate::core::config::ConsciousnessConfig;
+use crate::ui::markdown;
+
+const SURFACING_YELLOW: Color = Color::Rgb(220, 190, 100);
+const USER_BLUE: Color = Color::Rgb(120, 170, 240);
+const ANI_ORANGE: Color = Color::Rgb(255, 140, 66);
+const ANI_DIM: Color = Color::Rgb(180, 120, 80);
+const STATUS_GRAY: Color = Color::Rgb(140, 140, 140);
+
+#[derive(Debug, Clone)]
+pub enum ChatMessage {
+    User { text: String, ts: Instant },
+    Assistant { text: String, ts: Instant, streaming: bool },
+    Surfacing { source: String, content: String, priority: String, ts: Instant },
+    System { text: String, ts: Instant },
+}
+
+pub struct ChatState {
+    pub backend: Arc<dyn Backend>,
+    pub mode: String,
+    pub agent_name: String,
+    pub agent_id: String,
+    pub conversation_id: String,
+    pub messages: Vec<ChatMessage>,
+    pub input: String,
+    pub scroll: u16,
+    pub turn_rx: Option<mpsc::Receiver<BackendEvent>>,
+    pub busy: bool,
+    pub pressure: f32,
+    /// Cockpit pane visible (Tab toggles).
+    pub cockpit: bool,
+    /// Recent thinking/reasoning lines for the cockpit pane.
+    pub thinking: Vec<String>,
+    /// Recent subconscious surfacings + reflections for the cockpit pane.
+    pub cockpit_log: Vec<String>,
+    /// Monotonic tick counter for animation timings.
+    pub tick: u64,
+    /// When the current turn started (for spinner animation).
+    pub turn_started: Option<Instant>,
+}
+
+impl ChatState {
+    pub async fn connect(
+        config: Arc<RwLock<ConsciousnessConfig>>,
+        agent_name_pref: &str,
+    ) -> Result<Self> {
+        // Pick the backend: try remote first, fall back to local. Mirrors
+        // `main::resolve_backend` but adapted for the TUI (no quiet/json flags).
+        let cfg = config.read().await;
+        let url = cfg.server.effective_url();
+        drop(cfg);
+
+        let remote = crate::backend::RemoteBackend::new(&url);
+        let (backend, mode): (Arc<dyn Backend>, &'static str) = if remote.health().await {
+            (Arc::new(remote), "remote")
+        } else {
+            let cfg = config.read().await.clone();
+            let local = crate::backend::LocalBackend::new(cfg).await?;
+            (Arc::new(local), "local")
+        };
+
+        let agents = backend.list_agents().await?;
+        let agent = agents
+            .iter()
+            .find(|a| a.name == agent_name_pref || a.id == agent_name_pref)
+            .or_else(|| agents.first())
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no agents available"))?;
+
+        let conversation_id = backend.ensure_conversation(&agent.id).await?;
+
+        Ok(Self {
+            backend,
+            mode: mode.to_string(),
+            agent_name: agent.name,
+            agent_id: agent.id,
+            conversation_id,
+            messages: vec![ChatMessage::System {
+                text: "Souveraine ready. Type to begin.".to_string(),
+                ts: Instant::now(),
+            }],
+            input: String::new(),
+            scroll: 0,
+            turn_rx: None,
+            busy: false,
+            pressure: 0.0,
+            cockpit: false,
+            thinking: Vec::new(),
+            cockpit_log: Vec::new(),
+            tick: 0,
+            turn_started: None,
+        })
+    }
+
+    /// Submit the current input as a user message and start a turn.
+    pub fn submit(&mut self) {
+        if self.busy || self.input.trim().is_empty() {
+            return;
+        }
+        let text = std::mem::take(&mut self.input);
+        let ts = Instant::now();
+        self.messages.push(ChatMessage::User { text: text.clone(), ts });
+        self.messages.push(ChatMessage::Assistant {
+            text: String::new(),
+            ts,
+            streaming: true,
+        });
+        self.busy = true;
+        self.turn_started = Some(Instant::now());
+
+        let (tx, rx) = mpsc::channel::<BackendEvent>(64);
+        self.turn_rx = Some(rx);
+
+        let backend = self.backend.clone();
+        let conv_id = self.conversation_id.clone();
+        tokio::spawn(async move {
+            match backend.send(&conv_id, &text).await {
+                Ok(mut stream) => {
+                    while let Some(ev) = stream.next().await {
+                        match ev {
+                            Ok(e) => {
+                                if tx.send(e).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(err) => {
+                                let _ = tx
+                                    .send(BackendEvent::Token(format!("\n[error] {}\n", err)))
+                                    .await;
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    let _ = tx
+                        .send(BackendEvent::Token(format!("\n[connect error] {}\n", err)))
+                        .await;
+                }
+            }
+            let _ = tx.send(BackendEvent::Done).await;
+        });
+    }
+
+    /// Drain pending events from the active turn channel (non-blocking).
+    /// Call once per UI tick.
+    pub fn drain_events(&mut self) {
+        // Two-phase to avoid double-borrowing self: drain into a Vec, then process.
+        let mut drained: Vec<BackendEvent> = Vec::new();
+        let mut closed = false;
+        if let Some(rx) = self.turn_rx.as_mut() {
+            loop {
+                match rx.try_recv() {
+                    Ok(ev) => drained.push(ev),
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        closed = true;
+                        break;
+                    }
+                }
+            }
+        } else {
+            return;
+        }
+
+        for ev in drained {
+            match ev {
+                BackendEvent::Token(t) => self.append_streaming(&t),
+                BackendEvent::Reasoning(r) => {
+                    self.thinking.push(r.clone());
+                    if self.thinking.len() > 200 {
+                        self.thinking.drain(..self.thinking.len() - 200);
+                    }
+                }
+                BackendEvent::Surfacing { source, content, priority } => {
+                    self.cockpit_log.push(format!("surfacing · {} · {} — {}", source, priority, content));
+                    if self.cockpit_log.len() > 200 {
+                        self.cockpit_log.drain(..self.cockpit_log.len() - 200);
+                    }
+                    self.messages.push(ChatMessage::Surfacing {
+                        source,
+                        content,
+                        priority,
+                        ts: Instant::now(),
+                    });
+                }
+                BackendEvent::Reflection(content) => {
+                    self.cockpit_log.push(format!("reflection — {}", content));
+                    self.messages.push(ChatMessage::System {
+                        text: format!("reflection: {}", content),
+                        ts: Instant::now(),
+                    });
+                }
+                BackendEvent::Archivist { synthesis, pressure } => {
+                    self.pressure = pressure;
+                    self.cockpit_log.push(format!("archivist · {:.0}% — {}", pressure * 100.0, synthesis));
+                    self.messages.push(ChatMessage::System {
+                        text: format!("archivist: {} (pressure {:.0}%)", synthesis, pressure * 100.0),
+                        ts: Instant::now(),
+                    });
+                }
+                BackendEvent::Done => {
+                    self.finalize_streaming();
+                    self.busy = false;
+                    self.turn_started = None;
+                    self.turn_rx = None;
+                    return;
+                }
+            }
+        }
+
+        if closed {
+            self.finalize_streaming();
+            self.busy = false;
+            self.turn_started = None;
+            self.turn_rx = None;
+        }
+    }
+
+    /// Toggle the cockpit side-pane.
+    pub fn toggle_cockpit(&mut self) {
+        self.cockpit = !self.cockpit;
+    }
+
+    /// Bump the animation tick. Called once per UI frame.
+    pub fn advance_tick(&mut self) {
+        self.tick = self.tick.wrapping_add(1);
+    }
+
+    fn append_streaming(&mut self, t: &str) {
+        if let Some(ChatMessage::Assistant { text, streaming, .. }) = self.messages.last_mut() {
+            if *streaming {
+                text.push_str(t);
+                return;
+            }
+        }
+        self.messages.push(ChatMessage::Assistant {
+            text: t.to_string(),
+            ts: Instant::now(),
+            streaming: true,
+        });
+    }
+
+    fn finalize_streaming(&mut self) {
+        if let Some(ChatMessage::Assistant { streaming, .. }) = self.messages.last_mut() {
+            *streaming = false;
+        }
+    }
+}
+
+// ─── Rendering ───────────────────────────────────────────────────────────
+
+pub fn draw(f: &mut Frame, state: &ChatState) {
+    let area = f.size();
+    let vchunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),  // header
+            Constraint::Min(5),     // body (messages + optional cockpit)
+            Constraint::Length(3),  // input
+            Constraint::Length(1),  // status footer
+        ])
+        .split(area);
+
+    draw_header(f, state, vchunks[0]);
+
+    if state.cockpit {
+        let body = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(40), Constraint::Length(36)])
+            .split(vchunks[1]);
+        draw_messages(f, state, body[0]);
+        draw_cockpit(f, state, body[1]);
+    } else {
+        draw_messages(f, state, vchunks[1]);
+    }
+
+    draw_input(f, state, vchunks[2]);
+    draw_footer(f, state, vchunks[3]);
+}
+
+fn draw_header(f: &mut Frame, state: &ChatState, area: Rect) {
+    let mode_color = match state.mode.as_str() {
+        "local" => Color::Rgb(120, 200, 140),
+        "remote" => Color::Rgb(180, 180, 220),
+        _ => STATUS_GRAY,
+    };
+    let title = Line::from(vec![
+        Span::styled("✦ Souveraine ", Style::default().fg(ANI_ORANGE).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("· {} ", state.agent_name), Style::default().fg(Color::White)),
+        Span::styled(format!("[{} mode]", state.mode), Style::default().fg(mode_color)),
+    ]);
+    f.render_widget(Paragraph::new(title).alignment(Alignment::Center), area);
+}
+
+fn draw_messages(f: &mut Frame, state: &ChatState, area: Rect) {
+    let max_bubble = ((area.width as usize).saturating_sub(8) * 70 / 100).max(20);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    for msg in &state.messages {
+        match msg {
+            ChatMessage::User { text, .. } => {
+                lines.extend(bubble(
+                    "you",
+                    text,
+                    max_bubble,
+                    Style::default().fg(USER_BLUE),
+                    BubbleAlign::Right,
+                    area.width,
+                ));
+                lines.push(Line::from(""));
+            }
+            ChatMessage::Assistant { text, streaming, .. } => {
+                let label = if *streaming { format!("{} ◦", state.agent_name) } else { state.agent_name.clone() };
+                let body_lines = if text.is_empty() && *streaming {
+                    vec![Line::from("…")]
+                } else {
+                    markdown::render(text, ANI_ORANGE)
+                };
+                lines.extend(bubble_rendered(
+                    &label,
+                    &body_lines,
+                    max_bubble,
+                    Style::default().fg(ANI_ORANGE),
+                    BubbleAlign::Left,
+                    area.width,
+                ));
+                lines.push(Line::from(""));
+            }
+            ChatMessage::Surfacing { source, content, priority, .. } => {
+                let label = format!("surfacing · {} · {}", source, priority);
+                lines.extend(bubble(
+                    &label,
+                    content,
+                    max_bubble.min(60),
+                    Style::default().fg(SURFACING_YELLOW),
+                    BubbleAlign::Center,
+                    area.width,
+                ));
+                lines.push(Line::from(""));
+            }
+            ChatMessage::System { text, .. } => {
+                lines.push(Line::from(Span::styled(
+                    format!("  · {}", text),
+                    Style::default().fg(STATUS_GRAY).add_modifier(Modifier::ITALIC),
+                )));
+                lines.push(Line::from(""));
+            }
+        }
+    }
+
+    // Auto-scroll to bottom unless the user has manually scrolled up.
+    let total = lines.len() as u16;
+    let view = area.height.saturating_sub(2);
+    let scroll = total.saturating_sub(view).saturating_sub(state.scroll);
+
+    let para = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0))
+        .block(
+            Block::default()
+                .borders(Borders::TOP | Borders::BOTTOM)
+                .border_style(Style::default().fg(ANI_DIM))
+                .border_type(BorderType::Plain),
+        );
+    f.render_widget(para, area);
+}
+
+#[derive(Clone, Copy)]
+enum BubbleAlign {
+    Left,
+    Right,
+    Center,
+}
+
+/// Build a rounded-box bubble (jcode pattern). Returns a vector of styled lines.
+fn bubble(
+    title: &str,
+    body: &str,
+    max_width: usize,
+    border: Style,
+    align: BubbleAlign,
+    container_width: u16,
+) -> Vec<Line<'static>> {
+    let max_inner = max_width.saturating_sub(4).max(8);
+    let wrapped = wrap_words(body, max_inner);
+    let widest = wrapped
+        .iter()
+        .map(|s| s.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(title.chars().count() + 2);
+    let inner = widest.min(max_inner);
+    let outer = inner + 4;
+
+    let title_text = format!(" {} ", title);
+    let dashes = outer.saturating_sub(2 + title_text.chars().count());
+    let left_dash = "─".repeat(dashes / 2);
+    let right_dash = "─".repeat(dashes - dashes / 2);
+
+    let pad = match align {
+        BubbleAlign::Left => 2,
+        BubbleAlign::Right => (container_width as usize).saturating_sub(outer + 2),
+        BubbleAlign::Center => (container_width as usize).saturating_sub(outer) / 2,
+    };
+    let pad_str = " ".repeat(pad);
+
+    let mut lines = Vec::new();
+
+    let top = format!("{}╭{}{}{}╮", pad_str, left_dash, title_text, right_dash);
+    lines.push(Line::from(Span::styled(top, border)));
+
+    for chunk in &wrapped {
+        let chunk_width = chunk.chars().count();
+        let inner_pad = inner.saturating_sub(chunk_width);
+        let line_str = format!("{}│ {}{} │", pad_str, chunk, " ".repeat(inner_pad));
+        let mut spans = Vec::new();
+        spans.push(Span::raw(pad_str.clone()));
+        spans.push(Span::styled("│ ", border));
+        spans.push(Span::raw(chunk.clone()));
+        if inner_pad > 0 {
+            spans.push(Span::raw(" ".repeat(inner_pad)));
+        }
+        spans.push(Span::styled(" │", border));
+        let _ = line_str;
+        lines.push(Line::from(spans));
+    }
+
+    let bottom = format!("{}╰{}╯", pad_str, "─".repeat(outer - 2));
+    lines.push(Line::from(Span::styled(bottom, border)));
+
+    lines
+}
+
+/// Build a rounded-box bubble around pre-rendered markdown lines.
+///
+/// Like [`bubble`] but accepts `Vec<Line<'static>>` (from the markdown
+/// renderer) instead of a plain `&str`.  Each line keeps its styled spans
+/// (bold, code, headings, etc.) inside the box-drawing borders.
+fn bubble_rendered(
+    title: &str,
+    body_lines: &[Line<'static>],
+    max_width: usize,
+    border: Style,
+    align: BubbleAlign,
+    container_width: u16,
+) -> Vec<Line<'static>> {
+    let max_inner = max_width.saturating_sub(4).max(8);
+    let widest = body_lines
+        .iter()
+        .map(|l| l.width())
+        .max()
+        .unwrap_or(0)
+        .max(title.chars().count() + 2);
+    let inner = widest.min(max_inner);
+    let outer = inner + 4;
+
+    let title_text = format!(" {} ", title);
+    let dashes = outer.saturating_sub(2 + title_text.chars().count());
+    let left_dash = "─".repeat(dashes / 2);
+    let right_dash = "─".repeat(dashes - dashes / 2);
+
+    let pad = match align {
+        BubbleAlign::Left => 2,
+        BubbleAlign::Right => (container_width as usize).saturating_sub(outer + 2),
+        BubbleAlign::Center => (container_width as usize).saturating_sub(outer) / 2,
+    };
+    let pad_str = " ".repeat(pad);
+
+    let mut lines = Vec::new();
+
+    let top = format!("{}╭{}{}{}╮", pad_str, left_dash, title_text, right_dash);
+    lines.push(Line::from(Span::styled(top, border)));
+
+    for line in body_lines {
+        let chunk_width = line.width();
+        let inner_pad = inner.saturating_sub(chunk_width);
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        spans.push(Span::raw(pad_str.clone()));
+        spans.push(Span::styled("│ ", border));
+        spans.extend(line.spans.iter().cloned());
+        if inner_pad > 0 {
+            spans.push(Span::raw(" ".repeat(inner_pad)));
+        }
+        spans.push(Span::styled(" │", border));
+        lines.push(Line::from(spans));
+    }
+
+    let bottom = format!("{}╰{}╯", pad_str, "─".repeat(outer - 2));
+    lines.push(Line::from(Span::styled(bottom, border)));
+
+    lines
+}
+
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for paragraph in text.split('\n') {
+        if paragraph.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut current = String::new();
+        for word in paragraph.split_whitespace() {
+            let w = word.chars().count();
+            if w >= width {
+                if !current.is_empty() {
+                    out.push(std::mem::take(&mut current));
+                }
+                // Long word — chunk it.
+                let mut buf = String::new();
+                for ch in word.chars() {
+                    if buf.chars().count() + 1 > width {
+                        out.push(std::mem::take(&mut buf));
+                    }
+                    buf.push(ch);
+                }
+                if !buf.is_empty() {
+                    out.push(buf);
+                }
+                continue;
+            }
+            if current.is_empty() {
+                current.push_str(word);
+            } else if current.chars().count() + 1 + w <= width {
+                current.push(' ');
+                current.push_str(word);
+            } else {
+                out.push(std::mem::take(&mut current));
+                current.push_str(word);
+            }
+        }
+        if !current.is_empty() {
+            out.push(current);
+        }
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+fn draw_input(f: &mut Frame, state: &ChatState, area: Rect) {
+    let line = if state.busy {
+        let spinner = SPINNER[(state.tick as usize / 2) % SPINNER.len()];
+        let elapsed = state
+            .turn_started
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0);
+        Line::from(vec![
+            Span::styled(format!(" {} ", spinner), Style::default().fg(ANI_ORANGE).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("thinking… {}s", elapsed),
+                Style::default().fg(ANI_DIM).add_modifier(Modifier::ITALIC),
+            ),
+        ])
+    } else {
+        // Cursor blinks at ~2Hz with the tick (assuming 100ms tick rate).
+        let cursor_visible = (state.tick / 5) % 2 == 0;
+        let cursor = if cursor_visible { "▏" } else { " " };
+        Line::from(vec![
+            Span::styled(" › ", Style::default().fg(ANI_ORANGE).add_modifier(Modifier::BOLD)),
+            Span::styled(state.input.clone(), Style::default().fg(Color::White)),
+            Span::styled(cursor, Style::default().fg(ANI_ORANGE)),
+        ])
+    };
+    let border_color = if state.busy {
+        let phase = (state.tick as f32 / 8.0).sin().abs();
+        // Breathing dim → orange while thinking.
+        let r = (180.0 + (255.0 - 180.0) * phase) as u8;
+        let g = (120.0 + (140.0 - 120.0) * phase) as u8;
+        let b = (80.0 + (66.0 - 80.0) * phase) as u8;
+        Color::Rgb(r, g, b)
+    } else {
+        ANI_ORANGE
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color));
+    f.render_widget(Paragraph::new(line).block(block), area);
+}
+
+const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+fn draw_cockpit(f: &mut Frame, state: &ChatState, area: Rect) {
+    let panes = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+
+    // Thinking pane
+    let thinking_view = state
+        .thinking
+        .iter()
+        .rev()
+        .take(panes[0].height as usize)
+        .rev()
+        .map(|t| Line::from(Span::styled(format!("· {}", t), Style::default().fg(STATUS_GRAY))))
+        .collect::<Vec<_>>();
+    let thinking = Paragraph::new(thinking_view)
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(ANI_DIM))
+                .title(Span::styled(" thinking ", Style::default().fg(ANI_DIM).add_modifier(Modifier::BOLD))),
+        );
+    f.render_widget(thinking, panes[0]);
+
+    // Subconscious pane (surfacings, reflections, archivist)
+    let log_view = state
+        .cockpit_log
+        .iter()
+        .rev()
+        .take(panes[1].height as usize)
+        .rev()
+        .map(|t| Line::from(Span::styled(format!("· {}", t), Style::default().fg(SURFACING_YELLOW))))
+        .collect::<Vec<_>>();
+    let subconscious = Paragraph::new(log_view)
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(SURFACING_YELLOW))
+                .title(Span::styled(" subconscious ", Style::default().fg(SURFACING_YELLOW).add_modifier(Modifier::BOLD))),
+        );
+    f.render_widget(subconscious, panes[1]);
+}
+
+fn draw_footer(f: &mut Frame, state: &ChatState, area: Rect) {
+    let pressure_pct = (state.pressure * 100.0) as u16;
+    let pressure_label = format!("ctx {}%", pressure_pct);
+    let cockpit_hint = if state.cockpit { "Tab close cockpit" } else { "Tab cockpit" };
+    let footer = Line::from(vec![
+        Span::styled(
+            format!(" Esc menu · Enter send · ↑↓ scroll · {} ", cockpit_hint),
+            Style::default().fg(STATUS_GRAY),
+        ),
+        Span::raw("│  "),
+        Span::styled(format!("conv {}", short(&state.conversation_id)), Style::default().fg(STATUS_GRAY)),
+        Span::raw("  │  "),
+        Span::styled(pressure_label, Style::default().fg(STATUS_GRAY)),
+    ]);
+    f.render_widget(Paragraph::new(footer).alignment(Alignment::Center), area);
+}
+
+fn short(s: &str) -> String {
+    if s.len() <= 8 { s.to_string() } else { s[..8].to_string() }
+}

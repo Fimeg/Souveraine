@@ -1,0 +1,125 @@
+use crate::bridge::BifrostClient;
+use crate::core::config::ConsciousnessConfig;
+use crate::server::gitea_memory::GiteaMemory;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+pub mod agent_inventory;
+pub mod consciousness_engine;
+pub mod conversation;
+pub mod db;
+pub mod gitea_client;
+pub mod gitea_memory;
+pub mod session_manager;
+
+pub use agent_inventory::AgentInventory;
+pub use consciousness_engine::{ConsciousnessEngine, ConsciousnessEvent};
+pub use session_manager::SessionManager;
+
+// Server-side memory backend (Send-safe, HTTP-only via Gitea API).
+// The richer consciousness layer (PersonaRouter / SubconsciousN1 / Archivist)
+// is rebuilt in Stage 5 against the `Memory` trait from `crates/memory`.
+pub type ServerMemory = GiteaMemory;
+
+#[derive(Clone)]
+pub struct SouveraineServer {
+    pub agents: Arc<AgentInventory>,
+    pub sessions: Arc<SessionManager>,
+    pub consciousness: Arc<ConsciousnessEngine>,
+    pub bifrost: Arc<BifrostClient>,
+    pub config: Arc<RwLock<ServerConfig>>,
+    pub data_dir: PathBuf,
+    pub memory: Option<Arc<ServerMemory>>,
+    pub app_config: Arc<RwLock<ConsciousnessConfig>>,
+}
+
+pub struct ServerConfig {
+    pub bind: String,
+    pub port: u16,
+    pub data_dir: PathBuf,
+    pub gitea_url: Option<String>,
+}
+
+impl SouveraineServer {
+    pub async fn new(config: ConsciousnessConfig) -> anyhow::Result<Self> {
+        let data_dir = dirs::home_dir()
+            .unwrap()
+            .join(".souveraine")
+            .join("server");
+
+        tokio::fs::create_dir_all(&data_dir).await?;
+        tokio::fs::create_dir_all(data_dir.join("agents")).await?;
+
+        let db_path = data_dir.join("database.sqlite3");
+        let db = db::init_database(&db_path).await?;
+
+        let agents_dir = data_dir.join("agents");
+        let agents = Arc::new(AgentInventory::new(agents_dir, db).await?);
+        let sessions = Arc::new(SessionManager::new());
+
+        let consciousness = Arc::new(ConsciousnessEngine::new(
+            agents.clone(),
+            sessions.clone(),
+        ));
+
+        let bifrost = Arc::new(BifrostClient::new(
+            &config.bifrost.base_url,
+            &config.bifrost.api_key,
+            &config.bifrost.virtual_key,
+            &config.bifrost.primary_model,
+        ));
+
+        // Gitea-backed memory is opt-in for the server: it requires a reachable
+        // Gitea instance + token. If those aren't configured, the server still
+        // runs (agent CRUD, sessions, conversation pass-through) without memfs.
+        let memory = match ServerMemory::new(Arc::new(RwLock::new(config.clone()))).await {
+            Ok(m) => Some(Arc::new(m)),
+            Err(e) => {
+                tracing::warn!("Gitea memory disabled: {}", e);
+                None
+            }
+        };
+
+        let server_config = ServerConfig {
+            bind: config.server.bind.clone(),
+            port: config.server.port,
+            data_dir: data_dir.clone(),
+            gitea_url: std::env::var("SOUVERAINE_GITEA_URL").ok(),
+        };
+
+        Ok(Self {
+            agents,
+            sessions,
+            consciousness,
+            bifrost,
+            config: Arc::new(RwLock::new(server_config)),
+            data_dir,
+            memory,
+            app_config: Arc::new(RwLock::new(config)),
+        })
+    }
+
+    pub async fn run(&self) -> anyhow::Result<()> {
+        let this = self.clone();
+        let app = crate::api::create_routes(Arc::new(this))
+            .layer(tower_http::cors::CorsLayer::permissive());
+
+        let config = self.config.read().await;
+        let addr = format!("{}:{}", config.bind, config.port);
+        drop(config);
+
+        println!("Souveraine server listening on http://{}", addr);
+
+        let listener = tokio::net::TcpListener::bind(&addr).await?;
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await?;
+
+        Ok(())
+    }
+}
+
+pub use conversation::{ServerConversation, ServerTurnResult};
