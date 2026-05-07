@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info};
 
+use crate::bridge::bifrost::BifrostClient;
 use crate::core::config::{ModelConfig, TaskType};
 
 /// Context pressure — how full the context window is
@@ -78,6 +79,9 @@ pub struct ModelRouter {
     configs: HashMap<String, ModelConfig>,
     current_usage: Arc<RwLock<TokenUsage>>,
     token_counter: TokenCounter,
+    bifrost_client: Option<BifrostClient>,
+    bifrost_models: Vec<String>,
+    selected_model: String,
 }
 
 impl ModelRouter {
@@ -94,7 +98,20 @@ impl ModelRouter {
             configs,
             current_usage: Arc::new(RwLock::new(TokenUsage::default())),
             token_counter: TokenCounter::new(),
+            bifrost_client: None,
+            bifrost_models: Vec::new(),
+            selected_model: String::new(),
         }
+    }
+
+    /// Create a ModelRouter with Bifrost client for dynamic model discovery
+    pub fn with_bifrost(
+        configs: HashMap<String, ModelConfig>,
+        bifrost_client: BifrostClient,
+    ) -> Self {
+        let mut router = Self::new(configs);
+        router.bifrost_client = Some(bifrost_client);
+        router
     }
 
     /// Count tokens in text using real tiktoken
@@ -184,6 +201,84 @@ impl ModelRouter {
         providers.dedup();
         providers
     }
+
+    /// Fetch models from Bifrost dynamically
+    pub async fn fetch_bifrost_models(&mut self) -> anyhow::Result<Vec<String>> {
+        if let Some(client) = &self.bifrost_client {
+            match client.list_models().await {
+                Ok(models) => {
+                    self.bifrost_models = models.clone();
+                    info!("🌐 Fetched {} models from Bifrost ", models.len());
+                    Ok(models)
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to fetch models from Bifrost: {}", e);
+                    Ok(vec![])
+                }
+            }
+        } else {
+            Ok(vec![])
+        }
+    }
+
+    /// Get all models (Bifrost-discovered + configured)
+    pub fn all_models(&self) -> Vec<String> {
+        let mut models = self.bifrost_models.clone();
+        for name in self.configs.keys() {
+            if !models.contains(name) {
+                models.push(name.clone());
+            }
+        }
+        models
+    }
+
+    /// Set the selected model
+    pub fn set_model(&mut self, name: &str) -> anyhow::Result<()> {
+        if !self.all_models().contains(&name.to_string()) {
+            anyhow::bail!("Model '{}' not found. Available: {:?}", name, self.all_models());
+        }
+        self.selected_model = name.to_string();
+        info!("🎯 Selected model: {}", name);
+        Ok(())
+    }
+
+    /// Get current selected model
+    pub fn current_model(&self) -> &str {
+        if self.selected_model.is_empty() {
+            // Return first configured model or empty string
+            self.configs.keys().next().map(|s| s.as_str()).unwrap_or("")
+        } else {
+            &self.selected_model
+        }
+    }
+
+    /// Check if model is from Bifrost
+    pub fn is_bifrost_model(&self, name: &str) -> bool {
+        self.bifrost_models.contains(&name.to_string())
+    }
+
+    /// Get model info for display
+    pub fn model_info(&self, name: &str) -> Option<ModelInfo> {
+        self.configs.get(name).map(|cfg| ModelInfo {
+            name: name.to_string(),
+            provider: cfg.provider.clone(),
+            context_limit: cfg.context_limit,
+            output_limit: cfg.output_limit,
+            preferred_for: cfg.preferred_for.clone(),
+            from_bifrost: self.is_bifrost_model(name),
+        })
+    }
+}
+
+/// Model information for display
+#[derive(Debug, Clone)]
+pub struct ModelInfo {
+    pub name: String,
+    pub provider: String,
+    pub context_limit: usize,
+    pub output_limit: usize,
+    pub preferred_for: Vec<TaskType>,
+    pub from_bifrost: bool,
 }
 
 #[cfg(test)]

@@ -6,6 +6,7 @@ use tracing::{info, warn, debug};
 mod api;
 mod backend;
 mod bridge;
+mod cli;
 mod core;
 mod harness;
 mod interface;
@@ -23,7 +24,9 @@ const CONFIG_TEMPLATE: &str = r##"# Souveraine — The world where your agents l
 [bifrost]
 base_url = "http://10.10.20.120:3360"
 primary_model = "kimi-k2.5-turbo"
+# Bearer token for auth (env: BIFROST_KEY)
 api_key = ""
+# Virtual key for x-bf-vk header, required by some providers (env: BIFROST_VIRTUAL_KEY)
 virtual_key = ""
 
 [server]
@@ -141,9 +144,21 @@ enum Commands {
     #[command(long_about = "Show every configured agent — who they are, which model they speak through, what triggers know them.")]
     Agents,
 
-    /// List the voices available through Bifrost
-    #[command(long_about = "Query Bifrost for every model it can reach. Each is a possible voice the being can speak through.")]
-    Models,
+    /// List or set models
+    #[command(long_about = "List all available models from Bifrost and configured models. Or set a specific model as primary.")]
+    Model {
+        /// Model name to set as primary (omit to list all models)
+        #[arg(short, long)]
+        model: Option<String>,
+        
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+        
+        /// Verbose output
+        #[arg(short, long)]
+        verbose: bool,
+    },
 
     /// Show the world's current state
     #[command(long_about = "Display Souveraine's running configuration and the state of every subsystem.")]
@@ -212,7 +227,9 @@ async fn main() -> anyhow::Result<()> {
         Commands::Tui => run_tui(config.clone(), cli.agent.clone()).await?,
         Commands::Chat { message } => run_chat(config, cli.agent, message.clone(), cli.json, cli.quiet, cli.local).await?,
         Commands::Agents => run_agents(config, cli.json, cli.local).await?,
-        Commands::Models => run_models(config, cli.json).await?,
+        Commands::Model { model, json, verbose } => {
+            cli::run_model_command(model.as_deref(), *json, *verbose).await?
+        }
         Commands::Status => run_status(config, cli.json).await?,
         Commands::Server { bind, port } => run_server(bind.clone(), *port, config).await?,
         Commands::Init | Commands::Completions { .. } => unreachable!(),
@@ -425,40 +442,6 @@ async fn run_agents(
     Ok(())
 }
 
-async fn run_models(config: Arc<RwLock<ConsciousnessConfig>>, json: bool) -> anyhow::Result<()> {
-    let cfg = config.read().await;
-    let bifrost = bridge::BifrostClient::new(
-        &cfg.bifrost.base_url,
-        &cfg.bifrost.api_key,
-        &cfg.bifrost.virtual_key,
-        &cfg.bifrost.primary_model,
-    );
-    drop(cfg);
-
-    match bifrost.list_models().await {
-        Ok(models) => {
-            if json {
-                println!("{}", serde_json::to_string_pretty(&serde_json::json!({"models": models}))?);
-            } else {
-                println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-                println!("  Voices ({} available)", models.len());
-                println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-                for m in models {
-                    println!("  {}", m);
-                }
-                println!();
-            }
-        }
-        Err(e) => {
-            if json {
-                println!(r#"{{"error":"{}"}}"#, e.to_string().replace('"', r#"\""#));
-            } else {
-                eprintln!("Failed to fetch models: {}", e);
-            }
-        }
-    }
-    Ok(())
-}
 
 async fn run_status(config: Arc<RwLock<ConsciousnessConfig>>, json: bool) -> anyhow::Result<()> {
     let cfg = config.read().await;

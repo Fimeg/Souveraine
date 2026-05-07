@@ -121,7 +121,7 @@ pub struct BifrostConfig {
     pub api_key: String,
 
     /// Virtual key for x-bf-vk header (required by some providers)
-    #[serde(default)]
+    #[serde(default = "default_bifrost_virtual_key")]
     pub virtual_key: String,
 
     /// Default model for conversation
@@ -148,7 +148,7 @@ impl Default for BifrostConfig {
         Self {
             base_url: default_bifrost_url(),
             api_key: default_bifrost_key(),
-            virtual_key: String::new(),
+            virtual_key: default_bifrost_virtual_key(),
             primary_model: default_primary_model(),
             models: HashMap::new(),
         }
@@ -479,6 +479,10 @@ fn default_server_port() -> u16 { 8484 }
 fn default_server_url() -> String { "http://127.0.0.1:8484".to_string() }
 fn default_bifrost_key() -> String {
     std::env::var("BIFROST_KEY").unwrap_or_else(|_| "sk-bf-ae0d5801-9936-4fa9-ac9e-e956ffce6cfa".to_string())
+}
+
+fn default_bifrost_virtual_key() -> String {
+    std::env::var("BIFROST_VIRTUAL_KEY").unwrap_or_else(|_| String::new())
 }
 fn default_primary_model() -> String { "fireworks/accounts/fireworks/routers/kimi-k2p5-turbo".to_string() }
 fn default_bandwidth_high() -> BandwidthClass { BandwidthClass::High }
