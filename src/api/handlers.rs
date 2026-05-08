@@ -253,16 +253,32 @@ async fn handle_conversation_stream(
             let events = server.consciousness.on_response(&*session, &content).await?;
             drop(session);
             
+            // Inject surfacing events back into the session as system messages
+            // so the agent sees them in its context window on the next turn.
+            for event in &events {
+                if let crate::server::ConsciousnessEvent::Surfacing { source, content, priority } = event {
+                    let msg = crate::core::session::ConversationMessage {
+                        role: crate::core::session::MessageRole::System,
+                        blocks: vec![crate::core::session::ContentBlock::Text {
+                            text: format!("[surfacing: {}] {} — {}", source, content, priority),
+                        }],
+                        usage: None,
+                        timestamp: None,
+                    };
+                    let _ = server.sessions.add_message(&conversation_id, msg);
+                }
+            }
+
             for event in events {
-                let stream_event = match event {
+                let stream_event = match &event {
                     crate::server::ConsciousnessEvent::Surfacing { source, content, priority } => {
-                        StreamEvent::Surfacing { source: source.to_string(), content, priority: priority.to_string() }
+                        StreamEvent::Surfacing { source: source.clone(), content: content.clone(), priority: priority.clone() }
                     }
                     crate::server::ConsciousnessEvent::Reflection { content } => {
-                        StreamEvent::Reflection { content }
+                        StreamEvent::Reflection { content: content.clone() }
                     }
                     crate::server::ConsciousnessEvent::Archivist { synthesis, pressure } => {
-                        StreamEvent::Archivist { synthesis, pressure }
+                        StreamEvent::Archivist { synthesis: synthesis.clone(), pressure: *pressure }
                     }
                 };
                 let _ = tx.send(stream_event).await;

@@ -34,10 +34,18 @@ pub struct LlmConfig {
     pub context_window: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+    /// Maximum tool-calling rounds before forcing a text response.
+    /// Configurable per-agent; 0 disables tools entirely.
+    #[serde(default = "default_max_tool_rounds")]
+    pub max_tool_rounds: u32,
 }
 
 fn default_context_window() -> u32 {
     128000
+}
+
+fn default_max_tool_rounds() -> u32 {
+    10
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

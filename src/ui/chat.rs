@@ -25,10 +25,10 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Paragraph, Wrap},
     Frame,
 };
-use tokio::sync::mpsc;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, oneshot, RwLock};
 
 use crate::backend::{Backend, BackendEvent};
+use crate::bridge::bifrost::BifrostClient;
 use crate::core::config::ConsciousnessConfig;
 use crate::ui::markdown;
 
@@ -68,6 +68,8 @@ pub struct ChatState {
     pub tick: u64,
     /// When the current turn started (for spinner animation).
     pub turn_started: Option<Instant>,
+    /// Receiver for `/model` listing results from async Bifrost call.
+    pub model_rx: Option<oneshot::Receiver<String>>,
 }
 
 impl ChatState {
@@ -120,15 +122,45 @@ impl ChatState {
             cockpit_log: Vec::new(),
             tick: 0,
             turn_started: None,
+            model_rx: None,
         })
     }
 
-    /// Submit the current input as a user message and start a turn.
-    pub fn submit(&mut self) {
+    const HELP_TEXT: &'static str = "Available commands:
+  /help              Show this help
+  /clear             Clear chat history
+  /model             List available models
+  /model <name>      Set the active model
+  !<command>         Run a shell command (Linux/macOS)
+
+Use Tab to toggle the cockpit pane.";
+
+    /// Submit the current input. Returns `true` if the input was handled
+    /// (slash command, bang command, or sent to backend).
+    pub fn submit(&mut self) -> bool {
         if self.busy || self.input.trim().is_empty() {
-            return;
+            return false;
         }
-        let text = std::mem::take(&mut self.input);
+
+        let trimmed = self.input.trim().to_string();
+        self.input.clear();
+
+        // Slash commands
+        if trimmed.starts_with('/') {
+            return self.handle_slash_command(&trimmed);
+        }
+
+        // Bang commands: !<cmd>
+        if trimmed.starts_with('!') {
+            let cmd = trimmed[1..].trim();
+            if !cmd.is_empty() {
+                self.handle_bang_command(cmd);
+            }
+            return true;
+        }
+
+        // Normal chat message
+        let text = trimmed;
         let ts = Instant::now();
         self.messages.push(ChatMessage::User { text: text.clone(), ts });
         self.messages.push(ChatMessage::Assistant {
@@ -171,11 +203,165 @@ impl ChatState {
             }
             let _ = tx.send(BackendEvent::Done).await;
         });
+        true
+    }
+
+    fn handle_slash_command(&mut self, input: &str) -> bool {
+        let trimmed = input.trim();
+
+        if trimmed == "/help" {
+            self.system_message(Self::HELP_TEXT.to_string());
+            return true;
+        }
+
+        if trimmed == "/clear" {
+            self.messages.clear();
+            self.system_message("Chat cleared.".to_string());
+            return true;
+        }
+
+        if trimmed.starts_with("/model") {
+            return self.handle_model_command(trimmed);
+        }
+
+        // Unknown command
+        let cmd = trimmed.split_whitespace().next().unwrap_or(trimmed);
+        self.system_message(format!(
+            "Unknown command: {}\nType /help for available commands.",
+            cmd
+        ));
+        true
+    }
+
+    fn handle_model_command(&mut self, input: &str) -> bool {
+        let rest = input.strip_prefix("/model").unwrap_or("").trim();
+
+        // /model <name> — set model (synchronous, fast)
+        if !rest.is_empty() && !rest.starts_with('-') {
+            let model_name = rest.to_string();
+            let cfg_path = std::env::current_dir()
+                .map(|d| d.join("souveraine.toml"))
+                .unwrap_or_else(|_| std::path::PathBuf::from("souveraine.toml"));
+
+            match ConsciousnessConfig::load(&cfg_path) {
+                Ok(mut cfg) => {
+                    cfg.bifrost.primary_model = model_name.clone();
+                    match cfg.save(&cfg_path) {
+                        Ok(()) => self.system_message(format!("Set model to: {}", model_name)),
+                        Err(e) => self.error_message(format!("Failed to save config: {}", e)),
+                    }
+                }
+                Err(e) => self.error_message(format!("Failed to load config: {}", e)),
+            }
+            return true;
+        }
+
+        // /model — list models (async, uses oneshot to get result back)
+        self.system_message("Fetching models from Bifrost…".to_string());
+
+        let cfg_path = std::env::current_dir()
+            .map(|d| d.join("souveraine.toml"))
+            .unwrap_or_else(|_| std::path::PathBuf::from("souveraine.toml"));
+
+        let (tx, rx) = oneshot::channel();
+        self.model_rx = Some(rx);
+
+        tokio::spawn(async move {
+            let result = match ConsciousnessConfig::load(&cfg_path) {
+                Ok(cfg) => {
+                    let bifrost = BifrostClient::new(
+                        &cfg.bifrost.base_url,
+                        &cfg.bifrost.api_key,
+                        &cfg.bifrost.virtual_key,
+                        &cfg.bifrost.primary_model,
+                    );
+                    let bifrost_models = bifrost.list_models().await.unwrap_or_default();
+                    let mut all_models = bifrost_models.clone();
+                    for name in cfg.models.keys() {
+                        if !all_models.contains(name) {
+                            all_models.push(name.clone());
+                        }
+                    }
+                    let mut text = format!(
+                        "Selected: {}\nAvailable ({}):\n",
+                        cfg.bifrost.primary_model,
+                        all_models.len()
+                    );
+                    for m in &all_models {
+                        let marker = if bifrost_models.contains(&m) { "⚡" } else { "⚙" };
+                        text.push_str(&format!("  {} {}\n", marker, m));
+                    }
+                    text
+                }
+                Err(e) => format!("✕ Failed to load config: {}", e),
+            };
+            let _ = tx.send(result);
+        });
+
+        true
+    }
+
+    fn handle_bang_command(&mut self, cmd: &str) {
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(cmd)
+            .output();
+
+        match output {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let mut result = String::new();
+                if !stdout.is_empty() {
+                    result.push_str(stdout.trim());
+                }
+                if !stderr.is_empty() {
+                    if !result.is_empty() {
+                        result.push('\n');
+                    }
+                    result.push_str(stderr.trim());
+                }
+                if result.is_empty() {
+                    result = format!("[exit code {}]", out.status.code().unwrap_or(-1));
+                }
+                self.system_message(format!("$ {}\n{}", cmd, result));
+            }
+            Err(e) => {
+                self.error_message(format!("Shell command failed: {}", e));
+            }
+        }
+    }
+
+    /// Push a system message for display (from slash commands, etc.)
+    pub fn system_message(&mut self, text: String) {
+        self.messages.push(ChatMessage::System {
+            text,
+            ts: Instant::now(),
+        });
+    }
+
+    /// Push an error message for display
+    pub fn error_message(&mut self, text: String) {
+        self.messages.push(ChatMessage::System {
+            text: format!("✕ {}", text),
+            ts: Instant::now(),
+        });
     }
 
     /// Drain pending events from the active turn channel (non-blocking).
     /// Call once per UI tick.
     pub fn drain_events(&mut self) {
+        // Check for /model listing result
+        if let Some(rx) = self.model_rx.as_mut() {
+            if let Ok(result) = rx.try_recv() {
+                self.messages.push(ChatMessage::System {
+                    text: result,
+                    ts: Instant::now(),
+                });
+                self.model_rx = None;
+            }
+        }
+
         // Two-phase to avoid double-borrowing self: drain into a Vec, then process.
         let mut drained: Vec<BackendEvent> = Vec::new();
         let mut closed = false;
@@ -666,7 +852,7 @@ fn draw_footer(f: &mut Frame, state: &ChatState, area: Rect) {
     let cockpit_hint = if state.cockpit { "Tab close cockpit" } else { "Tab cockpit" };
     let footer = Line::from(vec![
         Span::styled(
-            format!(" Esc menu · Enter send · ↑↓ scroll · {} ", cockpit_hint),
+            format!(" Esc menu · Enter send · ↑↓ scroll · !cmd bash · {} ", cockpit_hint),
             Style::default().fg(STATUS_GRAY),
         ),
         Span::raw("│  "),

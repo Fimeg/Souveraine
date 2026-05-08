@@ -102,7 +102,7 @@ async fn run_turn(
 ) -> Result<()> {
     // Snapshot history for the Bifrost call, then drop the dashmap ref before
     // any await — `Ref` is not Send across awaits.
-    let (agent_id, messages) = {
+    let (agent_id, initial_messages) = {
         let session = server
             .sessions
             .get(&conversation_id)
@@ -136,34 +136,124 @@ async fn run_turn(
     };
 
     let agent = server.agents.get(&agent_id).await?;
+    let max_rounds = agent.llm_config.max_tool_rounds;
+    let model = agent.llm_config.model.clone();
+    let temperature = agent.llm_config.temperature;
 
-    let req = ChatCompletionRequest {
-        model: agent.llm_config.model.clone(),
-        messages,
-        stream: Some(false),
-        max_tokens: None,
-        temperature: agent.llm_config.temperature,
-        tools: None,
-    };
+    // Build bifrost-format tool definitions from the core tool set
+    let core_tools = crate::core::tools::tool_definitions();
+    let bifrost_tools: Vec<crate::bridge::bifrost::ToolDefinition> = core_tools
+        .iter()
+        .map(|t| crate::bridge::bifrost::ToolDefinition {
+            tool_type: "function".to_string(),
+            function: crate::bridge::bifrost::ToolFunction {
+                name: t.name.clone(),
+                description: t.description.clone(),
+                parameters: t.input_schema.clone(),
+            },
+        })
+        .collect();
 
-    let response = server.bifrost.chat_completion(req).await?;
-    let content = response.content.clone();
+    // ── Tool-calling loop ─────────────────────────────────────
+    let mut messages = initial_messages;
+    let mut tool_round = 0u32;
+    let final_content: String;
 
-    // Mirror the server's chunked streaming so the CLI/TUI sees progressive
-    // tokens (the underlying call is non-streaming today; replace once Bifrost
-    // SSE lands).
-    let chars: Vec<char> = content.chars().collect();
-    for chunk in chars.chunks(10) {
-        let s: String = chunk.iter().collect();
-        if tx.send(Ok(BackendEvent::Token(s))).await.is_err() {
-            return Ok(());
+    loop {
+        let req = ChatCompletionRequest {
+            model: model.clone(),
+            messages: messages.clone(),
+            stream: Some(false),
+            max_tokens: None,
+            temperature,
+            tools: if max_rounds > 0 {
+                Some(bifrost_tools.clone())
+            } else {
+                None
+            },
+        };
+
+        let response = server.bifrost.chat_completion(req).await?;
+
+        if response.tool_calls.is_empty() || tool_round >= max_rounds {
+            // Text response (or hit max rounds) — this is the final output
+            final_content = response.content.clone();
+
+            // If we hit max rounds with pending tool calls, add a note
+            if !response.tool_calls.is_empty() && tool_round >= max_rounds {
+                let note =
+                    "\n\n[Max tool rounds reached — continuing with text response]";
+                let _ = tx.send(Ok(BackendEvent::Token(note.to_string()))).await;
+            }
+
+            // Stream the final content in chunks
+            let chars: Vec<char> = final_content.chars().collect();
+            for chunk in chars.chunks(10) {
+                let s: String = chunk.iter().collect();
+                if tx.send(Ok(BackendEvent::Token(s))).await.is_err() {
+                    return Ok(());
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+            }
+            break;
         }
-        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+
+        tool_round += 1;
+
+        // Tell the UI we're executing tools
+        let tool_names: Vec<&str> =
+            response.tool_calls.iter().map(|tc| tc.name.as_str()).collect();
+        let announce = format!(
+            "\n🔧 Round {} — executing: {}\n",
+            tool_round,
+            tool_names.join(", ")
+        );
+        let _ = tx
+            .send(Ok(BackendEvent::Token(announce)))
+            .await;
+
+        // Add the assistant's tool-call message to the Bifrost conversation
+        let call_text = serde_json::json!({
+            "tool_calls": response.tool_calls.iter().map(|tc| {
+                serde_json::json!({"id": tc.id, "name": tc.name, "arguments": tc.arguments})
+            }).collect::<Vec<_>>()
+        }).to_string();
+        messages.push(BifrostMessage {
+            role: "assistant".to_string(),
+            content: call_text,
+        });
+
+        // Execute each tool and stream results back
+        for tc in &response.tool_calls {
+            let input_str = tc.arguments.to_string();
+            let result = crate::core::tools::execute_tool(&tc.name, &input_str).await;
+
+            let output = if result.is_error {
+                format!("Error: {}", result.output)
+            } else {
+                result.output
+            };
+
+            let status = if result.is_error { "❌" } else { "✅" };
+            let result_line = format!("{} **{}**: {} char(s)\n", status, tc.name, output.len());
+            let _ = tx
+                .send(Ok(BackendEvent::Token(result_line)))
+                .await;
+
+            // Add tool result to bifrost messages for next loop iteration
+            messages.push(BifrostMessage {
+                role: "tool".to_string(),
+                content: output,
+            });
+        }
+
+        // Continue loop — model will see tool results and respond
     }
 
+    // ── Post-turn processing (unchanged) ───────────────────────
     server.sessions.add_message(
         &conversation_id,
-        ConversationMessage::assistant_text(&content),
+        ConversationMessage::assistant_text(&final_content),
     )?;
 
     let events = {
@@ -171,20 +261,55 @@ async fn run_turn(
             .sessions
             .get(&conversation_id)
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", conversation_id))?;
-        server.consciousness.on_response(&*session, &content).await?
+        server
+            .consciousness
+            .on_response(&*session, &final_content)
+            .await?
     };
 
+    // Inject surfacing events back into the session as system messages
+    for event in &events {
+        if let ConsciousnessEvent::Surfacing {
+            source,
+            content,
+            priority,
+        } = event
+        {
+            let msg = crate::core::session::ConversationMessage {
+                role: crate::core::session::MessageRole::System,
+                blocks: vec![crate::core::session::ContentBlock::Text {
+                    text: format!(
+                        "[surfacing: {}] {} — {}",
+                        source, content, priority
+                    ),
+                }],
+                usage: None,
+                timestamp: None,
+            };
+            let _ = server.sessions.add_message(&conversation_id, msg);
+        }
+    }
+
     for event in events {
-        let be = match event {
-            ConsciousnessEvent::Surfacing { source, content, priority } => BackendEvent::Surfacing {
-                source: source.to_string(),
+        let be = match &event {
+            ConsciousnessEvent::Surfacing {
+                source,
                 content,
+                priority,
+            } => BackendEvent::Surfacing {
+                source: source.to_string(),
+                content: content.to_string(),
                 priority: priority.to_string(),
             },
-            ConsciousnessEvent::Reflection { content } => BackendEvent::Reflection(content),
-            ConsciousnessEvent::Archivist { synthesis, pressure } => BackendEvent::Archivist {
+            ConsciousnessEvent::Reflection { content } => {
+                BackendEvent::Reflection(content.clone())
+            }
+            ConsciousnessEvent::Archivist {
                 synthesis,
                 pressure,
+            } => BackendEvent::Archivist {
+                synthesis: synthesis.clone(),
+                pressure: *pressure,
             },
         };
         if tx.send(Ok(be)).await.is_err() {
@@ -193,7 +318,9 @@ async fn run_turn(
     }
 
     if let Some(mut session) = server.sessions.get_mut(&conversation_id) {
-        let pressure = server.consciousness.calculate_pressure(&session.messages);
+        let pressure = server
+            .consciousness
+            .calculate_pressure(&session.messages);
         session.context_pressure = pressure;
     }
 

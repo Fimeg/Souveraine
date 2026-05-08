@@ -160,10 +160,12 @@ impl MemoryRepo {
         let repo = git2::Repository::init(mem_path)
             .context("initializing git repository for memory")?;
 
-        // Set user config for commits
-        let mut config = repo.config().context("opening repo config")?;
-        config.set_str("user.name", &self.agent_id)?;
-        config.set_str("user.email", &format!("{}@souveraine.local", self.agent_id))?;
+        // Set user config for commits (scoped to drop before .await)
+        {
+            let mut config = repo.config().context("opening repo config")?;
+            config.set_str("user.name", &self.agent_id)?;
+            config.set_str("user.email", &format!("{}@souveraine.local", self.agent_id))?;
+        }
 
         // Write initial placeholder files with frontmatter
         let persona_content = render_frontmatter(
