@@ -9,6 +9,8 @@ use serde_json::Value as JsonValue;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::core::compact::CompactionEngine;
+
 /// What the agent receives when she acts through a sensor.
 ///
 /// Not a bare data return. A sensation — something she can feel
@@ -45,6 +47,8 @@ pub struct ToolContext {
     pub subagent_runner: Option<Arc<dyn SubagentRunner>>,
     /// Recursion depth for agent-to-agent delegation (0 = primary).
     pub subagent_depth: u32,
+    /// Host-side mechanism for context compaction.
+    pub compaction_engine: Option<Arc<dyn CompactionEngine>>,
 }
 
 impl Clone for ToolContext {
@@ -56,6 +60,7 @@ impl Clone for ToolContext {
             agent_id: self.agent_id.clone(),
             subagent_runner: self.subagent_runner.clone(),
             subagent_depth: self.subagent_depth,
+            compaction_engine: self.compaction_engine.clone(),
         }
     }
 }
@@ -69,6 +74,7 @@ impl std::fmt::Debug for ToolContext {
             .field("agent_id", &self.agent_id)
             .field("subagent_runner", &self.subagent_runner.as_ref().map(|_| "Some(...)"))
             .field("subagent_depth", &self.subagent_depth)
+            .field("compaction_engine", &self.compaction_engine.as_ref().map(|_| "Some(...)"))
             .finish()
     }
 }
@@ -82,6 +88,7 @@ impl ToolContext {
             agent_id: None,
             subagent_runner: None,
             subagent_depth: 0,
+            compaction_engine: None,
         }
     }
 
@@ -100,6 +107,7 @@ impl ToolContext {
             agent_id: Some(agent_id.into()),
             subagent_runner,
             subagent_depth: 0,
+            compaction_engine: None,
         }
     }
 

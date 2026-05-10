@@ -199,6 +199,9 @@ impl App {
                         BackendEvent::Archivist { synthesis, pressure } => {
                             self.scene.event_all(&TuiEvent::Archivist { synthesis, pressure });
                         }
+                        BackendEvent::CompactionWarning { pressure, tier } => {
+                            self.scene.event_all(&TuiEvent::CompactionWarning { pressure, tier });
+                        }
                         _ => {}
                     }
                 }

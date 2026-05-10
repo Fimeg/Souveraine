@@ -23,6 +23,7 @@
 //! immediately after the primary's turn.
 
 use crate::bridge::bifrost::{BifrostClient, ChatCompletionRequest, Message, ToolDefinition, ToolFunction};
+use crate::bridge::model_router::TokenCounter;
 use crate::core::session::ConversationMessage;
 use crate::core::subconscious::{InboxItem, SubconsciousInbox, Urgency};
 use crate::core::tools::defs::ToolContext;
@@ -41,6 +42,7 @@ pub struct ConsciousnessEngine {
     agents: Arc<AgentInventory>,
     _sessions: Arc<SessionManager>,
     bifrost: Arc<BifrostClient>,
+    counter: TokenCounter,
     /// Optional model override for the subconscious pass (e.g. "openai/glm-5.1").
     /// If None, uses the primary agent's model.
     subconscious_model: Option<String>,
@@ -53,6 +55,7 @@ pub enum ConsciousnessEvent {
     Surfacing { source: String, content: String, priority: String },
     Reflection { content: String },
     Archivist { synthesis: String, pressure: f32 },
+    CompactionWarning { pressure: f32, tier: u8 },
 }
 
 impl ConsciousnessEngine {
@@ -67,6 +70,7 @@ impl ConsciousnessEngine {
             agents,
             _sessions: sessions,
             bifrost,
+            counter: TokenCounter::new(),
             subconscious_model,
             max_tokens,
         }
@@ -93,6 +97,15 @@ impl ConsciousnessEngine {
                 synthesis: "Context compression triggered".to_string(),
                 pressure,
             });
+        }
+
+        // ── Three-tier compaction warning (advisory only, never force) ──
+        if pressure > 0.95 {
+            events.push(ConsciousnessEvent::CompactionWarning { pressure, tier: 3 });
+        } else if pressure > 0.90 {
+            events.push(ConsciousnessEvent::CompactionWarning { pressure, tier: 2 });
+        } else if pressure > 0.80 {
+            events.push(ConsciousnessEvent::CompactionWarning { pressure, tier: 1 });
         }
 
         // ── N+1 / subconscious surfacing (Aster) ────────────────────────
@@ -385,8 +398,8 @@ If nothing notable, respond with just: none"#;
                 crate::core::session::ContentBlock::Text { text } => Some(text.as_str()),
                 _ => None,
             })
-            .flat_map(|t| t.split_whitespace())
-            .count();
+            .map(|t| self.counter.count(t))
+            .sum();
         let limit = 128_000;
         (tokens as f32 / limit as f32).min(1.0)
     }

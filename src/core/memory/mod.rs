@@ -26,6 +26,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
+use crate::core::compact::CompactionStrategyKind;
 use crate::core::tools::defs::ToolContext;
 use crate::core::tools::ToolDefinition;
 
@@ -683,11 +684,28 @@ pub async fn execute_memory_command_with_context(
             Ok(out)
         }
         MemoryCommand::Compact { strategy } => {
-            let s = strategy.as_deref().unwrap_or("sliding-window");
-            Ok(format!(
-                "Compact requested (strategy: {}). Not yet implemented — see Stage 5/6.",
-                s
-            ))
+            let strategy_kind = strategy
+                .as_deref()
+                .and_then(CompactionStrategyKind::from_str)
+                .unwrap_or(CompactionStrategyKind::Cull);
+
+            match ctx.and_then(|c| c.compaction_engine.as_ref()) {
+                Some(engine) => {
+                    let report = engine
+                        .compact(&agent_id, Some(strategy_kind))
+                        .await?;
+                    Ok(report.to_string())
+                }
+                None => Ok(
+                    "I can compact my context window using one of these strategies:\n\
+                     - summary (LLM-summarize oldest messages)\n\
+                     - key-value (extract key facts to memory)\n\
+                     - quote (preserve important verbatim quotes)\n\
+                     - cull (drop greetings and acknowledgments)\n\n\
+                     Use: memory compact --strategy <strategy>"
+                        .to_string(),
+                ),
+            }
         }
         MemoryCommand::Delete { path } => {
             repo.delete(path).await?;
@@ -826,7 +844,7 @@ Paths are relative to my memory directory. Frontmatter description is required o
                 },
                 "strategy": {
                     "type": "string",
-                    "enum": ["sliding-window", "summarize", "prune-low-priority"],
+                    "enum": ["summary", "key-value", "key_value", "quote", "cull"],
                     "description": "Compaction strategy (for compact subcommand)"
                 }
             },

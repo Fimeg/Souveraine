@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::bridge::bifrost::{ChatCompletionRequest, Message as BifrostMessage};
+use crate::core::compact::CompactionEngine;
 use crate::core::config::ConsciousnessConfig;
 use crate::core::session::{ContentBlock, ConversationMessage, MessageRole};
 use crate::core::tools::defs::{SubagentParams, SubagentRunner, ToolContext};
@@ -368,6 +369,11 @@ async fn run_turn(
         env,
         subagent_runner,
     );
+    // Inject compaction engine from server (not part of for_agent API).
+    let tool_ctx = ToolContext {
+        compaction_engine: Some(server.compaction_engine.clone() as Arc<dyn CompactionEngine>),
+        ..tool_ctx
+    };
 
     // Build bifrost-format tool definitions from the core tool set
     let core_tools = crate::core::tools::tool_definitions().await;
@@ -542,6 +548,12 @@ async fn run_turn(
                 synthesis: synthesis.clone(),
                 pressure: *pressure,
             },
+            ConsciousnessEvent::CompactionWarning { pressure, tier } => {
+                BackendEvent::CompactionWarning {
+                    pressure: *pressure,
+                    tier: *tier,
+                }
+            }
         };
         if tx.send(Ok(be)).await.is_err() {
             return Ok(());

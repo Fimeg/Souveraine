@@ -88,6 +88,7 @@ impl Sensorium {
                 agent_id: None,
                 subagent_runner: None,
                 subagent_depth: 0,
+                compaction_engine: None,
             },
         }
     }

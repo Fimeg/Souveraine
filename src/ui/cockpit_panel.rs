@@ -21,6 +21,8 @@ use super::component::{Component, TuiEvent};
 const SURFACING_YELLOW: Color = Color::Rgb(220, 190, 100);
 const REFLECTION_CYAN: Color = Color::Rgb(100, 200, 220);
 const ARCHIVIST_MAGENTA: Color = Color::Rgb(200, 140, 220);
+const WARN_ORANGE: Color = Color::Rgb(255, 180, 80);
+const CRITICAL_RED: Color = Color::Rgb(220, 80, 80);
 
 /// A single entry in the cockpit log.
 #[derive(Debug, Clone)]
@@ -28,6 +30,7 @@ pub enum CockpitEntry {
     Surfacing { source: String, content: String, priority: String },
     Reflection { content: String },
     Archivist { synthesis: String, pressure: f32 },
+    CompactionWarning { pressure: f32, tier: u8 },
 }
 
 /// The cockpit panel — Aster's observations rendered to screen.
@@ -84,6 +87,16 @@ impl Component for CockpitPane {
                 }
                 true
             }
+            TuiEvent::CompactionWarning { pressure, tier } => {
+                self.entries.push_back(CockpitEntry::CompactionWarning {
+                    pressure: *pressure,
+                    tier: *tier,
+                });
+                if self.entries.len() > self.max_entries {
+                    self.entries.pop_front();
+                }
+                true
+            }
             _ => false,
         }
     }
@@ -127,6 +140,15 @@ impl Component for CockpitPane {
                             format!("{} (ctx {}%)", synthesis, pct),
                             Style::default().fg(ARCHIVIST_MAGENTA),
                         ),
+                    ]));
+                }
+                CockpitEntry::CompactionWarning { pressure, tier } => {
+                    let pct = (pressure * 100.0) as u16;
+                    let warn_color = match tier { 3 => CRITICAL_RED, 2 => Color::Rgb(255, 120, 50), _ => WARN_ORANGE };
+                    let label = match tier { 3 => "critical", 2 => "urgent", _ => "warn" };
+                    lines.push(Line::from(vec![
+                        Span::styled("⚠ ", Style::default().fg(warn_color).add_modifier(Modifier::BOLD)),
+                        Span::styled(format!("ctx {}% ({})", pct, label), Style::default().fg(warn_color)),
                     ]));
                 }
             }

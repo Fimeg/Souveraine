@@ -6,6 +6,7 @@
 // exposes the stubs that survived the cleanup.
 
 pub mod chain;
+pub mod compact;
 pub mod config;
 pub mod memory;
 pub mod reflection;

@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
+use crate::core::compact::CompactionConfig;
+
 /// Top-level config — mirrors souveraine.example.toml structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsciousnessConfig {
@@ -24,6 +26,10 @@ pub struct ConsciousnessConfig {
     /// Archivist (N+100 compression)
     #[serde(default)]
     pub archivist: ArchivistConfig,
+
+    /// In-session message compaction
+    #[serde(default)]
+    pub compaction: CompactionConfig,
 
     /// Subagent pool
     #[serde(default)]
@@ -476,6 +482,7 @@ impl Default for ConsciousnessConfig {
             subconscious: SubconsciousConfig::default(),
             reflection: ReflectionConfig::default(),
             archivist: ArchivistConfig::default(),
+            compaction: CompactionConfig::default(),
             subagent: SubagentConfig::default(),
             memory: MemoryConfig::default(),
             websocket: WebSocketConfig::default(),

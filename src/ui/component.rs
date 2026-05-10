@@ -63,6 +63,8 @@ pub enum TuiEvent {
     EnergyChanged(u8),
     /// Context pressure from the conversation engine.
     PressureChanged(f32),
+    /// Compaction pressure warning (advisory, 3-tier).
+    CompactionWarning { pressure: f32, tier: u8 },
     /// Backend connectivity status.
     BackendStatus { mode: String, healthy: bool },
 

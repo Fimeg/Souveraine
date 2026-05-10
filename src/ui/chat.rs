@@ -424,6 +424,16 @@ Use Tab to toggle the cockpit pane.";
                     });
                     self.pending_consciousness.push(BackendEvent::Archivist { synthesis, pressure });
                 }
+                BackendEvent::CompactionWarning { pressure, tier } => {
+                    self.pressure = pressure;
+                    let label = match tier { 3 => "critical", 2 => "urgent", _ => "warn" };
+                    self.cockpit_log.push(format!("compaction {label} · {:.0}%", pressure * 100.0));
+                    self.messages.push(ChatMessage::System {
+                        text: format!("context pressure {:.0}% ({label}) — consider `memory compact`", pressure * 100.0),
+                        ts: Instant::now(),
+                    });
+                    self.pending_consciousness.push(BackendEvent::CompactionWarning { pressure, tier });
+                }
                 BackendEvent::Done => {
                     self.finalize_streaming();
                     self.busy = false;

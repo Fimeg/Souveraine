@@ -280,6 +280,12 @@ async fn handle_conversation_stream(
                     crate::server::ConsciousnessEvent::Archivist { synthesis, pressure } => {
                         StreamEvent::Archivist { synthesis: synthesis.clone(), pressure: *pressure }
                     }
+                    crate::server::ConsciousnessEvent::CompactionWarning { pressure, tier } => {
+                        StreamEvent::Archivist {
+                            synthesis: format!("compaction warning tier {} at {:.0}%", tier, pressure * 100.0),
+                            pressure: *pressure,
+                        }
+                    }
                 };
                 let _ = tx.send(stream_event).await;
             }

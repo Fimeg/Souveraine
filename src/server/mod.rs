@@ -1,4 +1,5 @@
 use crate::bridge::BifrostClient;
+use crate::core::compact::{CompactionEngine, CompactionConfig, DefaultCompactionEngine, UtcClock};
 use crate::core::config::ConsciousnessConfig;
 use crate::server::gitea_memory::GiteaMemory;
 use std::path::PathBuf;
@@ -27,6 +28,7 @@ pub struct SouveraineServer {
     pub agents: Arc<AgentInventory>,
     pub sessions: Arc<SessionManager>,
     pub consciousness: Arc<ConsciousnessEngine>,
+    pub compaction_engine: Arc<dyn CompactionEngine>,
     pub bifrost: Arc<BifrostClient>,
     pub config: Arc<RwLock<ServerConfig>>,
     pub data_dir: PathBuf,
@@ -83,6 +85,49 @@ impl SouveraineServer {
             config.subconscious.max_tokens,
         ));
 
+        // Build compaction engine with closure-based session access
+        let comp_session = sessions.clone();
+        let comp_agents = agents.clone();
+        let app_cfg = Arc::new(RwLock::new(config.clone()));
+        let get_messages: Arc<dyn Fn(&str) -> Option<Vec<_>> + Send + Sync> = {
+            let s = comp_session.clone();
+            Arc::new(move |agent_id| {
+                let conv_ids = s.list_for_agent(agent_id);
+                let conv_id = conv_ids.last()?.clone();
+                s.get(&conv_id).map(|session| session.messages.clone())
+            })
+        };
+        let replace_messages: Arc<dyn Fn(&str, Vec<_>) -> anyhow::Result<()> + Send + Sync> = {
+            let s = comp_session.clone();
+            Arc::new(move |agent_id, messages| {
+                let conv_ids = s.list_for_agent(agent_id);
+                let conv_id = conv_ids.last()
+                    .ok_or_else(|| anyhow::anyhow!("No session for {}", agent_id))?;
+                let mut session = s.get_mut(&conv_id)
+                    .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
+                session.messages = messages;
+                Ok(())
+            })
+        };
+        let get_repo: Arc<dyn Fn(&str) -> Option<crate::core::memory::MemoryRepo> + Send + Sync> = {
+            let agents = comp_agents.clone();
+            Arc::new(move |id| Some(agents.memory_repo(id)))
+        };
+        let get_agent_type: Arc<dyn Fn(&str) -> Option<String> + Send + Sync> =
+            Arc::new(|_| Some("primary".to_string()));
+
+        let compaction_engine: Arc<dyn CompactionEngine> = Arc::new(DefaultCompactionEngine {
+            config: app_cfg,
+            counter: crate::bridge::model_router::TokenCounter::new(),
+            bifrost: Some((*bifrost).clone()),
+            model: config.subconscious.model.clone(),
+            clock: Arc::new(UtcClock),
+            get_messages,
+            replace_messages,
+            get_repo,
+            get_agent_type,
+        });
+
         // Gitea-backed memory is opt-in for the server: it requires a reachable
         // Gitea instance + token. If those aren't configured, the server still
         // runs (agent CRUD, sessions, conversation pass-through) without memfs.
@@ -105,6 +150,7 @@ impl SouveraineServer {
             agents,
             sessions,
             consciousness,
+            compaction_engine,
             bifrost,
             config: Arc::new(RwLock::new(server_config)),
             data_dir,

@@ -38,6 +38,8 @@ pub enum BackendEvent {
     Reflection(String),
     /// Archivist event (N+100 synthesis).
     Archivist { synthesis: String, pressure: f32 },
+    /// Compaction pressure warning (advisory only).
+    CompactionWarning { pressure: f32, tier: u8 },
     /// Stream ended cleanly.
     Done,
 }
