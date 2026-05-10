@@ -58,16 +58,18 @@ impl SouveraineServer {
         let agents = Arc::new(AgentInventory::new(agents_dir, db).await?);
         let sessions = Arc::new(SessionManager::new());
 
-        let consciousness = Arc::new(ConsciousnessEngine::new(
-            agents.clone(),
-            sessions.clone(),
-        ));
-
         let bifrost = Arc::new(BifrostClient::new(
             &config.bifrost.base_url,
             &config.bifrost.api_key,
             &config.bifrost.virtual_key,
             &config.bifrost.primary_model,
+        ));
+
+        let consciousness = Arc::new(ConsciousnessEngine::new(
+            agents.clone(),
+            sessions.clone(),
+            bifrost.clone(),
+            config.subconscious.model.clone(),
         ));
 
         // Gitea-backed memory is opt-in for the server: it requires a reachable

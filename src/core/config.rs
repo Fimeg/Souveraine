@@ -165,6 +165,10 @@ pub struct SubconsciousConfig {
     pub n1_trigger: N1Trigger,
     #[serde(default = "default_true")]
     pub inbox_enabled: bool,
+    /// Model handle for the subconscious pass (e.g. "openai/glm-5.1").
+    /// Defaults to None — uses the primary agent's model.
+    #[serde(default)]
+    pub model: Option<String>,
     /// Per-agent N+ interval overrides (e.g. Ani=N+1, Helper=N+5)
     #[serde(default)]
     pub per_agent_intervals: HashMap<String, AgentSubconsciousConfig>,
@@ -181,6 +185,7 @@ impl Default for SubconsciousConfig {
             n1_enabled: true,
             n1_trigger: N1Trigger::EveryResponse,
             inbox_enabled: true,
+            model: None,
             per_agent_intervals: HashMap::new(),
         }
     }
