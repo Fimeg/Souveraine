@@ -48,3 +48,4 @@ config.local.toml
 
 # Web assets (if present)
 web/dist/
+souveraine.log
