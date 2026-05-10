@@ -249,6 +249,18 @@ pub struct SubagentConfig {
     pub max_concurrent: usize,
     #[serde(default = "default_300")]
     pub timeout: u64,
+    /// Maximum nesting depth for spawned subagents.
+    #[serde(default = "default_3u32")]
+    pub max_depth: u32,
+    /// Maximum tool rounds per subagent turn.
+    #[serde(default = "default_25u32")]
+    pub max_tool_rounds: u32,
+    /// Fraction of max_tool_rounds at which first warning fires.
+    #[serde(default = "default_warning_1_threshold")]
+    pub warning_1_threshold: f32,
+    /// Fraction of max_tool_rounds at which second warning fires.
+    #[serde(default = "default_warning_2_threshold")]
+    pub warning_2_threshold: f32,
 }
 
 impl Default for SubagentConfig {
@@ -257,6 +269,10 @@ impl Default for SubagentConfig {
             enabled: true,
             max_concurrent: 3,
             timeout: 300,
+            max_depth: 3,
+            max_tool_rounds: 50,
+            warning_1_threshold: 0.8,
+            warning_2_threshold: 0.95,
         }
     }
 }
@@ -466,12 +482,16 @@ impl ConsciousnessConfig {
 fn default_true() -> bool { true }
 fn default_3() -> usize { 3 }
 fn default_25() -> usize { 25 }
+fn default_3u32() -> u32 { 3 }
+fn default_25u32() -> u32 { 50 }  // default subagent max tool rounds
 fn default_100() -> usize { 100 }
 fn default_300() -> u64 { 300 }
 fn default_7373() -> u16 { 7373 }
 fn default_128k() -> usize { 128000 }
 fn default_8k() -> usize { 8192 }
 fn default_threshold_70() -> f32 { 0.7 }
+fn default_warning_1_threshold() -> f32 { 0.8 }
+fn default_warning_2_threshold() -> f32 { 0.95 }
 fn default_auto_model() -> String { "auto".to_string() }
 fn default_bifrost_url() -> String { "http://10.10.20.120:3360".to_string() }
 fn default_server_bind() -> String { "127.0.0.1".to_string() }

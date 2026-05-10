@@ -88,6 +88,26 @@ impl ConsciousnessEngine {
         Ok(events)
     }
 
+    /// Run N+1 detection for a subagent fork without a full session.
+    /// Uses the heuristic detector on the subagent's final response and
+    /// queues observations into the parent agent's inbox.
+    pub async fn on_response_for_agent(
+        &self,
+        agent_id: &str,
+        response: &str,
+    ) -> anyhow::Result<()> {
+        let inbox = SubconsciousInbox::new(self.agents.memory_repo(agent_id));
+        let _ = inbox.init().await;
+
+        for item in detect_items(response) {
+            if let Err(e) = inbox.queue(item).await {
+                tracing::warn!("subagent subconscious queue failed: {}", e);
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn calculate_pressure(&self, messages: &[ConversationMessage]) -> f32 {
         let tokens: usize = messages
             .iter()

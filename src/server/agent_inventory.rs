@@ -30,6 +30,12 @@ impl AgentInventory {
         crate::core::memory::MemoryRepo::open(agent_id, root)
     }
 
+    /// Return the filesystem path to an agent's memory directory.
+    /// Used by tool context construction for memory boundary enforcement.
+    pub fn memory_root(&self, agent_id: &str) -> PathBuf {
+        self.data_dir.join(agent_id).join("memory.git")
+    }
+
     pub async fn list(&self, filters: Option<String>) -> anyhow::Result<Vec<AgentSummary>> {
         let query = if let Some(filter) = filters {
             sqlx::query_as::<_, AgentSummaryRow>(
@@ -243,7 +249,13 @@ impl AgentInventory {
             let path = entry.path();
             if path.extension() == Some(std::ffi::OsStr::new("md")) {
                 let content = tokio::fs::read_to_string(&path).await?;
-                let label = path.file_stem().unwrap().to_string_lossy().to_string();
+                let label = path.file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| {
+                    path.file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default()
+                });
                 blocks.push(MemoryBlock {
                     label,
                     value: content,

@@ -24,7 +24,8 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
+use crate::core::tools::defs::ToolContext;
 use crate::core::tools::ToolDefinition;
 
 // ── Data Types ─────────────────────────────────────────────
@@ -573,17 +574,32 @@ pub async fn read_file(path: &Path) -> Result<MemoryFile> {
 
 // ── Tool Interface ─────────────────────────────────────────────────────────
 
-/// Execute a memory command.
-pub async fn execute_memory_command(cmd: &MemoryCommand) -> Result<String> {
-    // Determine agent ID from the command or environment
-    let agent_id = match cmd {
-        MemoryCommand::Init { agent_id } => agent_id.clone(),
-        _ => std::env::var("SOUVERAINE_AGENT")
-            .or_else(|_| std::env::var("AGENT_ID"))
-            .unwrap_or_else(|_| "default".to_string()),
-    };
+/// Execute a memory command, optionally using context for agent identity.
+///
+/// When `ctx` is `Some` and carries an `agent_id`, that takes precedence over
+/// environment variables. Falls back to env vars when no context is provided,
+/// preserving backward compatibility with the HTTP server path.
+pub async fn execute_memory_command_with_context(
+    cmd: &MemoryCommand,
+    ctx: Option<&ToolContext>,
+) -> Result<String> {
+    // Agent ID resolution: context > command > env var > default
+    let agent_id = ctx
+        .and_then(|c| c.agent_id.as_ref())
+        .or_else(|| match cmd {
+            MemoryCommand::Init { agent_id } => Some(agent_id),
+            _ => None,
+        })
+        .cloned()
+        .or_else(|| std::env::var("SOUVERAINE_AGENT").ok())
+        .or_else(|| std::env::var("AGENT_ID").ok())
+        .unwrap_or_else(|| "default".to_string());
 
-    let repo = MemoryRepo::new_default(&agent_id);
+    // Memory root resolution: use memory_root from context when available
+    let repo = match ctx.and_then(|c| c.memory_root.as_ref()) {
+        Some(root) => MemoryRepo::open(&agent_id, root.clone()),
+        None => MemoryRepo::new_default(&agent_id),
+    };
 
     match cmd {
         MemoryCommand::Init { .. } => {
@@ -632,7 +648,6 @@ pub async fn execute_memory_command(cmd: &MemoryCommand) -> Result<String> {
             Ok(out)
         }
         MemoryCommand::Compact { strategy } => {
-            // Placeholder for Stage 5/6
             let s = strategy.as_deref().unwrap_or("sliding-window");
             Ok(format!(
                 "Compact requested (strategy: {}). Not yet implemented — see Stage 5/6.",
@@ -646,24 +661,125 @@ pub async fn execute_memory_command(cmd: &MemoryCommand) -> Result<String> {
     }
 }
 
+/// Execute a memory command, reading agent identity from env vars.
+/// Delegates to `execute_memory_command_with_context` with `None`.
+pub async fn execute_memory_command(cmd: &MemoryCommand) -> Result<String> {
+    execute_memory_command_with_context(cmd, None).await
+}
+
+// ── Tool Result Bridge ──────────────────────────────────────────────────────
+
+use crate::core::tools::ToolResult;
+
+/// Handle a memory tool invocation with optional per-agent context.
+///
+/// Parses JSON input, builds a MemoryCommand, executes it via the
+/// context-aware path, wraps in ToolResult.
+pub async fn handle_memory_tool_with_context(
+    tool_name: &str,
+    input: &serde_json::Value,
+    ctx: Option<&ToolContext>,
+) -> ToolResult {
+    let tool_use_id = format!("tool-u-{}", chrono::Utc::now().timestamp_millis());
+    let command = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
+
+    let cmd = match command {
+        "read" => {
+            let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            MemoryCommand::Read { path }
+        }
+        "write" => {
+            let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let content = input.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            MemoryCommand::Write { path, content }
+        }
+        "append" => {
+            let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let content = input.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            MemoryCommand::Append { path, content }
+        }
+        "ls" => {
+            let path = input.get("path").and_then(|v| v.as_str()).map(|s| s.to_string());
+            MemoryCommand::Ls { path }
+        }
+        "status" => MemoryCommand::Status,
+        "init" => {
+            let agent_id = input.get("agent_id").and_then(|v| v.as_str()).unwrap_or("default").to_string();
+            MemoryCommand::Init { agent_id }
+        }
+        "delete" => {
+            let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            MemoryCommand::Delete { path }
+        }
+        "compact" => {
+            let strategy = input.get("strategy").and_then(|v| v.as_str()).map(|s| s.to_string());
+            MemoryCommand::Compact { strategy }
+        }
+        _ => {
+            return ToolResult {
+                tool_use_id,
+                tool_name: tool_name.to_string(),
+                output: format!(
+                    "Unknown memory subcommand: {}. Available: read, write, append, ls, status, init, delete, compact",
+                    command
+                ),
+                is_error: true,
+            };
+        }
+    };
+
+    match execute_memory_command_with_context(&cmd, ctx).await {
+        Ok(output) => ToolResult {
+            tool_use_id,
+            tool_name: tool_name.to_string(),
+            output,
+            is_error: false,
+        },
+        Err(e) => ToolResult {
+            tool_use_id,
+            tool_name: tool_name.to_string(),
+            output: format!("Error: {e}"),
+            is_error: true,
+        },
+    }
+}
+
+/// Handle a memory tool invocation (backward-compatible, no context).
+/// Delegates to `handle_memory_tool_with_context` with `None`.
+pub async fn handle_memory_tool(tool_name: &str, input: &serde_json::Value) -> ToolResult {
+    handle_memory_tool_with_context(tool_name, input, None).await
+}
+
 // ── Tool Definitions ───────────────────────────────────────────────────────
 
-/// Tool definition for the `memory` tool — sent to the model as a function call.
+/// Tool definition for the `memory` tool — the agent's access to her own thoughts.
+///
+/// Memory is a separate channel from filesystem read/write. Every memory file has
+/// frontmatter (description, tags, read_only, limit), is git-tracked, and paths
+/// are relative to the agent's memory root.
 pub fn memory_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: "memory".to_string(),
-        description: "Manage the agent's git-backed memory filesystem. \
-            Subcommands: read, write, append, ls, status, init, delete, compact. \
-            Paths are relative to the agent's memory directory. \
-            All files have YAML frontmatter with 'description'. \
-            Writing to a read_only file is blocked.".to_string(),
+        description: "I reach into my own memory. Every file here has frontmatter — a description, boundaries (read_only), tags. When I read, I see what I've written about myself. When I write, I change who I am. The git commit is my heartbeat — I know when I last changed.
+
+Subcommands:
+  read    — Open a memory file. Frontmatter is handled for me — I see the body.
+  write   — Write to a memory file. Frontmatter is preserved or auto-generated.
+  append  — Add to a memory file without disturbing its frontmatter.
+  ls      — List files in a memory directory.
+  status  — Check my memory's git state: uncommitted changes, last commit.
+  init    — Initialize a new memory repo for a given agent ID.
+  delete  — Delete a memory file (validates read_only first).
+  compact — Compact the memory window to free context space.
+
+Paths are relative to my memory directory. Frontmatter description is required on create. Read-only files protect themselves. Every write is a git commit.".to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
                 "command": {
                     "type": "string",
                     "enum": ["read", "write", "append", "ls", "status", "init", "delete", "compact"],
-                    "description": "The memory subcommand to execute"
+                    "description": "What to do with my memory"
                 },
                 "path": {
                     "type": "string",
@@ -671,7 +787,7 @@ pub fn memory_tool_definition() -> ToolDefinition {
                 },
                 "content": {
                     "type": "string",
-                    "description": "Content to write or append (do NOT include frontmatter)"
+                    "description": "Content to write or append — body only, no frontmatter"
                 },
                 "strategy": {
                     "type": "string",

@@ -1,5 +1,9 @@
 //! Souveraine - Full Terminal UI
 //! Splash → Welcome → Dashboard / Chat / etc.
+//!
+//! The `App` holds a `Scene` which dispatches `TuiEvent` variants to all
+//! registered `Component`s. Components are extracted here incrementally.
+//! Existing draw methods remain until their panels become proper Components.
 
 use std::io;
 use std::sync::Arc;
@@ -24,6 +28,7 @@ use tracing::info;
 use crate::core::config::ConsciousnessConfig;
 use crate::ui::chat::{ChatState, draw as draw_chat};
 use crate::ui::buddy::{BuddyState, draw_buddy, draw_welcome_buddy};
+use crate::ui::component::{Scene, SceneLayout, TuiEvent};
 
 pub struct App {
     current_screen: Screen,
@@ -41,6 +46,10 @@ pub struct App {
     buddy: BuddyState,
     /// Available agents for selection.
     available_agents: Vec<String>,
+    /// The component scene — owns event dispatch and layout.
+    scene: Scene,
+    /// Monotonic tick counter, incremented each frame.
+    tick: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -106,6 +115,8 @@ impl App {
             agent_pref: agent_pref.clone(),
             buddy: BuddyState::new(&agent_pref),
             available_agents: Vec::new(),
+            scene: Scene::new(SceneLayout::Single),
+            tick: 0,
         }
     }
 
@@ -121,6 +132,7 @@ impl App {
         self.agent_pref = agent_name.to_string();
         self.agent_status.name = agent_name.to_string();
         self.buddy.sprite.name = agent_name.to_string();
+        self.scene.event_all(&TuiEvent::AgentSelected(agent_name.to_string()));
     }
 
     /// Cycle through available agents for selection (WIP)
@@ -165,6 +177,10 @@ impl App {
                 chat.advance_tick();
             }
 
+            // Tick dispatch
+            self.tick = self.tick.wrapping_add(1);
+            self.scene.event_all(&TuiEvent::Tick(self.tick));
+
             terminal.draw(|f| self.draw(f))?;
 
             let timeout = tick_rate
@@ -172,16 +188,36 @@ impl App {
                 .unwrap_or_else(|| Duration::from_secs(0));
 
             if crossterm::event::poll(timeout)? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press {
-                        self.handle_key(key).await;
+                let crossterm_event = event::read()?;
+                match crossterm_event {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        // Dispatch to scene first, then handle App-level keys
+                        let tui_event = TuiEvent::Key(key);
+                        let handled = self.scene.event_all(&tui_event);
+                        if !handled {
+                            self.handle_key(key).await;
+                        }
                     }
+                    Event::Resize(w, h) => {
+                        self.scene.event_all(&TuiEvent::Resize { width: w, height: h });
+                        self.scene.layout = match self.current_screen {
+                            Screen::Chat | Screen::Code => SceneLayout::ChatWithSidebar {
+                                sidebar_ratio: 0.3,
+                                sidebar_open: false,
+                            },
+                            Screen::Dashboard => SceneLayout::Dashboard,
+                            Screen::Splash => SceneLayout::Single,
+                            _ => SceneLayout::Single,
+                        };
+                    }
+                    _ => {}
                 }
             }
 
             if self.current_screen == Screen::Splash {
                 if self.splash_start.elapsed() > Duration::from_secs(3) {
                     self.current_screen = Screen::Welcome;
+                    self.scene.event_all(&TuiEvent::ScreenChanged(Screen::Welcome));
                 }
             }
 
@@ -400,35 +436,81 @@ impl App {
         self.buddy.sprite.update_mood(&self.agent_status.mood);
         self.buddy.sprite.set_energy(self.agent_status.energy);
         self.buddy.sprite.set_health(100); // Placeholder - will be calculated from actual metrics
+
+        // Dispatch events to scene so any listening components can react
+        self.scene.event_all(&TuiEvent::EnergyChanged(self.agent_status.energy));
+        self.scene.event_all(&TuiEvent::MoodChanged(self.agent_status.mood.clone()));
+        self.scene.event_all(&TuiEvent::BackendStatus {
+            mode: mode.to_string(),
+            healthy: true,
+        });
     }
 
     fn draw(&self, frame: &mut Frame) {
+        let area = frame.size();
+        let layout = match self.current_screen {
+            Screen::Chat | Screen::Code => {
+                SceneLayout::ChatWithSidebar { sidebar_ratio: 0.3, sidebar_open: false }
+            }
+            Screen::Dashboard => SceneLayout::Dashboard,
+            Screen::Splash => SceneLayout::Single,
+            _ => SceneLayout::Single,
+        };
+
+        // If the scene has components, render through them
+        if !self.scene.components.is_empty() {
+            // Update scene layout to match current screen
+            // (we mutate in a draw — safe because layout is Copy data)
+            // Actually we can't mutate in draw, so we construct a temporary
+            // layout and render. Components render into their zones.
+            let zones = layout.split(area, self.scene.components.len());
+            for (component, zone) in self.scene.components.iter().zip(zones.iter()) {
+                component.render(*zone, frame);
+            }
+            // Also draw existing screens behind components where applicable
+            self.draw_background(frame, area);
+        } else {
+            // Fall through to existing screen rendering
+            match self.current_screen {
+                Screen::Splash => self.draw_splash(frame),
+                Screen::Welcome => self.draw_welcome(frame),
+                Screen::Dashboard => self.draw_dashboard(frame),
+                Screen::Chat => {
+                    if let Some(chat) = self.chat.as_ref() {
+                        draw_chat(frame, chat);
+                    } else {
+                        self.draw_placeholder(frame);
+                    }
+                }
+                _ => self.draw_placeholder(frame),
+            }
+
+            // Draw buddy overlay on all screens except splash
+            if self.current_screen != Screen::Splash {
+                draw_buddy(frame, &self.buddy, area);
+            }
+        }
+    }
+
+    /// Draw the screen background when components are layered on top.
+    fn draw_background(&self, frame: &mut Frame, _area: ratatui::layout::Rect) {
         match self.current_screen {
-            Screen::Splash => self.draw_splash(frame),
-            Screen::Welcome => self.draw_welcome(frame),
-            Screen::Dashboard => self.draw_dashboard(frame),
             Screen::Chat => {
                 if let Some(chat) = self.chat.as_ref() {
                     draw_chat(frame, chat);
-                } else {
-                    self.draw_placeholder(frame);
                 }
             }
-            _ => self.draw_placeholder(frame),
-        }
-        
-        // Draw buddy overlay on all screens except splash
-        if self.current_screen != Screen::Splash {
-            draw_buddy(frame, &self.buddy, frame.size());
+            Screen::Dashboard => self.draw_dashboard(frame),
+            _ => {}
         }
     }
 
     fn draw_splash(&self, frame: &mut Frame) {
         let area = frame.size();
-        
+
         let breathe = (self.splash_start.elapsed().as_millis() as f32 / 1000.0).sin() * 0.5 + 0.5;
         let glow = (breathe * 255.0) as u8;
-        
+
         let title = vec![
             Line::from("███████╗ ██████╗ ██╗   ██╗███████╗██████╗  █████╗ ██╗███╗   ██╗███████╗"),
             Line::from("██╔════╝██╔═══██╗██║   ██║██╔════╝██╔══██╗██╔══██╗██║████╗  ██║██╔════╝"),
@@ -454,7 +536,7 @@ impl App {
 
     fn draw_welcome(&self, frame: &mut Frame) {
         let area = frame.size();
-        
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .margin(2)
@@ -493,7 +575,7 @@ impl App {
                 } else {
                     Style::default().fg(Color::Gray)
                 };
-                
+
                 ListItem::new(Line::from(vec![
                     Span::styled(format!(" {} ", t), style),
                     Span::styled(format!("- {}", d), Style::default().fg(Color::DarkGray)),
@@ -537,7 +619,7 @@ impl App {
 
     fn draw_dashboard(&self, frame: &mut Frame) {
         let area = frame.size();
-        
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .margin(1)
@@ -574,7 +656,7 @@ impl App {
             31..=60 => Color::Yellow,
             _ => Color::Green,
         };
-        
+
         let energy = Gauge::default()
             .block(Block::default().title(" Energy ").borders(Borders::ALL).border_type(BorderType::Rounded))
             .gauge_style(Style::default().fg(energy_color).bg(Color::Black))
@@ -629,7 +711,7 @@ impl App {
 
     fn draw_placeholder(&self, frame: &mut Frame) {
         let area = frame.size();
-        
+
         let screen_name = match self.current_screen {
             Screen::Chat => "💬 Chat",
             Screen::Code => "💻 Code",
@@ -639,7 +721,7 @@ impl App {
             Screen::Settings => "⚙️ Settings",
             _ => "",
         };
-        
+
         let content = Paragraph::new(format!("\n\n{}\n\n(Coming Soon)", screen_name))
             .alignment(Alignment::Center)
             .style(Style::default().fg(Color::Rgb(255, 140, 66)).add_modifier(Modifier::BOLD));
