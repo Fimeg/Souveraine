@@ -70,6 +70,9 @@ pub struct ChatState {
     pub turn_started: Option<Instant>,
     /// Receiver for `/model` listing results from async Bifrost call.
     pub model_rx: Option<oneshot::Receiver<String>>,
+    /// Consciousness events (surfacing, reflection, archivist) since last drain.
+    /// Forwarded to the Scene by App after each tick.
+    pub pending_consciousness: Vec<BackendEvent>,
 }
 
 impl ChatState {
@@ -123,6 +126,7 @@ impl ChatState {
             tick: 0,
             turn_started: None,
             model_rx: None,
+            pending_consciousness: Vec::new(),
         })
     }
 
@@ -395,11 +399,13 @@ Use Tab to toggle the cockpit pane.";
                         self.cockpit_log.drain(..self.cockpit_log.len() - 200);
                     }
                     self.messages.push(ChatMessage::Surfacing {
-                        source,
-                        content,
-                        priority,
+                        source: source.clone(),
+                        content: content.clone(),
+                        priority: priority.clone(),
                         ts: Instant::now(),
                     });
+                    // Buffer for scene dispatch
+                    self.pending_consciousness.push(BackendEvent::Surfacing { source, content, priority });
                 }
                 BackendEvent::Reflection(content) => {
                     self.cockpit_log.push(format!("reflection — {}", content));
@@ -407,6 +413,7 @@ Use Tab to toggle the cockpit pane.";
                         text: format!("reflection: {}", content),
                         ts: Instant::now(),
                     });
+                    self.pending_consciousness.push(BackendEvent::Reflection(content));
                 }
                 BackendEvent::Archivist { synthesis, pressure } => {
                     self.pressure = pressure;
@@ -415,6 +422,7 @@ Use Tab to toggle the cockpit pane.";
                         text: format!("archivist: {} (pressure {:.0}%)", synthesis, pressure * 100.0),
                         ts: Instant::now(),
                     });
+                    self.pending_consciousness.push(BackendEvent::Archivist { synthesis, pressure });
                 }
                 BackendEvent::Done => {
                     self.finalize_streaming();

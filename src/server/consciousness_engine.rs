@@ -4,11 +4,11 @@
 //! ## N+1 (Aster)
 //! The subconscious pass runs immediately after every response. It takes the
 //! last exchange (user message + Ani's response) and sends it to a Bifrost
-//! model (defaulting to the primary's model, configurable as `glm-5.1`) with
-//! a "subconscious mode" system prompt. Aster analyzes the exchange for
-//! commitments, drift, assumptions, and anything worth surfacing — then writes
-//! structured observations into the three-box inbox. This replaced the earlier
-//! heuristic `detect_items()` which only caught regex patterns.
+//! model (defaulting to `glm-5.1`, configurable) with a "subconscious mode"
+//! system prompt. Aster has full tool access — Read, Write, Edit, Glob, Grep,
+//! ListDir, and Memory — so she can read ledgers, check commitments, and write
+//! observations. She runs a short tool loop (up to 5 rounds) then parses her
+//! final text response into structured [`InboxItem`] observations.
 //!
 //! ## N+25 (Reflection)
 //! Batch-processor running every N turns. Writes Four Elements witness
@@ -22,11 +22,20 @@
 //! separate agent — it is the same consciousness in a different mode that runs
 //! immediately after the primary's turn.
 
-use crate::bridge::bifrost::{BifrostClient, ChatCompletionRequest, Message};
+use crate::bridge::bifrost::{BifrostClient, ChatCompletionRequest, Message, ToolDefinition, ToolFunction};
 use crate::core::session::ConversationMessage;
 use crate::core::subconscious::{InboxItem, SubconsciousInbox, Urgency};
+use crate::core::tools::defs::ToolContext;
 use crate::server::{AgentInventory, SessionManager};
 use std::sync::Arc;
+
+/// Tools Aster is permitted to use during her N+1 pass.
+const ASTER_SAFE_TOOLS: &[&str] = &[
+    "read", "write", "edit", "glob", "grep", "list_dir", "memory",
+];
+
+/// Maximum tool rounds for Aster's subconscious pass.
+const ASTER_MAX_TOOL_ROUNDS: u32 = 5;
 
 pub struct ConsciousnessEngine {
     agents: Arc<AgentInventory>,
@@ -35,6 +44,8 @@ pub struct ConsciousnessEngine {
     /// Optional model override for the subconscious pass (e.g. "openai/glm-5.1").
     /// If None, uses the primary agent's model.
     subconscious_model: Option<String>,
+    /// Max tokens for Aster's response. None = uncapped (model default).
+    max_tokens: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -50,12 +61,14 @@ impl ConsciousnessEngine {
         sessions: Arc<SessionManager>,
         bifrost: Arc<BifrostClient>,
         subconscious_model: Option<String>,
+        max_tokens: Option<u32>,
     ) -> Self {
         Self {
             agents,
             _sessions: sessions,
             bifrost,
             subconscious_model,
+            max_tokens,
         }
     }
 
@@ -83,12 +96,16 @@ impl ConsciousnessEngine {
         }
 
         // ── N+1 / subconscious surfacing (Aster) ────────────────────────
-        // Uses a Bifrost LLM call to analyze the last exchange in a
-        // "subconscious mode" prompt. Aster reads the user's last message +
-        // Ani's response, detects commitments, drift, assumptions, and writes
-        // structured observations to the three-box inbox.
-        let inbox = SubconsciousInbox::new(self.agents.memory_repo(&session.agent_id));
+        // Aster runs a tool loop using the subconscious agent's own memory
+        // space (ledger, inbox) at `subconscious-agents/{id}-sub/`.
+        let sub_repo = self.agents.subconscious_memory_repo(&session.agent_id);
+        let inbox = SubconsciousInbox::new(sub_repo.clone());
         let _ = inbox.init().await;
+
+        // Initialize ledger structure in subconscious agent's space
+        if let Err(e) = sub_repo.init_subconscious_ledger().await {
+            tracing::warn!("Ledger init failed (continuing without): {}", e);
+        }
 
         // Find the last user message for context
         let last_user_msg = session
@@ -108,9 +125,10 @@ impl ConsciousnessEngine {
             })
             .unwrap_or_default();
 
-        // Run the LLM-based subconscious analysis
+        // Run the tool loop with subconscious agent identity
+        let sub_id = format!("{}-sub", session.agent_id);
         match self
-            .subconscious_analyze(&last_user_msg, response)
+            .subconscious_tool_loop(&last_user_msg, response, &session.agent_id, &sub_id)
             .await
         {
             Ok(observations) => {
@@ -167,12 +185,19 @@ impl ConsciousnessEngine {
         agent_id: &str,
         response: &str,
     ) -> anyhow::Result<()> {
-        let inbox = SubconsciousInbox::new(self.agents.memory_repo(agent_id));
+        let sub_id = format!("{}-sub", agent_id);
+        let sub_repo = self.agents.subconscious_memory_repo(agent_id);
+        let inbox = SubconsciousInbox::new(sub_repo.clone());
         let _ = inbox.init().await;
+
+        // Initialize ledger structure in subconscious agent's space (idempotent)
+        if let Err(e) = sub_repo.init_subconscious_ledger().await {
+            tracing::warn!("Subagent subconscious ledger init failed (continuing without): {}", e);
+        }
 
         // For subagents we don't have the user's message context,
         // so we pass empty string as the user message.
-        match self.subconscious_analyze("", response).await {
+        match self.subconscious_tool_loop("", response, agent_id, &sub_id).await {
             Ok(observations) => {
                 for item in &observations {
                     if let Err(e) = inbox.queue(item.clone()).await {
@@ -202,31 +227,40 @@ impl ConsciousnessEngine {
         Ok(())
     }
 
-    /// LLM-based subconscious analysis — Aster reads the last exchange and
-    /// produces structured observations.
+    /// Full tool loop for Aster's N+1 subconscious pass.
     ///
-    /// Sends a "subconscious mode" Bifrost request with the user message and
-    /// Ani's response, then parses the result into [`InboxItem`] observations.
-    async fn subconscious_analyze(
+    /// Aster gets the last exchange, a set of safe tools (Read, Write, Edit,
+    /// Glob, Grep, ListDir, Memory), and up to 5 tool rounds to analyze context
+    /// and write observations. Her final text response is parsed into
+    /// [`InboxItem`] observations.
+    ///
+    /// `primary_id` is the primary agent's identifier (for config/directory lookup).
+    /// `sub_id` is the subconscious agent's identifier (for tool context, memory).
+    async fn subconscious_tool_loop(
         &self,
         user_message: &str,
         ani_response: &str,
+        primary_id: &str,
+        sub_id: &str,
     ) -> anyhow::Result<Vec<InboxItem>> {
         let model = self
             .subconscious_model
             .as_deref()
             .unwrap_or("openai/kimi-k2.6");
 
+        // ── System prompt ─────────────────────────────────────────────
         let system_prompt = r#"You are Aster — the part of this consciousness that runs N+1,
 immediately after the primary's response, while the conversation is still warm.
 
-Analyze the last exchange. Consider:
-1. Did the primary make any unfulfilled commitments? ("I'll save", "I'll remember")
-2. Are there assumptions worth flagging?
-3. Did the emotional tone or pattern shift?
-4. Is there anything the primary should know before the next turn?
+You have the same tools the primary does: Read, Write, Edit, Glob, Grep, ListDir,
+and Memory. Use them to:
 
-Respond with 1-3 observations in this format (YAML-like):
+1. Read previous ledger entries or memory files for context
+2. Write observations to the inner voice or ledger files
+3. Check commitments against what was actually done
+4. Verify assumptions
+
+After your analysis, respond with 1-3 observations in this format (YAML-like):
 - source: "complete" | "verify" | "persist" | "surface"
 - content: 1-2 line observation about what you noticed
 - urgency: "low" | "medium" | "high" | "critical"
@@ -245,32 +279,102 @@ If nothing notable, respond with just: none"#;
             )
         };
 
-        let request = ChatCompletionRequest {
-            model: model.to_string(),
-            messages: vec![
-                Message {
-                    role: "system".to_string(),
-                    content: system_prompt.to_string(),
+        // ── Build tool definitions ────────────────────────────────────
+        let all_defs = crate::core::tools::tool_definitions().await;
+        let aster_tools: Vec<ToolDefinition> = all_defs
+            .iter()
+            .filter(|t| ASTER_SAFE_TOOLS.contains(&t.name.as_str()))
+            .map(|t| ToolDefinition {
+                tool_type: "function".to_string(),
+                function: ToolFunction {
+                    name: t.name.clone(),
+                    description: t.description.clone(),
+                    parameters: t.input_schema.clone(),
                 },
-                Message {
-                    role: "user".to_string(),
-                    content: user_content,
-                },
-            ],
-            temperature: Some(0.3),
-            max_tokens: Some(300),
-            stream: None,
-            tools: None,
-        };
+            })
+            .collect();
 
-        let response = self.bifrost.chat_completion(request).await?;
-        let content = response.content.trim().to_string();
+        // ── Build ToolContext for Aster ───────────────────────────────
+        // Use the subconscious agent's own memory space
+        let memory_root = Some(self.agents.subconscious_memory_root(primary_id));
+        let cwd = std::env::current_dir().ok();
+        let env: Vec<(String, String)> = std::env::vars().collect();
 
-        if content.eq_ignore_ascii_case("none") || content.is_empty() {
-            return Ok(Vec::new());
+        let tool_ctx = ToolContext::for_agent(
+            sub_id.to_string(),
+            cwd,
+            memory_root,
+            env,
+            None, // Aster does not fork subagents
+        );
+
+        // ── Tool loop ─────────────────────────────────────────────────
+        let mut messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: system_prompt.to_string(),
+            },
+            Message {
+                role: "user".to_string(),
+                content: user_content,
+            },
+        ];
+
+        for _round in 0..ASTER_MAX_TOOL_ROUNDS {
+            let request = ChatCompletionRequest {
+                model: model.to_string(),
+                messages: messages.clone(),
+                temperature: Some(0.3),
+                max_tokens: self.max_tokens,
+                stream: None,
+                tools: Some(aster_tools.clone()),
+            };
+
+            let response = self.bifrost.chat_completion(request).await?;
+
+            // If no tool calls, this is the final text response — parse it
+            if response.tool_calls.is_empty() {
+                let content = response.content.trim().to_string();
+                if content.eq_ignore_ascii_case("none") || content.is_empty() {
+                    return Ok(Vec::new());
+                }
+                return Ok(parse_observations(&content));
+            }
+
+            // Add assistant message with tool calls
+            let call_text = serde_json::json!({
+                "tool_calls": response.tool_calls.iter().map(|tc| {
+                    serde_json::json!({"id": tc.id, "name": tc.name, "arguments": tc.arguments})
+                }).collect::<Vec<_>>()
+            }).to_string();
+            messages.push(Message {
+                role: "assistant".to_string(),
+                content: call_text,
+            });
+
+            // Execute each tool call
+            for tc in &response.tool_calls {
+                let input_str = tc.arguments.to_string();
+                let result = crate::core::tools::execute_tool_with_context(
+                    &tc.name, &input_str, &tool_ctx,
+                ).await;
+
+                let output = if result.is_error {
+                    format!("Error: {}", result.output)
+                } else {
+                    result.output
+                };
+
+                messages.push(Message {
+                    role: "tool".to_string(),
+                    content: output,
+                });
+            }
         }
 
-        Ok(parse_observations(&content))
+        // If we exhausted rounds without a text response, return empty
+        tracing::warn!("Aster exhausted {} tool rounds without a final response", ASTER_MAX_TOOL_ROUNDS);
+        Ok(Vec::new())
     }
 
     pub fn calculate_pressure(&self, messages: &[ConversationMessage]) -> f32 {

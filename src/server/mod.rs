@@ -56,6 +56,16 @@ impl SouveraineServer {
 
         let agents_dir = data_dir.join("agents");
         let agents = Arc::new(AgentInventory::new(agents_dir, db).await?);
+
+        // Reconcile subconscious agents for existing primaries
+        if let Ok(existing) = agents.list(None).await {
+            for summary in &existing {
+                if let Err(e) = agents.create_subconscious_for(&summary.id).await {
+                    tracing::warn!("Subconscious reconcile failed for {}: {}", summary.id, e);
+                }
+            }
+        }
+
         let sessions = Arc::new(SessionManager::new());
 
         let bifrost = Arc::new(BifrostClient::new(
@@ -70,6 +80,7 @@ impl SouveraineServer {
             sessions.clone(),
             bifrost.clone(),
             config.subconscious.model.clone(),
+            config.subconscious.max_tokens,
         ));
 
         // Gitea-backed memory is opt-in for the server: it requires a reachable

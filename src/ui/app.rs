@@ -28,7 +28,10 @@ use tracing::info;
 use crate::core::config::ConsciousnessConfig;
 use crate::ui::chat::{ChatState, draw as draw_chat};
 use crate::ui::buddy::{BuddyState, draw_buddy, draw_welcome_buddy};
-use crate::ui::component::{Scene, SceneLayout, TuiEvent};
+use crate::ui::buddy_panel::BuddyPanel;
+use crate::ui::cockpit_panel::CockpitPane;
+use crate::ui::component::{Component, Scene, SceneLayout, TuiEvent};
+use crate::backend::BackendEvent;
 
 pub struct App {
     current_screen: Screen,
@@ -103,7 +106,7 @@ impl Default for AgentStatus {
 impl App {
     pub fn new(config: Arc<RwLock<ConsciousnessConfig>>, agent_pref: String) -> Self {
         info!("Creating Souveraine App");
-        Self {
+        let mut app = Self {
             current_screen: Screen::Splash,
             splash_start: Instant::now(),
             menu_selected: 0,
@@ -117,7 +120,14 @@ impl App {
             available_agents: Vec::new(),
             scene: Scene::new(SceneLayout::Single),
             tick: 0,
-        }
+        };
+
+        // Register standard components so they receive events from the start.
+        // BuddyPanel and CockpitPane listen for surfacing events from Aster.
+        app.scene.add(BuddyPanel::new(&agent_pref));
+        app.scene.add(CockpitPane::new());
+
+        app
     }
 
     /// Add an available agent for selection (WIP - called from backend discovery)
@@ -175,6 +185,23 @@ impl App {
             if let Some(chat) = self.chat.as_mut() {
                 chat.drain_events();
                 chat.advance_tick();
+
+                // Forward consciousness events (surfacing, reflection, archivist)
+                // from chat to the scene so Aster's observations reach Components.
+                for ev in chat.pending_consciousness.drain(..) {
+                    match ev {
+                        BackendEvent::Surfacing { source, content, priority } => {
+                            self.scene.event_all(&TuiEvent::Surfacing { source, content, priority });
+                        }
+                        BackendEvent::Reflection(content) => {
+                            self.scene.event_all(&TuiEvent::Reflection { content });
+                        }
+                        BackendEvent::Archivist { synthesis, pressure } => {
+                            self.scene.event_all(&TuiEvent::Archivist { synthesis, pressure });
+                        }
+                        _ => {}
+                    }
+                }
             }
 
             // Tick dispatch

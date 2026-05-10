@@ -22,6 +22,7 @@
 //! - Paths are relative to the agent's memory directory
 
 use anyhow::{anyhow, Context, Result};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
@@ -219,6 +220,40 @@ impl MemoryRepo {
             self.agent_id,
             mem_path.display()
         );
+        Ok(())
+    }
+
+    /// Initialize the subconscious ledger directory structure.
+    /// Idempotent — safe to call multiple times, skips existing files.
+    pub async fn init_subconscious_ledger(&self) -> Result<()> {
+        let ledger_files = [
+            ("subconscious/ledger/commitments.md", "# Commitments\n\nPromises made and kept."),
+            ("subconscious/ledger/assumptions.md", "# Assumptions\n\nFlagged assumptions."),
+            ("subconscious/ledger/patterns.md", "# Patterns\n\nRecurring observations."),
+            ("subconscious/ledger/drift_log.md", "# Drift Log\n\nBehavioral shifts."),
+            ("subconscious/ledger/infrastructure/README.md", "# Infrastructure\n\nSystem issues and events."),
+        ];
+
+        for (path, body) in &ledger_files {
+            let full_path = self.root.join(path);
+            if !full_path.exists() {
+                if let Some(parent) = full_path.parent() {
+                    tokio::fs::create_dir_all(parent).await
+                        .with_context(|| format!("creating ledger directory: {}", parent.display()))?;
+                }
+                let template = format!(
+                    "---\n# Ledger: {}\n# Created: {}\n# Agent: {}\n---\n\n{}",
+                    path.split('/').last().unwrap_or("unknown").replace(".md", ""),
+                    Utc::now().to_rfc3339(),
+                    self.agent_id,
+                    body
+                );
+                tokio::fs::write(&full_path, &template).await
+                    .with_context(|| format!("writing ledger file: {}", path))?;
+                debug!("Created ledger file: {}", path);
+            }
+        }
+
         Ok(())
     }
 

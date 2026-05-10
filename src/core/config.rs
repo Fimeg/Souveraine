@@ -169,6 +169,10 @@ pub struct SubconsciousConfig {
     /// Defaults to None — uses the primary agent's model.
     #[serde(default)]
     pub model: Option<String>,
+    /// Max tokens for Aster's response. Set to control cost/length.
+    /// Defaults to None — let the model use its full output capacity.
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
     /// Per-agent N+ interval overrides (e.g. Ani=N+1, Helper=N+5)
     #[serde(default)]
     pub per_agent_intervals: HashMap<String, AgentSubconsciousConfig>,
@@ -186,6 +190,7 @@ impl Default for SubconsciousConfig {
             n1_trigger: N1Trigger::EveryResponse,
             inbox_enabled: true,
             model: None,
+            max_tokens: None,
             per_agent_intervals: HashMap::new(),
         }
     }
@@ -365,6 +370,26 @@ impl Default for DiscoveryConfig {
     }
 }
 
+// ── Agent Identity ──
+
+/// Discriminates agent types for directory routing and behavior.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AgentType {
+    Primary,
+    Subconscious,
+    Subagent,
+}
+
+/// Identity metadata carried by every agent at creation time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentIdentity {
+    pub agent_type: AgentType,
+    /// Set for Subconscious and Subagent — links back to the creator.
+    pub parent_agent: Option<String>,
+    /// Path or generator key for this agent's system prompt.
+    pub system_prompt_source: String,
+}
+
 // ── Enums & Shared Types ──
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -495,6 +520,7 @@ fn default_7373() -> u16 { 7373 }
 fn default_128k() -> usize { 128000 }
 fn default_8k() -> usize { 8192 }
 fn default_threshold_70() -> f32 { 0.7 }
+fn default_subconscious_max_tokens() -> u32 { 8192 }
 fn default_warning_1_threshold() -> f32 { 0.8 }
 fn default_warning_2_threshold() -> f32 { 0.95 }
 fn default_auto_model() -> String { "auto".to_string() }
