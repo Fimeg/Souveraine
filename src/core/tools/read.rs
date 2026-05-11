@@ -78,7 +78,7 @@ fn extract_lines(content: &str, ranges: &[LineRange]) -> String {
             let start = r.start.saturating_sub(1).min(total);
             let end = match r.end {
                 usize::MAX => total,
-                e => e.min(total),
+                e => e.saturating_sub(1).min(total),
             };
             if start >= end {
                 return None;

@@ -154,6 +154,14 @@ impl TuiSensorium {
     pub fn input_sender(&self) -> mpsc::Sender<InputEvent> {
         self.input_tx.clone()
     }
+
+    pub fn can_render_real_time_subconscious(&self) -> bool {
+        self.bandwidth.can_render_real_time_subconscious()
+    }
+
+    pub fn can_render_animations(&self) -> bool {
+        self.bandwidth.can_render_animations()
+    }
 }
 
 impl Default for TuiSensorium {
@@ -211,6 +219,14 @@ impl MobileSensorium {
 
     pub fn input_sender(&self) -> mpsc::Sender<InputEvent> {
         self.input_tx.clone()
+    }
+
+    pub fn can_render_real_time_subconscious(&self) -> bool {
+        BandwidthClass::Low.can_render_real_time_subconscious()
+    }
+
+    pub fn can_render_animations(&self) -> bool {
+        BandwidthClass::Low.can_render_animations()
     }
 }
 

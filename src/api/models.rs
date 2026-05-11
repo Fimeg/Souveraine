@@ -38,6 +38,11 @@ pub struct LlmConfig {
     /// Configurable per-agent; 0 disables tools entirely.
     #[serde(default = "default_max_tool_rounds")]
     pub max_tool_rounds: u32,
+    /// Milliseconds to wait between tool rounds to avoid rate-limit cascades.
+    /// The follow-up LLM call after a tool executes can trigger rate limits
+    /// if it arrives too quickly. Default 500ms.
+    #[serde(default = "default_inter_round_delay")]
+    pub inter_round_delay_ms: u64,
 }
 
 fn default_context_window() -> u32 {
@@ -46,6 +51,10 @@ fn default_context_window() -> u32 {
 
 fn default_max_tool_rounds() -> u32 {
     10
+}
+
+fn default_inter_round_delay() -> u64 {
+    500
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

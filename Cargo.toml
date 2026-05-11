@@ -118,7 +118,7 @@ codegen-units = 1
 strip = true
 
 [features]
-default = []
+default = ["figlet-rs"]
 figlet-rs = ["dep:figlet-rs"]
 cowsay = ["dep:cowsay"]
 tauri-desktop = ["dep:tauri", "dep:tauri-plugin-shell"]

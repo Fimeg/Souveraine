@@ -23,6 +23,15 @@ pub struct AgentInfo {
 }
 
 #[derive(Debug, Clone)]
+pub struct ConversationInfo {
+    pub id: String,
+    pub agent_id: String,
+    pub summary: Option<String>,
+    pub message_count: u32,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
 pub enum BackendEvent {
     /// Streaming chunk of the assistant's reply.
     Token(String),
@@ -40,6 +49,17 @@ pub enum BackendEvent {
     Archivist { synthesis: String, pressure: f32 },
     /// Compaction pressure warning (advisory only).
     CompactionWarning { pressure: f32, tier: u8 },
+    /// Continuous context pressure update (sub-threshold).
+    /// Fires every round so the TUI ctx counter reflects live state
+    /// rather than only updating when a warning crosses a threshold.
+    ContextPressure(f32),
+    /// Inference strain — the voice is hoarse, providers are slow.
+    /// Correlates to health over time.
+    InferenceStrain {
+        attempt: u32,
+        status: u16,
+        model: String,
+    },
     /// Stream ended cleanly.
     Done,
 }
@@ -53,6 +73,18 @@ pub trait Backend: Send + Sync {
 
     /// Create or reuse a conversation for this agent. Returns a conversation ID.
     async fn ensure_conversation(&self, agent_id: &str) -> Result<String>;
+
+    /// Create a new conversation for this agent. Always creates fresh.
+    async fn new_conversation(&self, agent_id: &str) -> Result<String>;
+
+    /// List persisted conversations for an agent (excludes archived).
+    async fn list_conversations(&self, agent_id: &str) -> Result<Vec<ConversationInfo>>;
+
+    /// Switch to an existing conversation, returning its messages for backfill.
+    async fn load_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<crate::core::session::ConversationMessage>>;
 
     /// Send a user message; receive a stream of incremental events.
     async fn send(

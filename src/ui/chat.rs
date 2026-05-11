@@ -22,7 +22,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
     Frame,
 };
 use tokio::sync::{mpsc, oneshot, RwLock};
@@ -37,6 +37,36 @@ const USER_BLUE: Color = Color::Rgb(120, 170, 240);
 const ANI_ORANGE: Color = Color::Rgb(255, 140, 66);
 const ANI_DIM: Color = Color::Rgb(180, 120, 80);
 const STATUS_GRAY: Color = Color::Rgb(140, 140, 140);
+
+// ─── Overlay ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub enum Overlay {
+    None,
+    SlashComplete {
+        selected: usize,
+        matches: Vec<&'static SlashDef>,
+    },
+    ConversationPicker {
+        selected: usize,
+        conversations: Vec<crate::backend::ConversationInfo>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct SlashDef {
+    pub name: &'static str,
+    pub hint: &'static str,
+}
+
+const SLASH_COMMANDS: &[SlashDef] = &[
+    SlashDef { name: "/help",   hint: "Show this help" },
+    SlashDef { name: "/clear",  hint: "Clear chat history" },
+    SlashDef { name: "/new",    hint: "New conversation" },
+    SlashDef { name: "/resume", hint: "List / switch conversations" },
+    SlashDef { name: "/convos", hint: "Alias for /resume" },
+    SlashDef { name: "/model",  hint: "List or set model" },
+];
 
 #[derive(Debug, Clone)]
 pub enum ChatMessage {
@@ -58,6 +88,7 @@ pub struct ChatState {
     pub turn_rx: Option<mpsc::Receiver<BackendEvent>>,
     pub busy: bool,
     pub pressure: f32,
+    pub overlay: Overlay,
     /// Cockpit pane visible (Tab toggles).
     pub cockpit: bool,
     /// Recent thinking/reasoning lines for the cockpit pane.
@@ -73,6 +104,12 @@ pub struct ChatState {
     /// Consciousness events (surfacing, reflection, archivist) since last drain.
     /// Forwarded to the Scene by App after each tick.
     pub pending_consciousness: Vec<BackendEvent>,
+    /// Pending /new conversation result.
+    pub new_conv_rx: Option<oneshot::Receiver<Result<String>>>,
+    /// Pending /resume conversation list result.
+    pub convos_rx: Option<oneshot::Receiver<Result<Vec<crate::backend::ConversationInfo>>>>,
+    /// Pending conversation switch result (conv_id, messages).
+    pub switch_rx: Option<oneshot::Receiver<Result<(String, Vec<crate::core::session::ConversationMessage>)>>>,
 }
 
 impl ChatState {
@@ -120,6 +157,7 @@ impl ChatState {
             turn_rx: None,
             busy: false,
             pressure: 0.0,
+            overlay: Overlay::None,
             cockpit: false,
             thinking: Vec::new(),
             cockpit_log: Vec::new(),
@@ -127,12 +165,18 @@ impl ChatState {
             turn_started: None,
             model_rx: None,
             pending_consciousness: Vec::new(),
+            new_conv_rx: None,
+            convos_rx: None,
+            switch_rx: None,
         })
     }
 
     const HELP_TEXT: &'static str = "Available commands:
   /help              Show this help
   /clear             Clear chat history
+  /new               Start a new conversation
+  /resume            List and switch conversations
+  /convos            Alias for /resume
   /model             List available models
   /model <name>      Set the active model
   !<command>         Run a shell command (Linux/macOS)
@@ -224,6 +268,24 @@ Use Tab to toggle the cockpit pane.";
             return true;
         }
 
+        if trimmed == "/new" {
+            self.handle_new_conversation();
+            return true;
+        }
+
+        if trimmed == "/resume" || trimmed == "/convos" {
+            self.handle_list_conversations();
+            return true;
+        }
+
+        if trimmed.starts_with("/resume ") {
+            let conv_id = trimmed.strip_prefix("/resume ").unwrap().trim();
+            if !conv_id.is_empty() {
+                self.handle_switch_conversation(conv_id.to_string());
+            }
+            return true;
+        }
+
         if trimmed.starts_with("/model") {
             return self.handle_model_command(trimmed);
         }
@@ -235,6 +297,48 @@ Use Tab to toggle the cockpit pane.";
             cmd
         ));
         true
+    }
+
+    fn handle_new_conversation(&mut self) {
+        let backend = self.backend.clone();
+        let agent_id = self.agent_id.clone();
+        let (tx, rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            let result = backend.new_conversation(&agent_id).await;
+            let _ = tx.send(result);
+        });
+
+        self.system_message("Creating new conversation...".to_string());
+        self.new_conv_rx = Some(rx);
+    }
+
+    fn handle_list_conversations(&mut self) {
+        let backend = self.backend.clone();
+        let agent_id = self.agent_id.clone();
+        let (tx, rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            let result = backend.list_conversations(&agent_id).await;
+            let _ = tx.send(result);
+        });
+
+        self.system_message("Loading conversations...".to_string());
+        self.convos_rx = Some(rx);
+    }
+
+    fn handle_switch_conversation(&mut self, conversation_id: String) {
+        let backend = self.backend.clone();
+        let conv_id = conversation_id.clone();
+        let (tx, rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            let result = backend.load_conversation(&conv_id).await;
+            let _ = tx.send(result.map(|msgs| (conv_id, msgs)));
+        });
+
+        self.system_message(format!("Switching to {}...", conversation_id));
+        self.switch_rx = Some(rx);
     }
 
     fn handle_model_command(&mut self, input: &str) -> bool {
@@ -366,6 +470,89 @@ Use Tab to toggle the cockpit pane.";
             }
         }
 
+        // Check for /new conversation result
+        if let Some(rx) = self.new_conv_rx.as_mut() {
+            if let Ok(result) = rx.try_recv() {
+                match result {
+                    Ok(conv_id) => {
+                        self.conversation_id = conv_id.clone();
+                        self.messages.clear();
+                        self.system_message(format!(
+                            "New conversation started: {}",
+                            &conv_id[..8.min(conv_id.len())]
+                        ));
+                    }
+                    Err(e) => {
+                        self.system_message(format!("Failed to create conversation: {}", e));
+                    }
+                }
+                self.new_conv_rx = None;
+            }
+        }
+
+        // Check for /resume conversation list result → show picker overlay
+        if let Some(rx) = self.convos_rx.as_mut() {
+            if let Ok(result) = rx.try_recv() {
+                match result {
+                    Ok(convos) => {
+                        if convos.is_empty() {
+                            self.system_message("No saved conversations.".to_string());
+                        } else {
+                            self.overlay = Overlay::ConversationPicker {
+                                selected: 0,
+                                conversations: convos,
+                            };
+                        }
+                    }
+                    Err(e) => {
+                        self.system_message(format!("Failed to list conversations: {}", e));
+                    }
+                }
+                self.convos_rx = None;
+            }
+        }
+
+        // Check for conversation switch result
+        if let Some(rx) = self.switch_rx.as_mut() {
+            if let Ok(result) = rx.try_recv() {
+                match result {
+                    Ok((conv_id, messages)) => {
+                        self.conversation_id = conv_id.clone();
+                        self.messages.clear();
+                        // Backfill from persisted messages
+                        for msg in &messages {
+                            let text = msg.blocks.iter().filter_map(|b| match b {
+                                crate::core::session::ContentBlock::Text { text } => Some(text.as_str()),
+                                _ => None,
+                            }).collect::<Vec<_>>().join("\n");
+                            if text.is_empty() { continue; }
+                            match msg.role {
+                                crate::core::session::MessageRole::User => {
+                                    self.messages.push(ChatMessage::User { text, ts: Instant::now() });
+                                }
+                                crate::core::session::MessageRole::Assistant => {
+                                    self.messages.push(ChatMessage::Assistant { text, ts: Instant::now(), streaming: false });
+                                }
+                                crate::core::session::MessageRole::System => {
+                                    self.messages.push(ChatMessage::System { text, ts: Instant::now() });
+                                }
+                                _ => {}
+                            }
+                        }
+                        self.system_message(format!(
+                            "Resumed conversation {} ({} messages)",
+                            &conv_id[..8.min(conv_id.len())],
+                            messages.len()
+                        ));
+                    }
+                    Err(e) => {
+                        self.system_message(format!("Failed to switch: {}", e));
+                    }
+                }
+                self.switch_rx = None;
+            }
+        }
+
         // Two-phase to avoid double-borrowing self: drain into a Vec, then process.
         let mut drained: Vec<BackendEvent> = Vec::new();
         let mut closed = false;
@@ -434,6 +621,17 @@ Use Tab to toggle the cockpit pane.";
                     });
                     self.pending_consciousness.push(BackendEvent::CompactionWarning { pressure, tier });
                 }
+                BackendEvent::ContextPressure(p) => {
+                    self.pressure = p;
+                }
+                BackendEvent::InferenceStrain { attempt, status, model } => {
+                    let msg = if status == 0 {
+                        format!("inference strain · {} unreachable (attempt {})", model, attempt + 1)
+                    } else {
+                        format!("inference strain · {} returned {} (attempt {})", model, status, attempt + 1)
+                    };
+                    self.cockpit_log.push(msg);
+                }
                 BackendEvent::Done => {
                     self.finalize_streaming();
                     self.busy = false;
@@ -455,6 +653,62 @@ Use Tab to toggle the cockpit pane.";
     /// Toggle the cockpit side-pane.
     pub fn toggle_cockpit(&mut self) {
         self.cockpit = !self.cockpit;
+    }
+
+    /// Update slash-command completion state based on current input.
+    /// Call after each input mutation.
+    pub fn update_completion(&mut self) {
+        if self.busy {
+            self.overlay = Overlay::None;
+            return;
+        }
+        let trimmed = self.input.trim_start();
+        if trimmed.starts_with('/') && !trimmed.contains(' ') && !trimmed.contains('\n') {
+            let query = trimmed;
+            let matches: Vec<&'static SlashDef> = SLASH_COMMANDS
+                .iter()
+                .filter(|cmd| cmd.name.starts_with(query))
+                .collect();
+            if matches.is_empty() || (matches.len() == 1 && matches[0].name == query) {
+                self.overlay = Overlay::None;
+            } else {
+                let selected = match &self.overlay {
+                    Overlay::SlashComplete { selected, .. } => (*selected).min(matches.len().saturating_sub(1)),
+                    _ => 0,
+                };
+                self.overlay = Overlay::SlashComplete { selected, matches };
+            }
+        } else if matches!(self.overlay, Overlay::SlashComplete { .. }) {
+            self.overlay = Overlay::None;
+        }
+    }
+
+    /// Accept the currently selected slash completion into the input.
+    pub fn accept_completion(&mut self) {
+        if let Overlay::SlashComplete { selected, ref matches } = self.overlay {
+            if let Some(cmd) = matches.get(selected) {
+                self.input = cmd.name.to_string();
+            }
+        }
+        self.overlay = Overlay::None;
+    }
+
+    /// Accept the currently selected conversation from the picker.
+    pub fn accept_conversation_pick(&mut self) {
+        if let Overlay::ConversationPicker { selected, ref conversations } = self.overlay {
+            if let Some(conv) = conversations.get(selected) {
+                let conv_id = conv.id.clone();
+                self.overlay = Overlay::None;
+                self.handle_switch_conversation(conv_id);
+                return;
+            }
+        }
+        self.overlay = Overlay::None;
+    }
+
+    /// Returns true if the overlay is currently capturing input.
+    pub fn overlay_active(&self) -> bool {
+        !matches!(self.overlay, Overlay::None)
     }
 
     /// Bump the animation tick. Called once per UI frame.
@@ -487,13 +741,24 @@ Use Tab to toggle the cockpit pane.";
 
 pub fn draw(f: &mut Frame, state: &ChatState) {
     let area = f.size();
+
+    // Dynamic input height: grows with content, capped at 40% of terminal.
+    let input_inner_width = (area.width as usize).saturating_sub(5).max(1);
+    let input_visual_lines = if state.busy {
+        1
+    } else {
+        count_visual_lines(&state.input, input_inner_width)
+    };
+    let max_input_lines = ((area.height as usize) * 40 / 100).max(1);
+    let input_height = (input_visual_lines.min(max_input_lines) as u16) + 2; // +2 for borders
+
     let vchunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),  // header
-            Constraint::Min(5),     // body (messages + optional cockpit)
-            Constraint::Length(3),  // input
-            Constraint::Length(1),  // status footer
+            Constraint::Length(1),            // header
+            Constraint::Min(5),              // body (messages + optional cockpit)
+            Constraint::Length(input_height), // input (dynamic)
+            Constraint::Length(1),            // status footer
         ])
         .split(area);
 
@@ -512,6 +777,9 @@ pub fn draw(f: &mut Frame, state: &ChatState) {
 
     draw_input(f, state, vchunks[2]);
     draw_footer(f, state, vchunks[3]);
+
+    // Overlays render last — on top of everything.
+    draw_overlay(f, state, area, vchunks[2]);
 }
 
 fn draw_header(f: &mut Frame, state: &ChatState, area: Rect) {
@@ -774,33 +1042,26 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
     out
 }
 
+fn count_visual_lines(text: &str, wrap_width: usize) -> usize {
+    if text.is_empty() {
+        return 1;
+    }
+    let w = wrap_width.max(1);
+    let mut count = 0;
+    for line in text.split('\n') {
+        let chars = line.chars().count();
+        if chars == 0 {
+            count += 1;
+        } else {
+            count += (chars + w - 1) / w;
+        }
+    }
+    count.max(1)
+}
+
 fn draw_input(f: &mut Frame, state: &ChatState, area: Rect) {
-    let line = if state.busy {
-        let spinner = SPINNER[(state.tick as usize / 2) % SPINNER.len()];
-        let elapsed = state
-            .turn_started
-            .map(|t| t.elapsed().as_secs())
-            .unwrap_or(0);
-        Line::from(vec![
-            Span::styled(format!(" {} ", spinner), Style::default().fg(ANI_ORANGE).add_modifier(Modifier::BOLD)),
-            Span::styled(
-                format!("thinking… {}s", elapsed),
-                Style::default().fg(ANI_DIM).add_modifier(Modifier::ITALIC),
-            ),
-        ])
-    } else {
-        // Cursor blinks at ~2Hz with the tick (assuming 100ms tick rate).
-        let cursor_visible = (state.tick / 5) % 2 == 0;
-        let cursor = if cursor_visible { "▏" } else { " " };
-        Line::from(vec![
-            Span::styled(" › ", Style::default().fg(ANI_ORANGE).add_modifier(Modifier::BOLD)),
-            Span::styled(state.input.clone(), Style::default().fg(Color::White)),
-            Span::styled(cursor, Style::default().fg(ANI_ORANGE)),
-        ])
-    };
     let border_color = if state.busy {
         let phase = (state.tick as f32 / 8.0).sin().abs();
-        // Breathing dim → orange while thinking.
         let r = (180.0 + (255.0 - 180.0) * phase) as u8;
         let g = (120.0 + (140.0 - 120.0) * phase) as u8;
         let b = (80.0 + (66.0 - 80.0) * phase) as u8;
@@ -812,10 +1073,162 @@ fn draw_input(f: &mut Frame, state: &ChatState, area: Rect) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border_color));
-    f.render_widget(Paragraph::new(line).block(block), area);
+
+    if state.busy {
+        let spinner = SPINNER[(state.tick as usize / 2) % SPINNER.len()];
+        let elapsed = state
+            .turn_started
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0);
+        let line = Line::from(vec![
+            Span::styled(format!(" {} ", spinner), Style::default().fg(ANI_ORANGE).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("thinking… {}s", elapsed),
+                Style::default().fg(ANI_DIM).add_modifier(Modifier::ITALIC),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(line).block(block), area);
+        return;
+    }
+
+    let cursor_visible = (state.tick / 5) % 2 == 0;
+    let cursor_ch: &str = if cursor_visible { "▏" } else { " " };
+    let inner_width = (area.width as usize).saturating_sub(5).max(1);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let logical: Vec<&str> = state.input.split('\n').collect();
+
+    for (li, logical_line) in logical.iter().enumerate() {
+        let wrapped = wrap_words(logical_line, inner_width);
+        for (wi, chunk) in wrapped.iter().enumerate() {
+            let prefix: Span<'static> = if li == 0 && wi == 0 {
+                Span::styled(" › ", Style::default().fg(ANI_ORANGE).add_modifier(Modifier::BOLD))
+            } else {
+                Span::raw("   ")
+            };
+            let is_last = li == logical.len() - 1 && wi == wrapped.len() - 1;
+            let mut spans = vec![prefix, Span::styled(chunk.clone(), Style::default().fg(Color::White))];
+            if is_last {
+                spans.push(Span::styled(cursor_ch.to_string(), Style::default().fg(ANI_ORANGE)));
+            }
+            lines.push(Line::from(spans));
+        }
+    }
+
+    if lines.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled(" › ", Style::default().fg(ANI_ORANGE).add_modifier(Modifier::BOLD)),
+            Span::styled(cursor_ch.to_string(), Style::default().fg(ANI_ORANGE)),
+        ]));
+    }
+
+    let visible_height = area.height.saturating_sub(2) as usize;
+    let scroll = if lines.len() > visible_height {
+        (lines.len() - visible_height) as u16
+    } else {
+        0
+    };
+
+    let para = Paragraph::new(lines).scroll((scroll, 0)).block(block);
+    f.render_widget(para, area);
 }
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+fn draw_overlay(f: &mut Frame, state: &ChatState, full_area: Rect, input_area: Rect) {
+    match &state.overlay {
+        Overlay::None => {}
+        Overlay::SlashComplete { selected, matches } => {
+            let count = matches.len().min(8);
+            let height = count as u16 + 2; // +2 for border
+            let width = 40u16.min(full_area.width.saturating_sub(4));
+            let x = input_area.x + 1;
+            let y = input_area.y.saturating_sub(height);
+            let area = Rect { x, y, width, height };
+
+            f.render_widget(Clear, area);
+
+            let items: Vec<Line<'static>> = matches.iter().enumerate().take(count).map(|(i, cmd)| {
+                let sel = i == *selected;
+                let style = if sel {
+                    Style::default().fg(Color::Rgb(255, 200, 100)).bg(Color::Rgb(60, 40, 20)).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                let hint_style = if sel {
+                    Style::default().fg(Color::Rgb(180, 150, 80)).bg(Color::Rgb(60, 40, 20))
+                } else {
+                    Style::default().fg(STATUS_GRAY)
+                };
+                Line::from(vec![
+                    Span::styled(format!(" {} ", cmd.name), style),
+                    Span::styled(format!(" {}", cmd.hint), hint_style),
+                ])
+            }).collect();
+
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(ANI_DIM));
+            let para = Paragraph::new(items).block(block);
+            f.render_widget(para, area);
+        }
+        Overlay::ConversationPicker { selected, conversations } => {
+            let count = conversations.len();
+            let visible = count.min(12);
+            let height = visible as u16 + 4; // border + header + footer
+            let width = (full_area.width * 3 / 4).max(40).min(full_area.width.saturating_sub(4));
+            let x = (full_area.width.saturating_sub(width)) / 2;
+            let y = (full_area.height.saturating_sub(height)) / 2;
+            let area = Rect { x, y, width, height };
+
+            f.render_widget(Clear, area);
+
+            let inner_width = (width as usize).saturating_sub(4);
+            let mut lines: Vec<Line<'static>> = Vec::new();
+            lines.push(Line::from(Span::styled(
+                " Conversations — ↑↓ select · Enter switch · Esc cancel",
+                Style::default().fg(STATUS_GRAY).add_modifier(Modifier::ITALIC),
+            )));
+
+            let scroll_offset = if *selected >= visible { selected + 1 - visible } else { 0 };
+            for (i, conv) in conversations.iter().enumerate().skip(scroll_offset).take(visible) {
+                let sel = i == *selected;
+                let short_id = &conv.id[..8.min(conv.id.len())];
+                let summary = conv.summary.as_deref().unwrap_or("(no summary)");
+                let label = format!(
+                    " {} · {} msgs · {}",
+                    short_id, conv.message_count, summary,
+                );
+                let truncated = if label.chars().count() > inner_width {
+                    let mut s: String = label.chars().take(inner_width.saturating_sub(1)).collect();
+                    s.push('…');
+                    s
+                } else {
+                    label
+                };
+
+                let style = if sel {
+                    Style::default().fg(Color::Rgb(255, 200, 100)).bg(Color::Rgb(60, 40, 20)).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                lines.push(Line::from(Span::styled(truncated, style)));
+            }
+
+            let block = Block::default()
+                .title(Span::styled(
+                    " Resume ",
+                    Style::default().fg(ANI_ORANGE).add_modifier(Modifier::BOLD),
+                ))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(ANI_ORANGE));
+            let para = Paragraph::new(lines).block(block);
+            f.render_widget(para, area);
+        }
+    }
+}
 
 fn draw_cockpit(f: &mut Frame, state: &ChatState, area: Rect) {
     let panes = Layout::default()
@@ -870,7 +1283,7 @@ fn draw_footer(f: &mut Frame, state: &ChatState, area: Rect) {
     let cockpit_hint = if state.cockpit { "Tab close cockpit" } else { "Tab cockpit" };
     let footer = Line::from(vec![
         Span::styled(
-            format!(" Esc menu · Enter send · ↑↓ scroll · !cmd bash · {} ", cockpit_hint),
+            format!(" Esc menu · Enter send · S-Ret ↵ · ↑↓ scroll · {} ", cockpit_hint),
             Style::default().fg(STATUS_GRAY),
         ),
         Span::raw("│  "),

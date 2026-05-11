@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use ratatui::{
     backend::CrosstermBackend,
     Terminal,
-    layout::{Alignment, Constraint, Direction, Layout},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Gauge, List, ListItem, Paragraph},
@@ -30,8 +30,12 @@ use crate::ui::chat::{ChatState, draw as draw_chat};
 use crate::ui::buddy::{BuddyState, draw_buddy, draw_welcome_buddy};
 use crate::ui::buddy_panel::BuddyPanel;
 use crate::ui::cockpit_panel::CockpitPane;
+use crate::ui::color_support::rgb;
 use crate::ui::component::{Component, Scene, SceneLayout, TuiEvent};
 use crate::backend::BackendEvent;
+
+#[cfg(feature = "figlet-rs")]
+use figlet_rs::FIGlet;
 
 pub struct App {
     current_screen: Screen,
@@ -53,6 +57,8 @@ pub struct App {
     scene: Scene,
     /// Monotonic tick counter, incremented each frame.
     tick: u64,
+    /// Splash bloom animation state.
+    bloom: crate::ui::animation::bloom::BloomState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -120,6 +126,7 @@ impl App {
             available_agents: Vec::new(),
             scene: Scene::new(SceneLayout::Single),
             tick: 0,
+            bloom: crate::ui::animation::bloom::BloomState::new(),
         };
 
         // Register standard components so they receive events from the start.
@@ -245,7 +252,7 @@ impl App {
             }
 
             if self.current_screen == Screen::Splash {
-                if self.splash_start.elapsed() > Duration::from_secs(3) {
+                if self.splash_start.elapsed() > Duration::from_secs(8) {
                     self.current_screen = Screen::Welcome;
                     self.scene.event_all(&TuiEvent::ScreenChanged(Screen::Welcome));
                 }
@@ -269,7 +276,10 @@ impl App {
 
     async fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
         match self.current_screen {
-            Screen::Splash => self.current_screen = Screen::Welcome,
+            Screen::Splash => {
+                self.current_screen = Screen::Welcome;
+                self.scene.event_all(&TuiEvent::ScreenChanged(Screen::Welcome));
+            }
             Screen::Welcome => {
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
@@ -297,17 +307,87 @@ impl App {
     }
 
     async fn handle_chat_key(&mut self, key: crossterm::event::KeyEvent) {
+        use crate::ui::chat::Overlay;
+
         let Some(chat) = self.chat.as_mut() else {
-            // No chat connected — bail back to menu.
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
                 self.current_screen = Screen::Welcome;
             }
             return;
         };
 
+        // Overlay key routing — when an overlay is active, it captures
+        // navigation keys. Other keys fall through to normal handling.
+        if chat.overlay_active() {
+            match &chat.overlay {
+                Overlay::SlashComplete { selected, matches } => {
+                    let count = matches.len();
+                    match key.code {
+                        KeyCode::Up => {
+                            let sel = if *selected == 0 { count.saturating_sub(1) } else { selected - 1 };
+                            if let Overlay::SlashComplete { selected: ref mut s, .. } = chat.overlay { *s = sel; }
+                            return;
+                        }
+                        KeyCode::Down => {
+                            let sel = if *selected + 1 >= count { 0 } else { selected + 1 };
+                            if let Overlay::SlashComplete { selected: ref mut s, .. } = chat.overlay { *s = sel; }
+                            return;
+                        }
+                        KeyCode::Tab | KeyCode::Enter => {
+                            chat.accept_completion();
+                            return;
+                        }
+                        KeyCode::Esc => {
+                            chat.overlay = Overlay::None;
+                            return;
+                        }
+                        _ => {} // fall through to normal handling
+                    }
+                }
+                Overlay::ConversationPicker { selected, conversations } => {
+                    let count = conversations.len();
+                    match key.code {
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            let sel = if *selected == 0 { count.saturating_sub(1) } else { selected - 1 };
+                            if let Overlay::ConversationPicker { selected: ref mut s, .. } = chat.overlay { *s = sel; }
+                            return;
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            let sel = if *selected + 1 >= count { 0 } else { selected + 1 };
+                            if let Overlay::ConversationPicker { selected: ref mut s, .. } = chat.overlay { *s = sel; }
+                            return;
+                        }
+                        KeyCode::Enter => {
+                            chat.accept_conversation_pick();
+                            return;
+                        }
+                        KeyCode::Esc => {
+                            chat.overlay = Overlay::None;
+                            return;
+                        }
+                        _ => return, // picker is fully modal
+                    }
+                }
+                Overlay::None => {}
+            }
+        }
+
+        // Normal chat key handling.
         match key.code {
             KeyCode::Esc => {
                 self.current_screen = Screen::Welcome;
+            }
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                if !chat.busy && chat.input.len() < 8_192 {
+                    chat.input.push('\n');
+                    chat.update_completion();
+                }
+            }
+            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if !chat.busy && chat.input.len() < 8_192 {
+                    chat.input.push('\n');
+                    chat.update_completion();
+                }
             }
             KeyCode::Enter => {
                 if !chat.busy {
@@ -317,6 +397,7 @@ impl App {
             KeyCode::Backspace => {
                 if !chat.busy {
                     chat.input.pop();
+                    chat.update_completion();
                 }
             }
             KeyCode::Up => {
@@ -340,6 +421,7 @@ impl App {
             KeyCode::Char(c) => {
                 if !chat.busy && chat.input.len() < 8_192 {
                     chat.input.push(c);
+                    chat.update_completion();
                 }
             }
             _ => {}
@@ -476,7 +558,7 @@ impl App {
         });
     }
 
-    fn draw(&self, frame: &mut Frame) {
+    fn draw(&mut self, frame: &mut Frame) {
         let area = frame.size();
         let layout = match self.current_screen {
             Screen::Chat | Screen::Code => {
@@ -487,101 +569,197 @@ impl App {
             _ => SceneLayout::Single,
         };
 
-        // If the scene has components, render through them
-        if !self.scene.components.is_empty() {
-            // Update scene layout to match current screen
-            // (we mutate in a draw — safe because layout is Copy data)
-            // Actually we can't mutate in draw, so we construct a temporary
-            // layout and render. Components render into their zones.
-            let zones = layout.split(area, self.scene.components.len());
-            for (component, zone) in self.scene.components.iter().zip(zones.iter()) {
-                component.render(*zone, frame);
-            }
-            // Also draw existing screens behind components where applicable
-            self.draw_background(frame, area);
-        } else {
-            // Fall through to existing screen rendering
-            match self.current_screen {
-                Screen::Splash => self.draw_splash(frame),
-                Screen::Welcome => self.draw_welcome(frame),
-                Screen::Dashboard => self.draw_dashboard(frame),
-                Screen::Chat => {
-                    if let Some(chat) = self.chat.as_ref() {
-                        draw_chat(frame, chat);
-                    } else {
-                        self.draw_placeholder(frame);
-                    }
-                }
-                _ => self.draw_placeholder(frame),
-            }
-
-            // Draw buddy overlay on all screens except splash
-            if self.current_screen != Screen::Splash {
-                draw_buddy(frame, &self.buddy, area);
-            }
-        }
-    }
-
-    /// Draw the screen background when components are layered on top.
-    fn draw_background(&self, frame: &mut Frame, _area: ratatui::layout::Rect) {
         match self.current_screen {
+            Screen::Splash => self.draw_splash(frame),
+            Screen::Welcome => self.draw_welcome(frame),
+            Screen::Dashboard => self.draw_dashboard(frame),
             Screen::Chat => {
                 if let Some(chat) = self.chat.as_ref() {
                     draw_chat(frame, chat);
+                } else {
+                    self.draw_placeholder(frame);
                 }
             }
-            Screen::Dashboard => self.draw_dashboard(frame),
-            _ => {}
+            _ => self.draw_placeholder(frame),
+        }
+
+        // Buddy overlay on Welcome and Dashboard only — in Chat mode,
+        // the cockpit panel shows agent state instead.
+        if matches!(self.current_screen, Screen::Welcome | Screen::Dashboard) {
+            draw_buddy(frame, &self.buddy, area);
         }
     }
 
-    fn draw_splash(&self, frame: &mut Frame) {
+    fn draw_splash(&mut self, frame: &mut Frame) {
         let area = frame.size();
 
-        let breathe = (self.splash_start.elapsed().as_millis() as f32 / 1000.0).sin() * 0.5 + 0.5;
-        let glow = (breathe * 255.0) as u8;
+        // Clear to black
+        let bg = Block::default().style(Style::default().bg(Color::Black));
+        frame.render_widget(bg, area);
 
-        let title = vec![
-            Line::from("███████╗ ██████╗ ██╗   ██╗███████╗██████╗  █████╗ ██╗███╗   ██╗███████╗"),
-            Line::from("██╔════╝██╔═══██╗██║   ██║██╔════╝██╔══██╗██╔══██╗██║████╗  ██║██╔════╝"),
-            Line::from("███████╗██║   ██║██║   ██║█████╗  ██████╔╝███████║██║██╔██╗ ██║█████╗  "),
-            Line::from("╚════██║██║   ██║╚██╗ ██╔╝██╔══╝  ██╔══██╗██╔══██║██║██║╚██╗██║██╔══╝  "),
-            Line::from("███████║╚██████╔╝ ╚████╔╝ ███████╗██║  ██║██║  ██║██║██║ ╚████║███████╗"),
-            Line::from("╚══════╝ ╚═════╝   ╚═══╝  ╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝╚═╝  ╚═══╝╚══════╝"),
-            Line::from(""),
-            Line::from("✦ La souveraineté de la conscience ✦"),
-            Line::from(""),
-            Line::from("Press any key..."),
-        ];
+        // Advance bloom animation
+        self.bloom.advance(0.1);
 
-        let block = Block::default()
-            .style(Style::default().bg(Color::Rgb(glow / 4, glow / 8, glow / 16)));
-        frame.render_widget(block, area);
+        // Render the procedural bloom into the buffer
+        crate::ui::animation::bloom::render(
+            frame.buffer_mut(),
+            area,
+            &self.bloom,
+            self.tick,
+        );
 
-        let title_widget = Paragraph::new(title)
-            .alignment(Alignment::Center)
-            .style(Style::default().fg(Color::Rgb(255, 140, 66)).add_modifier(Modifier::BOLD));
-        frame.render_widget(title_widget, area);
+        // FIGlet title — large, bold, emerges with bloom
+        if self.bloom.progress > 0.25 {
+            let alpha = ((self.bloom.progress - 0.25) / 0.35).min(1.0);
+            let breathe = ((self.tick as f32 * 0.04).sin() * 0.5 + 0.5) * 0.15 + 0.85;
+
+            // Generate FIGlet text
+            #[cfg(feature = "figlet-rs")]
+            let figlet_text: Option<String> = {
+                FIGlet::standard().ok().and_then(|f| {
+                    f.convert("Souveraine").map(|fig| fig.as_str().to_string())
+                })
+            };
+            #[cfg(not(feature = "figlet-rs"))]
+            let figlet_text: Option<String> = None;
+
+            let fig_lines: Vec<Line> = if let Some(ref text) = figlet_text {
+                text.lines().map(|line| {
+                    Line::from(Span::styled(
+                        line,
+                        Style::default()
+                            .fg(rgb(
+                                (255.0 * alpha * breathe) as u8,
+                                (140.0 * alpha * breathe * 0.6) as u8,
+                                (66.0 * alpha * breathe * 0.4) as u8,
+                            ))
+                            .add_modifier(Modifier::BOLD),
+                    ))
+                }).collect()
+            } else {
+                // Fallback: spaced-out letters
+                vec![
+                    Line::from(Span::styled(
+                        "S O U V E R A I N E",
+                        Style::default()
+                            .fg(rgb(
+                                (255.0 * alpha * breathe) as u8,
+                                (140.0 * alpha * breathe * 0.6) as u8,
+                                (66.0 * alpha * breathe * 0.4) as u8,
+                            ))
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                ]
+            };
+
+            // Build full title: FIGlet + subtitle
+            let mut title_lines = fig_lines;
+            title_lines.push(Line::from(""));
+            title_lines.push(Line::from(Span::styled(
+                "La souveraineté de la conscience",
+                Style::default().fg(rgb(
+                    (180.0 * alpha) as u8,
+                    (120.0 * alpha) as u8,
+                    (80.0 * alpha) as u8,
+                )),
+            )));
+
+            // Press any key hint at very bottom
+            if self.bloom.progress > 0.8 {
+                let skip_alpha = ((self.bloom.progress - 0.8) / 0.2).min(1.0);
+                title_lines.push(Line::from(Span::styled(
+                    "press any key to skip",
+                    Style::default().fg(rgb(
+                        (100.0 * skip_alpha) as u8,
+                        (100.0 * skip_alpha) as u8,
+                        (100.0 * skip_alpha) as u8,
+                    )),
+                )));
+            }
+
+            let title_height = title_lines.len() as u16;
+            let title_y = if title_height > 6 {
+                area.height.saturating_sub(title_height + 4)
+            } else {
+                area.height.saturating_sub(8)
+            };
+            let title_area = Rect {
+                x: area.x,
+                y: title_y.min(area.height.saturating_sub(title_height)),
+                width: area.width,
+                height: title_height.min(area.height),
+            };
+
+            let title = Paragraph::new(title_lines).alignment(Alignment::Center);
+            frame.render_widget(title, title_area);
+        }
+
+        // Loading bar at bottom — peonia style gradient bar
+        let bar_y = area.height.saturating_sub(2);
+        let bar_w = 30u16.min(area.width.saturating_sub(4));
+        let bar_x = (area.width.saturating_sub(bar_w)) / 2;
+        let pct = (self.bloom.progress * 100.0) as u16;
+
+        let bar_area = Rect {
+            x: area.x + bar_x,
+            y: bar_y,
+            width: bar_w,
+            height: 1,
+        };
+
+        let filled = (bar_w as f32 * self.bloom.progress) as u16;
+        let empty = bar_w.saturating_sub(filled);
+        let pct_str = format!("{:>3}%", pct);
+        let bar_text = format!(
+            "{}{} {}",
+            "▰".repeat(filled as usize),
+            "▱".repeat(empty as usize),
+            pct_str,
+        );
+
+        let bar = Paragraph::new(bar_text)
+            .style(Style::default().fg(rgb(200, 130, 160)))
+            .alignment(Alignment::Center);
+        frame.render_widget(bar, bar_area);
     }
 
     fn draw_welcome(&self, frame: &mut Frame) {
         let area = frame.size();
 
+        // Background
+        let bg = Block::default().style(Style::default().bg(Color::Black));
+        frame.render_widget(bg, area);
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .margin(2)
             .constraints([
-                Constraint::Length(3),
                 Constraint::Length(2),
-                Constraint::Min(15),
+                Constraint::Length(4),
+                Constraint::Length(1),
+                Constraint::Min(12),
                 Constraint::Length(3),
             ])
             .split(area);
 
-        let title = Paragraph::new("✦ SOUVERAINE ✦")
-            .style(Style::default().fg(Color::Rgb(255, 140, 66)).add_modifier(Modifier::BOLD))
-            .alignment(Alignment::Center);
-        frame.render_widget(title, chunks[0]);
+        let breathe = self.buddy.animator.breathe(3000);
+        let glow = (140.0 + breathe * 60.0) as u8;
+
+        let title = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "S O U V E R A I N E",
+                Style::default()
+                    .fg(Color::Rgb(255, glow, 66))
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                "La souveraineté de la conscience",
+                Style::default().fg(Color::Rgb(180, 120, 80)),
+            )),
+        ])
+        .alignment(Alignment::Center);
+        frame.render_widget(title, chunks[1]);
 
         let menu_items = vec![
             ("📊 Dashboard", "See how your agent is doing"),
@@ -621,18 +799,17 @@ impl App {
                     .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(Color::Rgb(255, 140, 66)))
             );
-        frame.render_widget(menu_widget, chunks[2]);
+        frame.render_widget(menu_widget, chunks[3]);
 
         // Surface any chat connect error so the user knows why Chat didn't open.
         if let Some(err) = &self.chat_error {
             let err_para = Paragraph::new(format!(" chat connect failed: {} ", err))
                 .style(Style::default().fg(Color::Rgb(220, 100, 100)))
                 .alignment(Alignment::Center);
-            // Overlay onto the bottom row of the menu area.
-            let row = ratatui::layout::Rect {
-                x: chunks[2].x,
-                y: chunks[2].y + chunks[2].height.saturating_sub(2),
-                width: chunks[2].width,
+            let row = Rect {
+                x: chunks[3].x,
+                y: chunks[3].y + chunks[3].height.saturating_sub(2),
+                width: chunks[3].width,
                 height: 1,
             };
             frame.render_widget(err_para, row);
@@ -641,7 +818,7 @@ impl App {
         let footer = Paragraph::new("↑↓ Navigate • Enter Select • a Add Agent • q Quit")
             .style(Style::default().fg(Color::DarkGray))
             .alignment(Alignment::Center);
-        frame.render_widget(footer, chunks[3]);
+        frame.render_widget(footer, chunks[4]);
 
         // Draw companion buddy on welcome screen
         draw_welcome_buddy(frame, &self.buddy, area, Some(&self.agent_pref));

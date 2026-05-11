@@ -23,7 +23,7 @@ pub mod strategy;
 
 pub use config::{CompactionConfig, CompactionStrategyKind};
 pub use plan::{AuditEntry, CompactionPlan, CompactionReport};
-pub use strategy::{CompactionStrategy, CullStrategy, KeyValueStrategy, QuoteStrategy, SummaryStrategy};
+pub use strategy::{CompactionStrategy, CullStrategy, MicrocompactStrategy, SlidingWindowStrategy, SummaryStrategy};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -102,19 +102,33 @@ impl CompactionEngine for DefaultCompactionEngine {
         agent_id: &str,
         strategy_override: Option<CompactionStrategyKind>,
     ) -> anyhow::Result<CompactionReport> {
-        let messages = (self.get_messages)(agent_id)
-            .ok_or_else(|| anyhow::anyhow!("No session found for agent {}", agent_id))?;
-
-        let before_count = messages.len();
-        let before_tokens = count_messages(&self.counter, &messages);
-
-        // Resolve config
+        // Resolve config early so we can bail before requiring a session
         let agent_type = (self.get_agent_type)(agent_id)
             .unwrap_or_else(|| "primary".to_string());
         let cfg = {
             let app_config = self.config.read().await;
             app_config.compaction.for_agent_type(&agent_type)
         };
+
+        let messages = match (self.get_messages)(agent_id) {
+            Some(m) => m,
+            None if !cfg.enabled => {
+                return Ok(CompactionReport {
+                    agent_id: agent_id.to_string(),
+                    strategy: strategy_override.unwrap_or(cfg.strategy.clone()),
+                    before_tokens: 0,
+                    after_tokens: 0,
+                    messages_before: 0,
+                    messages_after: 0,
+                    messages_compacted: 0,
+                    audit_path: None,
+                });
+            }
+            None => anyhow::bail!("No session found for agent {}", agent_id),
+        };
+
+        let before_count = messages.len();
+        let before_tokens = count_messages(&self.counter, &messages);
 
         if !cfg.enabled {
             return Ok(CompactionReport {
@@ -147,26 +161,16 @@ impl CompactionEngine for DefaultCompactionEngine {
                 }
                 None => CompactionPlan::empty(),
             },
-            CompactionStrategyKind::KeyValue => match &self.bifrost {
-                Some(client) => {
-                    let model = self
-                        .model
-                        .as_deref()
-                        .unwrap_or("openai/kimi-k2.6");
-                    let s = KeyValueStrategy {
-                        client: client.clone(),
-                        model: model.to_string(),
-                    };
-                    s.plan(&messages, &cfg, &self.counter).await?
-                }
-                None => CompactionPlan::empty(),
-            },
-            CompactionStrategyKind::Quote => {
-                let s = QuoteStrategy;
-                s.plan(&messages, &cfg, &self.counter).await?
-            }
             CompactionStrategyKind::Cull => {
                 let s = CullStrategy;
+                s.plan(&messages, &cfg, &self.counter).await?
+            }
+            CompactionStrategyKind::Microcompact => {
+                let s = MicrocompactStrategy;
+                s.plan(&messages, &cfg, &self.counter).await?
+            }
+            CompactionStrategyKind::SlidingWindow => {
+                let s = SlidingWindowStrategy;
                 s.plan(&messages, &cfg, &self.counter).await?
             }
         };
@@ -184,28 +188,35 @@ impl CompactionEngine for DefaultCompactionEngine {
             });
         }
 
-        // Build replacement messages
-        let mut new_messages: Vec<ConversationMessage> = Vec::new();
-
-        for &idx in &plan.keep_indices {
-            if idx < messages.len() {
-                new_messages.push(messages[idx].clone());
-            }
-        }
-
-        if let Some(ref summary_text) = plan.summary_text {
-            new_messages.push(ConversationMessage {
-                role: crate::core::session::MessageRole::System,
-                blocks: vec![crate::core::session::ContentBlock::Text {
-                    text: format!("[Compacted summary]\n{}", summary_text),
-                }],
-                usage: None,
-                timestamp: Some(Utc::now()),
-            });
-        }
-
-        let messages_compacted = before_count.saturating_sub(new_messages.len());
-        let after_tokens = count_messages(&self.counter, &new_messages);
+        // Build replacement messages.
+        // Microcompact provides a full replacement list; other strategies
+        // use keep_indices + optional summary_text.
+        let (new_messages, messages_compacted, after_tokens) =
+            if let Some(replacement) = plan.replacement_messages {
+                let compacted = before_count.saturating_sub(replacement.len());
+                let tokens = count_messages(&self.counter, &replacement);
+                (replacement, compacted, tokens)
+            } else {
+                let mut kept = Vec::new();
+                for &idx in &plan.keep_indices {
+                    if idx < messages.len() {
+                        kept.push(messages[idx].clone());
+                    }
+                }
+                if let Some(ref summary_text) = plan.summary_text {
+                    kept.push(ConversationMessage {
+                        role: crate::core::session::MessageRole::System,
+                        blocks: vec![crate::core::session::ContentBlock::Text {
+                            text: format!("[Compacted summary]\n{}", summary_text),
+                        }],
+                        usage: None,
+                        timestamp: Some(Utc::now()),
+                    });
+                }
+                let compacted = before_count.saturating_sub(kept.len());
+                let tokens = count_messages(&self.counter, &kept);
+                (kept, compacted, tokens)
+            };
 
         if let Err(e) = (self.replace_messages)(agent_id, new_messages) {
             tracing::warn!("[compact] Failed to replace session messages: {}", e);
@@ -223,8 +234,6 @@ impl CompactionEngine for DefaultCompactionEngine {
                 before_tokens,
                 after_tokens,
                 summary_text: plan.summary_text.clone(),
-                kv_count: plan.kv_pairs.len(),
-                quote_count: plan.quotes.len(),
                 culled_count: plan.culled_count,
             };
             self.write_audit(agent_id, &entry).await.ok()

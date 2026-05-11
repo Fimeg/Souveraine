@@ -578,7 +578,7 @@ pub fn parse_memory_file(content: &str) -> Result<MemoryFile> {
         .ok_or_else(|| anyhow!("memory file frontmatter has no closing ---"))?;
 
     let frontmatter_text = &after_first[..end_idx].trim();
-    let body_start = end_idx + 4; // skip the \n and ---
+    let body_start = 3 + end_idx + 4; // 3 for opening --- + end_idx + 4 for \n---
     let body = content[body_start..].trim().to_string();
 
     // Parse YAML frontmatter
@@ -844,7 +844,7 @@ Paths are relative to my memory directory. Frontmatter description is required o
                 },
                 "strategy": {
                     "type": "string",
-                    "enum": ["summary", "key-value", "key_value", "quote", "cull"],
+                    "enum": ["microcompact", "micro", "sliding_window", "sliding-window", "summary", "cull"],
                     "description": "Compaction strategy (for compact subcommand)"
                 }
             },

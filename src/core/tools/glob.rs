@@ -143,12 +143,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_glob_current_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("hello.rs"), "fn main() {}").unwrap();
+        std::fs::write(dir.path().join("world.rs"), "fn test() {}").unwrap();
+
+        let mut ctx = ToolContext::new();
+        ctx.cwd = Some(dir.path().to_path_buf());
         let glob = Glob;
         let input = serde_json::json!({ "pattern": "*.rs" });
-        let result = glob.execute(input, &ToolContext::new()).await.unwrap();
+        let result = glob.execute(input, &ctx).await.unwrap();
         assert!(
-            result.content.contains("defs.rs") || result.content.contains("mod.rs"),
-            "expected .rs files in glob results: {}",
+            result.content.contains("hello.rs"),
+            "expected hello.rs in glob results: {}",
             result.content
         );
     }

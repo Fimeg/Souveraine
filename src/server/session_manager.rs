@@ -1,7 +1,9 @@
+use crate::core::conversation::{ConversationRecord, ConversationStore};
 use crate::core::session::ConversationMessage;
 use crate::api::models::StreamEvent;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::broadcast::{self, Sender};
 use uuid::Uuid;
@@ -9,6 +11,17 @@ use uuid::Uuid;
 pub struct SessionManager {
     sessions: DashMap<String, Session>,
     agent_conversations: DashMap<String, Vec<String>>,
+    store: Option<Arc<ConversationStoreHandle>>,
+}
+
+struct ConversationStoreHandle {
+    agents_dir: PathBuf,
+}
+
+impl ConversationStoreHandle {
+    fn store_for(&self, agent_id: &str) -> ConversationStore {
+        ConversationStore::new(&self.agents_dir.join(agent_id))
+    }
 }
 
 pub struct Session {
@@ -28,6 +41,17 @@ impl SessionManager {
         Self {
             sessions: DashMap::new(),
             agent_conversations: DashMap::new(),
+            store: None,
+        }
+    }
+
+    pub fn with_persistence(agents_dir: PathBuf) -> Self {
+        Self {
+            sessions: DashMap::new(),
+            agent_conversations: DashMap::new(),
+            store: Some(Arc::new(ConversationStoreHandle {
+                agents_dir,
+            })),
         }
     }
 
@@ -42,6 +66,54 @@ impl SessionManager {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             turn_count: 0,
+            last_n25: Utc::now(),
+            context_pressure: 0.0,
+            event_sender: sender,
+        };
+
+        self.sessions.insert(conversation_id.clone(), session);
+        self.agent_conversations
+            .entry(agent_id.to_string())
+            .or_insert_with(Vec::new)
+            .push(conversation_id.clone());
+
+        if let Some(handle) = &self.store {
+            let record = ConversationRecord::new(
+                conversation_id.clone(),
+                agent_id.to_string(),
+            );
+            let store = handle.store_for(agent_id);
+            tokio::spawn(async move {
+                if let Err(e) = store.save_metadata(&record).await {
+                    tracing::warn!("Failed to persist conversation metadata: {}", e);
+                }
+            });
+        }
+
+        conversation_id
+    }
+
+    /// Create a conversation and load existing messages from an in-memory
+    /// session that was previously active. Used for restoring from disk.
+    pub fn create_with_messages(
+        &self,
+        agent_id: &str,
+        conversation_id: String,
+        messages: Vec<ConversationMessage>,
+    ) -> String {
+        let (sender, _receiver) = broadcast::channel(100);
+        let turn_count = messages
+            .iter()
+            .filter(|m| m.role == crate::core::session::MessageRole::Assistant)
+            .count() as u32;
+
+        let session = Session {
+            conversation_id: conversation_id.clone(),
+            agent_id: agent_id.to_string(),
+            messages,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            turn_count,
             last_n25: Utc::now(),
             context_pressure: 0.0,
             event_sender: sender,
@@ -77,6 +149,25 @@ impl SessionManager {
             session.turn_count += 1;
         }
 
+        if let Some(handle) = &self.store {
+            let agent_id = session.agent_id.clone();
+            let conv_id = conversation_id.to_string();
+            let messages = session.messages.clone();
+            let msg_count = messages.len() as u32;
+            let store = handle.store_for(&agent_id);
+            tokio::spawn(async move {
+                if let Err(e) = store.save_messages(&conv_id, &messages).await {
+                    tracing::warn!("Failed to persist messages: {}", e);
+                }
+                if let Ok(Some(mut record)) = store.load_metadata(&conv_id).await {
+                    record.message_count = msg_count;
+                    record.updated_at = Utc::now();
+                    record.last_message_at = Some(Utc::now());
+                    let _ = store.save_metadata(&record).await;
+                }
+            });
+        }
+
         Ok(())
     }
 
@@ -108,5 +199,30 @@ impl SessionManager {
             .get(agent_id)
             .map(|v| v.clone())
             .unwrap_or_default()
+    }
+
+    /// Load persisted conversations for an agent from disk into the
+    /// session manager. Call once at startup per agent.
+    pub async fn load_persisted(&self, agent_id: &str) -> anyhow::Result<Vec<ConversationRecord>> {
+        let handle = match &self.store {
+            Some(h) => h,
+            None => return Ok(Vec::new()),
+        };
+        let store = handle.store_for(agent_id);
+        let records = store.list_active().await?;
+
+        for record in &records {
+            if self.sessions.contains_key(&record.id) {
+                continue;
+            }
+            let messages = store.load_messages(&record.id).await.unwrap_or_default();
+            self.create_with_messages(agent_id, record.id.clone(), messages);
+        }
+
+        Ok(records)
+    }
+
+    pub fn conversation_store_for(&self, agent_id: &str) -> Option<ConversationStore> {
+        self.store.as_ref().map(|h| h.store_for(agent_id))
     }
 }

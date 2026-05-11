@@ -98,26 +98,33 @@ impl Default for AgentCompactionConfig {
     }
 }
 
-/// Available compaction strategies.
+/// Available compaction strategies. Synthesized from OpenHarness
+/// (port of Claude Code's microCompact.ts / autoCompact.ts), hermes-agent,
+/// claw-open, and jcode. See `docs/tasks/compaction-rebuild.md`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum CompactionStrategyKind {
-    /// LLM-based summarization of oldest messages into a single replacement.
+    /// Cheap pre-pass: replace old tool result contents with a placeholder,
+    /// keeping recent tool results intact. No LLM. From OpenHarness/Claude
+    /// Code microCompact.ts. The first response to context pressure.
+    Microcompact,
+    /// Keep system + last N messages, drop the middle. No LLM. Fast.
+    /// Tool-pair aware: never splits a tool call from its result.
+    SlidingWindow,
+    /// LLM-based structured summarization of oldest messages, producing a
+    /// 9-section boundary message (from OpenHarness/Claude Code autoCompact.ts).
     Summary,
-    /// LLM-based extraction of key facts, decisions, and plans.
-    KeyValue,
-    /// Pattern-based preservation of important verbatim quotes.
-    Quote,
-    /// Drop low-value messages (greetings, acknowledgments).
+    /// Drop low-value messages (greetings, acknowledgments). Role-aware:
+    /// never drops System or Tool messages or tool-call carriers.
     Cull,
 }
 
 impl CompactionStrategyKind {
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
+            "microcompact" | "micro" | "tool_results" => Some(Self::Microcompact),
+            "sliding_window" | "sliding-window" | "window" => Some(Self::SlidingWindow),
             "summarize" | "summary" => Some(Self::Summary),
-            "key-value" | "key_value" | "keyvalue" | "kv" => Some(Self::KeyValue),
-            "quote" => Some(Self::Quote),
             "cull" => Some(Self::Cull),
             _ => None,
         }
@@ -125,9 +132,9 @@ impl CompactionStrategyKind {
 
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::Microcompact => "microcompact",
+            Self::SlidingWindow => "sliding_window",
             Self::Summary => "summary",
-            Self::KeyValue => "key_value",
-            Self::Quote => "quote",
             Self::Cull => "cull",
         }
     }

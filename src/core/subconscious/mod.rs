@@ -84,14 +84,26 @@ impl InboxItem {
 
 /// File-backed subconscious nervous system. Backed by a [`MemoryRepo`] so every
 /// inbox mutation is a git commit and survives compaction.
+///
+/// The inbox boxes (pending/intrusive/sent) live in the subconscious agent's
+/// own memfs — that's Aster's working space. But the inner voice channel
+/// (`system/metacognition/subconscious.md`) writes to the **primary** agent's
+/// memfs so Annie can actually read what Aster noticed.
 #[derive(Clone)]
 pub struct SubconsciousInbox {
     repo: MemoryRepo,
+    /// Primary agent's repo — inner voice writes go here so the primary sees them.
+    primary_repo: Option<MemoryRepo>,
 }
 
 impl SubconsciousInbox {
     pub fn new(repo: MemoryRepo) -> Self {
-        Self { repo }
+        Self { repo, primary_repo: None }
+    }
+
+    /// Create an inbox that delivers inner voice to the primary agent's memfs.
+    pub fn with_primary(repo: MemoryRepo, primary_repo: MemoryRepo) -> Self {
+        Self { repo, primary_repo: Some(primary_repo) }
     }
 
     /// Ensure the three boxes exist. Idempotent.
@@ -127,14 +139,18 @@ impl SubconsciousInbox {
         self.write_items(INTRUSIVE, &items).await
     }
 
-    /// Append a line to the append-only inner voice channel
-    /// (`system/metacognition/subconscious.md`).
+    /// Surface an observation from the subconscious to the conscious mind.
+    ///
+    /// Appends to the primary agent's `system/metacognition/subconscious.md`
+    /// so the conscious agent finds it in her own memfs — not buried in
+    /// Aster's working directory.
     ///
     /// Format: `[2026-05-06 14:32] [URGENCY: low] — content`
-    pub async fn deliver_to_subconscious(&self, urgency: Urgency, content: &str) -> Result<()> {
+    pub async fn surface_to_conscious(&self, urgency: Urgency, content: &str) -> Result<()> {
         let stamp = Utc::now().format("%Y-%m-%d %H:%M");
         let line = format!("[{}] [URGENCY: {}] — {}", stamp, urgency.as_str(), content);
-        self.repo.append(INNER_VOICE, &line).await
+        let target = self.primary_repo.as_ref().unwrap_or(&self.repo);
+        target.append(INNER_VOICE, &line).await
     }
 
     /// Read pending items.
@@ -324,11 +340,11 @@ mod tests {
         inbox.init().await.unwrap();
 
         inbox
-            .deliver_to_subconscious(Urgency::Low, "first thought")
+            .surface_to_conscious(Urgency::Low, "first thought")
             .await
             .unwrap();
         inbox
-            .deliver_to_subconscious(Urgency::High, "second thought")
+            .surface_to_conscious(Urgency::High, "second thought")
             .await
             .unwrap();
 

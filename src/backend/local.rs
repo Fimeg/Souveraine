@@ -12,17 +12,44 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::bridge::bifrost::{ChatCompletionRequest, Message as BifrostMessage};
+use crate::bridge::model_router::TokenCounter;
 use crate::core::compact::CompactionEngine;
 use crate::core::config::ConsciousnessConfig;
 use crate::core::session::{ContentBlock, ConversationMessage, MessageRole};
 use crate::core::tools::defs::{SubagentParams, SubagentRunner, ToolContext};
 use crate::server::{ConsciousnessEvent, SouveraineServer};
 
-use super::{AgentInfo, Backend, BackendEvent};
+use super::{AgentInfo, Backend, BackendEvent, ConversationInfo};
+
+/// Scale max output tokens proportionally to remaining context room.
+/// Below 80%: no cap. Above 80%: linear taper from the model's configured
+/// output_limit to a minimum floor at saturation. The agent feels the throat
+/// tighten progressively rather than hitting a cliff.
+fn pressure_to_max_tokens(pressure: f32, output_limit: u32) -> Option<u32> {
+    if pressure <= 0.80 {
+        return None;
+    }
+    let remaining = (1.0 - pressure) / 0.20; // 1.0 at 80%, 0.0 at 100%
+    let ratio = remaining.max(0.0).min(1.0);
+    let budget = (output_limit as f32 * ratio) as u32;
+    Some(budget.max(512))
+}
+
+/// Mirror of `ConsciousnessEngine::calculate_pressure` for the in-loop
+/// BifrostMessage shape, so we can recompute pressure as tool results
+/// accumulate inside a single turn. The 128k limit matches the existing
+/// hardcode in consciousness_engine.rs; per-model context_limit lives in
+/// Constitution V.3 and is still a TODO.
+fn bifrost_pressure(counter: &TokenCounter, messages: &[BifrostMessage]) -> f32 {
+    let tokens: usize = messages.iter().map(|m| counter.count(&m.content)).sum();
+    let limit = 128_000;
+    (tokens as f32 / limit as f32).min(1.0)
+}
 
 // ── LocalSubagentRunner ──────────────────────────────────────────
 
@@ -206,6 +233,12 @@ impl SubagentRunner for LocalSubagentRunner {
                     content: output,
                 });
             }
+
+            // Brief pause between tool rounds to let rate limits cool
+            let sub_delay = Duration::from_millis(app_config.subagent.inter_round_delay_ms);
+            if sub_delay > Duration::ZERO {
+                tokio::time::sleep(sub_delay).await;
+            }
         }
 
         // If we hit max rounds without a final response, note it
@@ -279,9 +312,137 @@ impl Backend for LocalBackend {
             .collect())
     }
 
+    async fn new_conversation(&self, agent_id: &str) -> Result<String> {
+        let _ = self.server.agents.get(agent_id).await?;
+        let conv_id = self.server.sessions.create(agent_id);
+
+        let memory_root = self.server.agents.memory_root(agent_id);
+        let (bundled, user, agent_memfs, project) =
+            crate::core::skills::default_discovery_paths(Some(memory_root.clone()));
+        let skills = crate::core::skills::discover(
+            bundled.as_deref(),
+            user.as_deref(),
+            agent_memfs.as_deref(),
+            project.as_deref(),
+        )
+        .await
+        .unwrap_or_default();
+
+        let system_prompt =
+            crate::core::prompt::build_system_prompt(&memory_root, Some(&skills)).await;
+
+        self.server.sessions.add_message(
+            &conv_id,
+            ConversationMessage {
+                role: crate::core::session::MessageRole::System,
+                blocks: vec![crate::core::session::ContentBlock::Text {
+                    text: system_prompt,
+                }],
+                usage: None,
+                timestamp: Some(chrono::Utc::now()),
+            },
+        )?;
+
+        Ok(conv_id)
+    }
+
+    async fn list_conversations(&self, agent_id: &str) -> Result<Vec<ConversationInfo>> {
+        let store = match self.server.sessions.conversation_store_for(agent_id) {
+            Some(s) => s,
+            None => {
+                let conv_ids = self.server.sessions.list_for_agent(agent_id);
+                return Ok(conv_ids
+                    .into_iter()
+                    .filter_map(|id| {
+                        let session = self.server.sessions.get(&id)?;
+                        Some(ConversationInfo {
+                            id: session.conversation_id.clone(),
+                            agent_id: session.agent_id.clone(),
+                            summary: None,
+                            message_count: session.messages.len() as u32,
+                            updated_at: session.updated_at.to_rfc3339(),
+                        })
+                    })
+                    .collect());
+            }
+        };
+
+        let records = store.list_active().await?;
+        Ok(records
+            .into_iter()
+            .map(|r| ConversationInfo {
+                id: r.id,
+                agent_id: r.agent_id,
+                summary: r.summary,
+                message_count: r.message_count,
+                updated_at: r.updated_at.to_rfc3339(),
+            })
+            .collect())
+    }
+
+    async fn load_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<crate::core::session::ConversationMessage>> {
+        if let Some(session) = self.server.sessions.get(conversation_id) {
+            return Ok(session.messages.clone());
+        }
+
+        // Not in memory — try loading from disk. We need the agent_id to find the store.
+        // Search all known agents.
+        let agents = self.server.agents.list(None).await?;
+        for agent in agents {
+            if let Some(store) = self.server.sessions.conversation_store_for(&agent.id) {
+                if let Ok(Some(_record)) = store.load_metadata(conversation_id).await {
+                    let messages = store.load_messages(conversation_id).await?;
+                    self.server.sessions.create_with_messages(
+                        &agent.id,
+                        conversation_id.to_string(),
+                        messages.clone(),
+                    );
+                    return Ok(messages);
+                }
+            }
+        }
+
+        anyhow::bail!("Conversation not found: {}", conversation_id)
+    }
+
     async fn ensure_conversation(&self, agent_id: &str) -> Result<String> {
         let _ = self.server.agents.get(agent_id).await?;
-        Ok(self.server.sessions.create(agent_id))
+        let conv_id = self.server.sessions.create(agent_id);
+
+        // Build system prompt from the agent's memfs and inject as first message
+        let memory_root = self.server.agents.memory_root(agent_id);
+
+        // Discover skills from all 4 tiers
+        let (bundled, user, agent_memfs, project) =
+            crate::core::skills::default_discovery_paths(Some(memory_root.clone()));
+        let skills = crate::core::skills::discover(
+            bundled.as_deref(),
+            user.as_deref(),
+            agent_memfs.as_deref(),
+            project.as_deref(),
+        )
+        .await
+        .unwrap_or_default();
+
+        let system_prompt =
+            crate::core::prompt::build_system_prompt(&memory_root, Some(&skills)).await;
+
+        self.server.sessions.add_message(
+            &conv_id,
+            ConversationMessage {
+                role: crate::core::session::MessageRole::System,
+                blocks: vec![crate::core::session::ContentBlock::Text {
+                    text: system_prompt,
+                }],
+                usage: None,
+                timestamp: Some(chrono::Utc::now()),
+            },
+        )?;
+
+        Ok(conv_id)
     }
 
     async fn send(
@@ -355,6 +516,13 @@ async fn run_turn(
     let max_rounds = agent.llm_config.max_tool_rounds;
     let model = agent.llm_config.model.clone();
     let temperature = agent.llm_config.temperature;
+    let inter_round_delay = Duration::from_millis(agent.llm_config.inter_round_delay_ms);
+
+    // Resolve the model's configured output limit for pressure scaling
+    let output_limit = {
+        let cfg = server.app_config.read().await;
+        cfg.models.get(&model).map(|m| m.output_limit as u32).unwrap_or(8192)
+    };
 
     // Build per-agent ToolContext with correct memory root and subagent runner
     let memory_root = Some(server.agents.memory_root(&agent_id));
@@ -393,13 +561,18 @@ async fn run_turn(
     let mut messages = initial_messages;
     let mut tool_round = 0u32;
     let final_content: String;
+    let counter = TokenCounter::new();
 
     loop {
+        let pressure = bifrost_pressure(&counter, &messages);
+        let max_tokens = pressure_to_max_tokens(pressure, output_limit);
+        let _ = tx.send(Ok(BackendEvent::ContextPressure(pressure))).await;
+
         let req = ChatCompletionRequest {
             model: model.clone(),
             messages: messages.clone(),
             stream: Some(false),
-            max_tokens: None,
+            max_tokens,
             temperature,
             tools: if max_rounds > 0 {
                 Some(bifrost_tools.clone())
@@ -408,7 +581,17 @@ async fn run_turn(
             },
         };
 
-        let response = server.bifrost.chat_completion(req).await?;
+        let (response, strain) = server.bifrost.chat_completion_with_strain(req).await?;
+
+        for event in &strain {
+            if let crate::bridge::bifrost::InferenceStrain::Transient { attempt, status, model, .. } = event {
+                let _ = tx.send(Ok(BackendEvent::InferenceStrain {
+                    attempt: *attempt,
+                    status: *status,
+                    model: model.clone(),
+                })).await;
+            }
+        }
 
         if response.tool_calls.is_empty() || tool_round >= max_rounds {
             // Text response (or hit max rounds) — this is the final output
@@ -482,6 +665,11 @@ async fn run_turn(
                 role: "tool".to_string(),
                 content: output,
             });
+        }
+
+        // Brief pause between tool rounds to let rate limits cool
+        if inter_round_delay > Duration::ZERO {
+            tokio::time::sleep(inter_round_delay).await;
         }
 
         // Continue loop — model will see tool results and respond

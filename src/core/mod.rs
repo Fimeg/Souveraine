@@ -8,10 +8,13 @@
 pub mod chain;
 pub mod compact;
 pub mod config;
+pub mod conversation;
 pub mod memory;
+pub mod prompt;
 pub mod reflection;
 pub mod sensorium;
 pub mod session;
+pub mod skills;
 pub mod subagent;
 pub mod subconscious;
 pub mod tools;

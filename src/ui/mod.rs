@@ -4,6 +4,7 @@ pub mod buddy;
 pub mod buddy_panel;
 pub mod chat;
 pub mod cockpit_panel;
+pub mod color_support;
 pub mod component;
 pub mod markdown;
 

@@ -1,8 +1,9 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+
+use crate::core::session::ConversationMessage;
 
 use super::config::CompactionStrategyKind;
 
@@ -13,14 +14,14 @@ pub struct CompactionPlan {
     pub keep_indices: Vec<usize>,
     /// Summary text replacing compacted messages (Strategy::Summary).
     pub summary_text: Option<String>,
-    /// Extracted key-value pairs (Strategy::KeyValue).
-    pub kv_pairs: HashMap<String, String>,
-    /// Preserved verbatim quotes (Strategy::Quote).
-    pub quotes: Vec<String>,
-    /// Number of trivial messages dropped (Strategy::Cull).
+    /// Number of messages dropped or rewritten by this plan.
     pub culled_count: usize,
     /// Estimated token savings from this plan.
     pub token_savings: usize,
+    /// If set, the engine uses this full message list as the post-compaction
+    /// state, bypassing `keep_indices` + `summary_text`. Used by Microcompact,
+    /// which mutates tool result blocks in place rather than dropping messages.
+    pub replacement_messages: Option<Vec<ConversationMessage>>,
 }
 
 impl CompactionPlan {
@@ -28,18 +29,16 @@ impl CompactionPlan {
         Self {
             keep_indices: Vec::new(),
             summary_text: None,
-            kv_pairs: HashMap::new(),
-            quotes: Vec::new(),
             culled_count: 0,
             token_savings: 0,
+            replacement_messages: None,
         }
     }
 
     pub fn is_empty(&self) -> bool {
         self.summary_text.is_none()
-            && self.kv_pairs.is_empty()
-            && self.quotes.is_empty()
             && self.culled_count == 0
+            && self.replacement_messages.is_none()
     }
 }
 
@@ -96,8 +95,6 @@ pub struct AuditEntry {
     pub before_tokens: usize,
     pub after_tokens: usize,
     pub summary_text: Option<String>,
-    pub kv_count: usize,
-    pub quote_count: usize,
     pub culled_count: usize,
 }
 
@@ -114,14 +111,8 @@ impl AuditEntry {
         if let Some(ref summary) = self.summary_text {
             body.push_str(&format!("\n## Summary Content\n\n{}\n", summary));
         }
-        if self.kv_count > 0 {
-            body.push_str(&format!("\nKey-value pairs extracted: {}\n", self.kv_count));
-        }
-        if self.quote_count > 0 {
-            body.push_str(&format!("\nQuotes preserved: {}\n", self.quote_count));
-        }
         if self.culled_count > 0 {
-            body.push_str(&format!("\nTrivial messages dropped: {}\n", self.culled_count));
+            body.push_str(&format!("\nMessages dropped or rewritten: {}\n", self.culled_count));
         }
         format!("---\n{}---\n{}", yaml, body)
     }
@@ -138,8 +129,6 @@ struct AuditFrontmatter {
     before_tokens: usize,
     after_tokens: usize,
     summary: bool,
-    kv_pairs: usize,
-    quotes: usize,
     culled: usize,
 }
 
@@ -154,8 +143,6 @@ impl From<&AuditEntry> for AuditFrontmatter {
             before_tokens: e.before_tokens,
             after_tokens: e.after_tokens,
             summary: e.summary_text.is_some(),
-            kv_pairs: e.kv_count,
-            quotes: e.quote_count,
             culled: e.culled_count,
         }
     }

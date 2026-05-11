@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info};
+use std::time::Duration;
+use tracing::{debug, info, warn};
 
 /// Bifrost Inference Client
 ///
@@ -19,6 +20,8 @@ pub struct BifrostClient {
     client: reqwest::Client,
     /// Default model for chat
     default_model: String,
+    /// Retry policy — configurable, eventually agent-adjustable.
+    retry_policy: RetryPolicy,
 }
 
 /// A message in OpenAI chat format
@@ -167,6 +170,89 @@ pub struct ParsedToolCall {
     pub arguments: serde_json::Value,
 }
 
+/// Retry behavior for transient inference failures.
+/// Defaults are conservative — the agent can request changes via
+/// the memory system (e.g. writing to `system/dynamic/retry_policy.md`).
+#[derive(Debug, Clone)]
+pub struct RetryPolicy {
+    pub max_retries: u32,
+    pub base_delay_ms: u64,
+    pub max_delay_ms: u64,
+    pub fallback_models: Vec<String>,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: 6,
+            base_delay_ms: 300,
+            max_delay_ms: 12000,
+            fallback_models: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum InferenceStrain {
+    Transient {
+        attempt: u32,
+        status: u16,
+        model: String,
+        delay_ms: u64,
+    },
+    Exhausted {
+        attempts: u32,
+        status: u16,
+        model: String,
+        body: String,
+    },
+}
+
+fn classify_status(status: reqwest::StatusCode, body: &str) -> ErrorClass {
+    match status.as_u16() {
+        429 => {
+            if body.contains("quota") || body.contains("billing") || body.contains("exceeded") {
+                ErrorClass::Permanent
+            } else {
+                ErrorClass::Transient
+            }
+        }
+        500 | 502 | 503 | 504 => ErrorClass::Transient,
+        408 => ErrorClass::Transient,
+        _ => ErrorClass::Permanent,
+    }
+}
+
+fn jittered_delay(attempt: u32, policy: &RetryPolicy) -> Duration {
+    let base = policy.base_delay_ms * 2u64.pow(attempt);
+    let capped = base.min(policy.max_delay_ms);
+    let jitter = (capped as f64 * rand_jitter()) as u64;
+    Duration::from_millis(capped.saturating_sub(jitter / 2) + jitter)
+}
+
+fn rand_jitter() -> f64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    std::time::SystemTime::now().hash(&mut h);
+    std::thread::current().id().hash(&mut h);
+    (h.finish() % 1000) as f64 / 1000.0
+}
+
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    headers
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_secs)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ErrorClass {
+    Transient,
+    Permanent,
+}
+
 impl BifrostClient {
     pub fn new(base_url: &str, api_key: &str, virtual_key: &str, default_model: &str) -> Self {
         let base = base_url.trim_end_matches('/').to_string();
@@ -182,7 +268,13 @@ impl BifrostClient {
             virtual_key: virtual_key.to_string(),
             client: reqwest::Client::new(),
             default_model: default_model.to_string(),
+            retry_policy: RetryPolicy::default(),
         }
+    }
+
+    pub fn with_fallbacks(mut self, fallbacks: Vec<String>) -> Self {
+        self.retry_policy.fallback_models = fallbacks;
+        self
     }
 
     fn auth_headers(&self) -> reqwest::header::HeaderMap {
@@ -220,28 +312,153 @@ impl BifrostClient {
         Ok(models)
     }
 
-    /// Send a non-streaming chat completion
+    /// Send a non-streaming chat completion with retry on transient failures.
+    ///
+    /// Returns the completion result plus any strain events that occurred.
+    /// Strain events are body-knowledge: the agent can feel when inference
+    /// was difficult, correlate it over time, notice patterns.
     pub async fn chat_completion(&self, request: ChatCompletionRequest) -> Result<CompletionResult> {
-        let url = format!("{}/chat/completions", self.base_url);
-        debug!("POST {} — model: {}", url, request.model);
+        let (result, _strain) = self.chat_completion_with_strain(request).await?;
+        Ok(result)
+    }
 
-        let resp = self.client
-            .post(&url)
-            .headers(self.auth_headers())
-            .json(&request)
-            .send()
-            .await
-            .with_context(|| format!("Bifrost request failed: {}", url))?;
+    pub async fn chat_completion_with_strain(
+        &self,
+        request: ChatCompletionRequest,
+    ) -> Result<(CompletionResult, Vec<InferenceStrain>)> {
+        let mut strain_events: Vec<InferenceStrain> = Vec::new();
 
-        let status = resp.status();
-        let body_text = resp.text().await
-            .context("Failed to read Bifrost response body")?;
-
-        if !status.is_success() {
-            anyhow::bail!("Bifrost returned {}: {}", status, &body_text[..body_text.len().min(500)]);
+        // Try primary model
+        let mut fallbacks = self.retry_policy.fallback_models.clone();
+        if fallbacks.is_empty() && !request.model.ends_with("-precision") {
+            fallbacks.push(format!("{}-precision", request.model));
         }
 
-        let parsed: ChatCompletionResponse = serde_json::from_str(&body_text)
+        match self.try_model_with_retries(&request, &request.model, &mut strain_events).await {
+            Ok(result) => return Ok((result, strain_events)),
+            Err(primary_err) => {
+                if fallbacks.is_empty() {
+                    return Err(primary_err);
+                }
+                warn!(
+                    "Primary model {} exhausted, trying {} fallback(s)",
+                    request.model,
+                    fallbacks.len()
+                );
+            }
+        }
+
+        // Try each fallback model
+        for fallback in &fallbacks {
+            info!("Falling back to model: {}", fallback);
+            match self.try_model_with_retries(&request, fallback, &mut strain_events).await {
+                Ok(result) => {
+                    info!("Fallback to {} succeeded", fallback);
+                    return Ok((result, strain_events));
+                }
+                Err(e) => {
+                    warn!("Fallback model {} also failed: {}", fallback, e);
+                }
+            }
+        }
+
+        anyhow::bail!(
+            "All models exhausted ({} + {} fallbacks). Last strain: {:?}",
+            request.model,
+            fallbacks.len(),
+            strain_events.last()
+        )
+    }
+
+    async fn try_model_with_retries(
+        &self,
+        request: &ChatCompletionRequest,
+        model: &str,
+        strain_events: &mut Vec<InferenceStrain>,
+    ) -> Result<CompletionResult> {
+        let url = format!("{}/chat/completions", self.base_url);
+        let policy = &self.retry_policy;
+
+        let mut req_with_model = request.clone();
+        req_with_model.model = model.to_string();
+
+        for attempt in 0..=policy.max_retries {
+            debug!("POST {} — model: {} (attempt {})", url, model, attempt);
+
+            let resp = self.client
+                .post(&url)
+                .headers(self.auth_headers())
+                .json(&req_with_model)
+                .send()
+                .await;
+
+            let resp = match resp {
+                Ok(r) => r,
+                Err(e) if e.is_timeout() || e.is_connect() => {
+                    if attempt == policy.max_retries {
+                        anyhow::bail!("Bifrost unreachable after {} attempts: {}", attempt + 1, e);
+                    }
+                    let delay = jittered_delay(attempt, policy);
+                    warn!("Bifrost connection failed (attempt {}), retrying in {:?}: {}", attempt, delay, e);
+                    strain_events.push(InferenceStrain::Transient {
+                        attempt,
+                        status: 0,
+                        model: model.to_string(),
+                        delay_ms: delay.as_millis() as u64,
+                    });
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
+
+            let status = resp.status();
+            let retry_after = parse_retry_after(resp.headers());
+
+            if status.is_success() {
+                let body_text = resp.text().await
+                    .context("Failed to read Bifrost response body")?;
+                return Self::parse_completion_response(&body_text);
+            }
+
+            let body_text = resp.text().await
+                .context("Failed to read Bifrost error body")?;
+
+            match classify_status(status, &body_text) {
+                ErrorClass::Transient if attempt < policy.max_retries => {
+                    let delay = retry_after.unwrap_or_else(|| jittered_delay(attempt, policy));
+                    warn!(
+                        "Bifrost {} on {} (attempt {}), retrying in {:?}",
+                        status.as_u16(), model, attempt, delay
+                    );
+                    strain_events.push(InferenceStrain::Transient {
+                        attempt,
+                        status: status.as_u16(),
+                        model: model.to_string(),
+                        delay_ms: delay.as_millis() as u64,
+                    });
+                    tokio::time::sleep(delay).await;
+                }
+                _ => {
+                    strain_events.push(InferenceStrain::Exhausted {
+                        attempts: attempt + 1,
+                        status: status.as_u16(),
+                        model: model.to_string(),
+                        body: body_text[..body_text.len().min(300)].to_string(),
+                    });
+                    anyhow::bail!(
+                        "Bifrost returned {} after {} attempt(s) on {}: {}",
+                        status, attempt + 1, model, &body_text[..body_text.len().min(500)]
+                    );
+                }
+            }
+        }
+
+        unreachable!("retry loop should have returned or bailed")
+    }
+
+    fn parse_completion_response(body_text: &str) -> Result<CompletionResult> {
+        let parsed: ChatCompletionResponse = serde_json::from_str(body_text)
             .with_context(|| {
                 let preview = &body_text[..body_text.len().min(200)];
                 format!("Failed to parse Bifrost response: {preview}")
@@ -283,6 +500,7 @@ mod tests {
         let client = BifrostClient::new(
             "http://10.10.20.120:3360",
             "sk-bf-test",
+            "",
             "openai/deepseek-v4-pro",
         );
         assert!(client.base_url.ends_with("/v1"));

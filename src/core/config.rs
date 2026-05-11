@@ -277,6 +277,11 @@ pub struct SubagentConfig {
     /// Fraction of max_tool_rounds at which second warning fires.
     #[serde(default = "default_warning_2_threshold")]
     pub warning_2_threshold: f32,
+    /// Milliseconds to wait between subagent tool rounds.
+    /// Helps avoid rate-limit cascades from rapid consecutive LLM calls.
+    /// Default: 300ms. Set to 0 to disable.
+    #[serde(default = "default_sub_inter_round_delay")]
+    pub inter_round_delay_ms: u64,
 }
 
 impl Default for SubagentConfig {
@@ -289,6 +294,7 @@ impl Default for SubagentConfig {
             max_tool_rounds: 50,
             warning_1_threshold: 0.8,
             warning_2_threshold: 0.95,
+            inter_round_delay_ms: 300,
         }
     }
 }
@@ -530,6 +536,7 @@ fn default_threshold_70() -> f32 { 0.7 }
 fn default_subconscious_max_tokens() -> u32 { 8192 }
 fn default_warning_1_threshold() -> f32 { 0.8 }
 fn default_warning_2_threshold() -> f32 { 0.95 }
+fn default_sub_inter_round_delay() -> u64 { 300 }
 fn default_auto_model() -> String { "auto".to_string() }
 fn default_bifrost_url() -> String { "http://10.10.20.120:3360".to_string() }
 fn default_server_bind() -> String { "127.0.0.1".to_string() }

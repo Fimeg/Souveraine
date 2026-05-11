@@ -68,14 +68,19 @@ impl SouveraineServer {
             }
         }
 
-        let sessions = Arc::new(SessionManager::new());
+        let sessions = Arc::new(SessionManager::with_persistence(data_dir.join("agents")));
 
+        let primary = &config.bifrost.primary_model;
+        let mut fallbacks = Vec::new();
+        if !primary.ends_with("-precision") {
+            fallbacks.push(format!("{}-precision", primary));
+        }
         let bifrost = Arc::new(BifrostClient::new(
             &config.bifrost.base_url,
             &config.bifrost.api_key,
             &config.bifrost.virtual_key,
-            &config.bifrost.primary_model,
-        ));
+            primary,
+        ).with_fallbacks(fallbacks));
 
         let consciousness = Arc::new(ConsciousnessEngine::new(
             agents.clone(),

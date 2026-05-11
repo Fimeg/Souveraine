@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-use super::{AgentInfo, Backend, BackendEvent};
+use super::{AgentInfo, Backend, BackendEvent, ConversationInfo};
 
 #[derive(Clone)]
 pub struct RemoteBackend {
@@ -75,6 +75,24 @@ impl Backend for RemoteBackend {
                 description: a.description,
             })
             .collect())
+    }
+
+    async fn new_conversation(&self, agent_id: &str) -> Result<String> {
+        // Remote: same as ensure_conversation for now — server always creates fresh
+        self.ensure_conversation(agent_id).await
+    }
+
+    async fn list_conversations(&self, _agent_id: &str) -> Result<Vec<ConversationInfo>> {
+        // TODO: implement remote conversation listing via GET /v1/agents/:id/conversations
+        Ok(Vec::new())
+    }
+
+    async fn load_conversation(
+        &self,
+        _conversation_id: &str,
+    ) -> Result<Vec<crate::core::session::ConversationMessage>> {
+        // TODO: implement remote conversation loading
+        anyhow::bail!("Remote conversation loading not yet implemented")
     }
 
     async fn ensure_conversation(&self, agent_id: &str) -> Result<String> {
