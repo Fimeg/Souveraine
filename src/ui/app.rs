@@ -55,6 +55,8 @@ pub struct App {
     presence: Presence,
     /// Available agents for selection.
     available_agents: Vec<String>,
+    /// Cursor index when the gallery is open.
+    gallery_selected: usize,
     /// The component scene — owns event dispatch and layout.
     scene: Scene,
     /// Monotonic tick counter, incremented each frame.
@@ -76,6 +78,8 @@ pub enum Screen {
     Settings,
     /// "Be with her" mode — fullscreen breathing portrait, no chat input.
     Presence,
+    /// Agent gallery — portrait grid of all available agents, choose one.
+    Gallery,
 }
 
 #[derive(Debug, Clone)]
@@ -129,6 +133,7 @@ impl App {
             agent_pref: agent_pref.clone(),
             presence: Presence::new(&agent_pref),
             available_agents: Vec::new(),
+            gallery_selected: 0,
             scene: Scene::new(SceneLayout::Single),
             tick: 0,
             bloom: crate::ui::animation::bloom::BloomState::new(),
@@ -162,6 +167,72 @@ impl App {
         self.agent_pref = agent_name.to_string();
         self.agent_status.name = agent_name.to_string();
         self.dispatch(TuiEvent::AgentSelected(agent_name.to_string()));
+    }
+
+    /// Open the agent gallery — the portrait grid is the way to swap agents.
+    fn open_gallery(&mut self) {
+        if self.available_agents.is_empty() {
+            // Seed defaults so the gallery is never empty on first open.
+            let defaults = ["Annie", "Ani", "JeanLuc", "Eione"];
+            for name in defaults {
+                self.add_available_agent(name.to_string());
+            }
+        }
+        self.gallery_selected = self
+            .available_agents
+            .iter()
+            .position(|a| a == &self.agent_pref)
+            .unwrap_or(0);
+        self.current_screen = Screen::Gallery;
+        self.dispatch(TuiEvent::ScreenChanged(Screen::Gallery));
+    }
+
+    fn handle_gallery_key(&mut self, key: crossterm::event::KeyEvent) {
+        if self.available_agents.is_empty() {
+            self.current_screen = Screen::Welcome;
+            return;
+        }
+        let cols = self.gallery_cols();
+        let n = self.available_agents.len();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('g') => {
+                self.current_screen = Screen::Welcome;
+                self.dispatch(TuiEvent::ScreenChanged(Screen::Welcome));
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                if self.gallery_selected > 0 {
+                    self.gallery_selected -= 1;
+                }
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                if self.gallery_selected + 1 < n {
+                    self.gallery_selected += 1;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.gallery_selected >= cols {
+                    self.gallery_selected -= cols;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.gallery_selected + cols < n {
+                    self.gallery_selected += cols;
+                }
+            }
+            KeyCode::Enter => {
+                let chosen = self.available_agents[self.gallery_selected].clone();
+                self.select_agent(&chosen);
+                self.current_screen = Screen::Welcome;
+                self.dispatch(TuiEvent::ScreenChanged(Screen::Welcome));
+            }
+            _ => {}
+        }
+    }
+
+    fn gallery_cols(&self) -> usize {
+        // Match draw_gallery's column count; safe default of 4 when terminal
+        // dimensions aren't relevant for keyboard navigation correctness.
+        4
     }
 
     /// Cycle through available agents for selection (WIP)
@@ -314,6 +385,10 @@ impl App {
                         self.current_screen = Screen::Presence;
                         self.dispatch(TuiEvent::ScreenChanged(Screen::Presence));
                     }
+                    KeyCode::Char('g') => {
+                        // Gallery — the avatar IS the doorway to "who am I talking to."
+                        self.open_gallery();
+                    }
                     _ => {}
                 }
             }
@@ -322,6 +397,7 @@ impl App {
                 self.current_screen = Screen::Welcome;
                 self.dispatch(TuiEvent::ScreenChanged(Screen::Welcome));
             }
+            Screen::Gallery => self.handle_gallery_key(key),
             Screen::Chat => self.handle_chat_key(key).await,
             Screen::Cron => self.handle_schedules_key(key),
             _ => {
@@ -756,6 +832,7 @@ impl App {
                 }
             }
             Screen::Presence => self.draw_presence_mode(frame),
+            Screen::Gallery => self.draw_gallery(frame),
             _ => self.draw_placeholder(frame),
         }
 
@@ -991,7 +1068,7 @@ impl App {
             frame.render_widget(err_para, row);
         }
 
-        let footer = Paragraph::new("↑↓ Navigate • Enter Select • a Add Agent • p Presence • q Quit")
+        let footer = Paragraph::new("↑↓ Navigate • Enter • a Add • g Gallery • p Presence • q Quit")
             .style(Style::default().fg(Color::DarkGray))
             .alignment(Alignment::Center);
         frame.render_widget(footer, chunks[4]);
@@ -1109,6 +1186,119 @@ impl App {
             .alignment(Alignment::Center)
             .style(Style::default().fg(Color::Rgb(255, 140, 66)).add_modifier(Modifier::BOLD));
         frame.render_widget(content, area);
+    }
+
+    /// Gallery — the portrait grid is the way to swap agents.
+    /// 4-column grid of portrait cards; cursor highlights with a bright border.
+    /// For C3 every card shows Annie's portrait (per-agent portraits land in C4
+    /// when image-protocol PNGs arrive from `assets/`).
+    fn draw_gallery(&self, frame: &mut Frame) {
+        use crate::ui::portrait;
+
+        let area = frame.size();
+        let bg = Block::default().style(Style::default().bg(Color::Rgb(10, 10, 16)));
+        frame.render_widget(bg, area);
+
+        // Header
+        let header = Paragraph::new(Line::from(vec![
+            Span::styled(
+                "  Annie Composite — Agent Gallery  ",
+                Style::default()
+                    .fg(Color::Rgb(220, 215, 215))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]))
+        .alignment(Alignment::Center);
+        let header_area = Rect { x: area.x, y: area.y + 1, width: area.width, height: 1 };
+        frame.render_widget(header, header_area);
+
+        if self.available_agents.is_empty() {
+            let empty = Paragraph::new("\n\n(no agents available)")
+                .style(Style::default().fg(Color::DarkGray))
+                .alignment(Alignment::Center);
+            frame.render_widget(empty, area);
+            return;
+        }
+
+        // Grid math: 4 cols, card = portrait card (CARD_W × CARD_H) + 2 row pad.
+        let cols: u16 = self.gallery_cols() as u16;
+        let card_w = portrait::RENDER_W + 2;
+        let card_h = portrait::RENDER_H + 3;
+        let pad_x: u16 = 2;
+        let pad_y: u16 = 1;
+        let total_grid_w = cols * card_w + (cols - 1) * pad_x;
+        let grid_x = area.x + area.width.saturating_sub(total_grid_w) / 2;
+        let grid_y = area.y + 3;
+
+        for (idx, name) in self.available_agents.iter().enumerate() {
+            let row = (idx as u16) / cols;
+            let col = (idx as u16) % cols;
+            let cx = grid_x + col * (card_w + pad_x);
+            let cy = grid_y + row * (card_h + pad_y + 1);
+            if cy + card_h + 1 >= area.y + area.height {
+                break;
+            }
+            let selected = idx == self.gallery_selected;
+            let border_col = if selected {
+                Color::Rgb(120, 220, 230)
+            } else {
+                Color::Rgb(70, 70, 90)
+            };
+
+            let card_area = Rect { x: cx, y: cy, width: card_w, height: card_h };
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(
+                    Style::default()
+                        .fg(border_col)
+                        .add_modifier(if selected { Modifier::BOLD } else { Modifier::DIM }),
+                );
+            frame.render_widget(block, card_area);
+
+            let portrait_area = Rect {
+                x: cx + 1,
+                y: cy + 1,
+                width: portrait::RENDER_W,
+                height: portrait::RENDER_H,
+            };
+            // For C3, all cards use the running Presence (Annie). C4 will load
+            // per-agent portraits from assets/ in each agent's memfs.
+            portrait::render(frame.buffer_mut(), portrait_area, &self.presence);
+
+            let name_area = Rect {
+                x: cx,
+                y: cy + card_h,
+                width: card_w,
+                height: 1,
+            };
+            let primary_marker = if name == &self.agent_pref { "● " } else { "  " };
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(primary_marker, Style::default().fg(Color::Rgb(120, 220, 230))),
+                    Span::styled(
+                        name.clone(),
+                        Style::default()
+                            .fg(if selected { Color::Rgb(220, 215, 215) } else { Color::Gray })
+                            .add_modifier(if selected { Modifier::BOLD } else { Modifier::empty() }),
+                    ),
+                ]))
+                .alignment(Alignment::Center),
+                name_area,
+            );
+        }
+
+        // Footer
+        let footer = Paragraph::new("← → ↑ ↓ navigate • Enter select • Esc cancel")
+            .style(Style::default().fg(Color::Rgb(70, 70, 90)))
+            .alignment(Alignment::Center);
+        let footer_area = Rect {
+            x: area.x,
+            y: area.y + area.height.saturating_sub(2),
+            width: area.width,
+            height: 1,
+        };
+        frame.render_widget(footer, footer_area);
     }
 
     /// Presence mode — fullscreen Annie. Centered, breathing, no chat input.
