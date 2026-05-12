@@ -53,6 +53,8 @@ pub struct ConsciousnessEngine {
     max_tokens: Option<u32>,
     /// Adaptive inter-round delay shared with the primary loop.
     rate_delay: Arc<AtomicU64>,
+    /// Reflection engine — N+25 phenomenological witness.
+    reflection: Arc<crate::core::reflection::ReflectionEngine>,
 }
 
 #[derive(Clone, Debug)]
@@ -72,6 +74,13 @@ impl ConsciousnessEngine {
         max_tokens: Option<u32>,
         rate_delay: Arc<AtomicU64>,
     ) -> Self {
+        let reflection = Arc::new(crate::core::reflection::ReflectionEngine::new(
+            agents.clone(),
+            bifrost.clone(),
+            rate_delay.clone(),
+            subconscious_model.clone(),
+            max_tokens,
+        ));
         Self {
             agents,
             _sessions: sessions,
@@ -80,7 +89,14 @@ impl ConsciousnessEngine {
             subconscious_model,
             max_tokens,
             rate_delay,
+            reflection,
         }
+    }
+
+    /// Expose the reflection engine so external callers (CLI subcommand,
+    /// future chat `/reflect` slash command) can trigger a pass directly.
+    pub fn reflection(&self) -> Arc<crate::core::reflection::ReflectionEngine> {
+        self.reflection.clone()
     }
 
     pub async fn on_response(
@@ -91,11 +107,43 @@ impl ConsciousnessEngine {
         let mut events = Vec::new();
         let pressure = self.pressure_for_session(session).await;
 
-        // ── N+25 reflection (placeholder until reflection module lands) ──
-        if session.turn_count % 25 == 0 && session.turn_count > 0 {
-            events.push(ConsciousnessEvent::Reflection {
-                content: format!("N+25 reflection after {} turns", session.turn_count),
-            });
+        // ── N+25 reflection ──
+        // Fires at every Nth turn (config: reflection.message_interval).
+        // Runs an LLM pass over the recent transcript and updates ledgers
+        // / primary memory via the memory tool. The summary string is
+        // surfaced as a ConsciousnessEvent so the cockpit panel renders it.
+        if session.turn_count > 0 && session.turn_count % 25 == 0 {
+            match self
+                .reflection
+                .reflect_now(&session.agent_id, &session.messages)
+                .await
+            {
+                Ok(report) => {
+                    let header = if report.exited_cleanly {
+                        format!(
+                            "N+25 reflection ({} turns reviewed)",
+                            report.turns_reviewed
+                        )
+                    } else {
+                        format!(
+                            "N+25 reflection (incomplete — tool rounds exhausted, {} turns)",
+                            report.turns_reviewed
+                        )
+                    };
+                    events.push(ConsciousnessEvent::Reflection {
+                        content: format!("{header}\n\n{}", report.summary),
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!("N+25 reflection failed: {}", e);
+                    events.push(ConsciousnessEvent::Reflection {
+                        content: format!(
+                            "N+25 reflection skipped at turn {} — model error: {e}",
+                            session.turn_count
+                        ),
+                    });
+                }
+            }
         }
 
         // ── N+100 / archivist (placeholder until archivist module lands) ──

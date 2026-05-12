@@ -207,6 +207,18 @@ enum Commands {
         #[command(subcommand)]
         action: EventsAction,
     },
+
+    /// Run an N+25 reflection pass on demand
+    #[command(
+        long_about = "Walk the agent's most recent conversation through a 5-phase \
+        reflection (Investigate → Extract → Update → Review → Commit). Durable \
+        learnings flow to the ledger and the primary memfs. Returns a report."
+    )]
+    Reflect {
+        /// Conversation to reflect on. Omit to use the most recent for the agent.
+        #[arg(long)]
+        conversation: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -357,6 +369,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Status => run_status(config, cli.json).await?,
         Commands::Server { bind, port } => run_server(bind.clone(), *port, config).await?,
+        Commands::Reflect { conversation } => {
+            run_reflect(config, cli.agent.clone(), conversation.clone(), cli.json).await?
+        }
         Commands::Init | Commands::Completions { .. } | Commands::Auth { .. } | Commands::Schedule { .. } | Commands::Identity { .. } | Commands::Events { .. } => unreachable!(),
     }
 
@@ -859,6 +874,92 @@ async fn run_chat(
         println!("\n");
     }
     println!("bye");
+    Ok(())
+}
+
+async fn run_reflect(
+    config: Arc<RwLock<ConsciousnessConfig>>,
+    agent_name: String,
+    conversation: Option<String>,
+    json: bool,
+) -> anyhow::Result<()> {
+    use crate::backend::LocalBackend;
+    let cfg = config.read().await.clone();
+    let local = LocalBackend::new(cfg).await?;
+    let server = local.server();
+
+    let summaries = server.agents.list(None).await?;
+    let agent = summaries
+        .iter()
+        .find(|a| a.name == agent_name || a.id == agent_name)
+        .or_else(|| summaries.first())
+        .ok_or_else(|| anyhow::anyhow!("no agents configured"))?;
+
+    // Resolve a conversation. Explicit --conversation wins; otherwise
+    // pick the most recent active conversation for this agent.
+    let store = crate::core::conversation::ConversationStore::new(
+        &dirs::home_dir()
+            .unwrap_or_default()
+            .join(".souveraine")
+            .join("agents")
+            .join(&agent.id),
+    );
+    let conv_id = match conversation {
+        Some(id) => id,
+        None => {
+            let mut records = store.list_active().await?;
+            records.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+            records
+                .into_iter()
+                .next()
+                .map(|r| r.id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("no conversations found for agent '{}'", agent.id)
+                })?
+        }
+    };
+
+    let messages = store.load_messages(&conv_id).await?;
+    if messages.is_empty() {
+        anyhow::bail!("conversation '{conv_id}' has no messages to reflect on");
+    }
+
+    if !json {
+        println!(
+            "Reflecting on conversation {} ({} messages) for agent {}…",
+            &conv_id[..8.min(conv_id.len())],
+            messages.len(),
+            agent.name,
+        );
+    }
+
+    let report = server
+        .consciousness
+        .reflection()
+        .reflect_now(&agent.id, &messages)
+        .await?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!();
+        println!("─── Reflection complete ─────────────────────────────");
+        println!("  agent:           {}", report.agent_id);
+        println!("  turns reviewed:  {}", report.turns_reviewed);
+        println!(
+            "  duration:        {:.1}s",
+            (report.completed_at - report.started_at)
+                .num_milliseconds() as f64 / 1000.0
+        );
+        println!(
+            "  exited cleanly:  {}",
+            if report.exited_cleanly { "yes" } else { "no (tool rounds exhausted)" }
+        );
+        println!("─────────────────────────────────────────────────────");
+        println!();
+        println!("{}", report.summary);
+    }
+
     Ok(())
 }
 

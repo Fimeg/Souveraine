@@ -402,6 +402,12 @@ impl LocalBackend {
     pub fn server_agents(&self) -> Arc<crate::server::AgentInventory> {
         self.server.agents.clone()
     }
+
+    /// Underlying server. CLI subcommands (e.g. `souveraine reflect`)
+    /// reach in here for the consciousness engine and session manager.
+    pub fn server(&self) -> Arc<crate::server::SouveraineServer> {
+        self.server.clone()
+    }
 }
 
 #[async_trait]
