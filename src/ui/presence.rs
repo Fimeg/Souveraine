@@ -125,8 +125,9 @@ impl VolitionGauge {
 /// The Presence — Annie's felt-state in the TUI.
 ///
 /// Updated via [`Presence::handle_event`] in response to `TuiEvent`s; never polled.
-/// Rendered via [`draw_overlay`] / [`draw_welcome`] as a corner card today, with
-/// half-block portraits arriving in C2.
+/// Rendered via [`draw_overlay`] as a corner card on Dashboard; the Welcome
+/// screen draws its centered portrait inline in `App::draw_welcome` so it can
+/// participate in the welcome vertical layout (title → avatar → menu → footer).
 pub struct Presence {
     pub name: String,
     pub posture: Posture,
@@ -354,117 +355,9 @@ pub fn draw_overlay(frame: &mut Frame, p: &Presence, area: Rect) {
     frame.render_widget(name_para, name_area);
 }
 
-/// Draw the presence on the welcome screen — portrait card with a short
-/// instruction strip beneath it.
-pub fn draw_welcome(
-    frame: &mut Frame,
-    p: &Presence,
-    area: Rect,
-    selected_agent: Option<&str>,
-) {
-    if !p.visible {
-        return;
-    }
-
-    // Total card height = portrait card + 4 rows of instruction text.
-    let total_h: u16 = CARD_H + 4;
-    if area.width < CARD_W + 2 || area.height < total_h + 1 {
-        return;
-    }
-
-    let card_x = area.x + area.width.saturating_sub(CARD_W + 1);
-    let card_y = area.y + 1;
-
-    // Portrait card
-    let card_area = Rect {
-        x: card_x,
-        y: card_y,
-        width: CARD_W,
-        height: CARD_H,
-    };
-    let border = posture_border(p.posture);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border).add_modifier(Modifier::DIM));
-    frame.render_widget(block, card_area);
-
-    let portrait_area = Rect {
-        x: card_area.x + 1,
-        y: card_area.y + 1,
-        width: portrait::RENDER_W,
-        height: portrait::RENDER_H,
-    };
-    portrait::render(frame.buffer_mut(), portrait_area, p);
-
-    let name_area = Rect {
-        x: card_area.x + 1,
-        y: card_area.y + 1 + portrait::RENDER_H,
-        width: card_area.width.saturating_sub(2),
-        height: 1,
-    };
-    let display_name = selected_agent.unwrap_or(&p.name);
-    let glyph = if p.subconscious_active { "◈" } else { "·" };
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(format!(" {} ", glyph), Style::default().fg(border)),
-            Span::styled(
-                display_name.to_string(),
-                Style::default().fg(border).add_modifier(Modifier::BOLD),
-            ),
-        ]))
-        .alignment(Alignment::Center),
-        name_area,
-    );
-
-    // Instruction strip beneath the portrait
-    let info_area = Rect {
-        x: card_x,
-        y: card_y + CARD_H,
-        width: CARD_W,
-        height: 4,
-    };
-
-    let info_lines = if let Some(agent_name) = selected_agent {
-        vec![
-            Line::from(vec![
-                Span::styled(" Status ", Style::default().fg(Color::DarkGray)),
-                Span::styled("Ready", Style::default().fg(Color::Green)),
-            ]),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled(" Press ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    "ENTER",
-                    Style::default()
-                        .fg(colors::ANI_PRIMARY)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(" to wake ", Style::default().fg(Color::DarkGray)),
-                Span::styled(agent_name, Style::default().fg(colors::ANI_SECONDARY)),
-            ]),
-        ]
-    } else {
-        vec![
-            Line::from(Span::styled(
-                " No agent selected",
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled(" Press ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    "a",
-                    Style::default()
-                        .fg(colors::ANI_PRIMARY)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(" to create alias", Style::default().fg(Color::DarkGray)),
-            ]),
-        ]
-    };
-    frame.render_widget(Paragraph::new(info_lines), info_area);
-}
+// Welcome rendering moved inline into `App::draw_welcome` (src/ui/app.rs)
+// so the avatar can be centered within the welcome layout instead of pinned
+// to a corner.
 
 // ── Tests ───────────────────────────────────────────────────────
 

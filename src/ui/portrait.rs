@@ -42,7 +42,7 @@ use ratatui::{
     style::Color,
 };
 
-use crate::ui::presence::{Eye, Posture, Presence};
+use crate::ui::presence::{Posture, Presence};
 
 // ── Loaded per-agent portrait (Tier 2 source) ───────────────────
 
@@ -83,11 +83,6 @@ impl PortraitSource {
     }
 }
 
-/// Rows reserved for state-aware overlays. Pixels in these rows always come
-/// from the hand-crafted palette grid (and color_for) so that blinking, gaze
-/// shifts, mouth changes, and brow furrows keep working regardless of which
-/// portrait source the user loaded.
-const OVERLAY_ROWS: &[usize] = &[6, 7, 10, 11];
 
 pub const PORTRAIT_W: u16 = 18;
 pub const PORTRAIT_H: u16 = 18;
@@ -97,99 +92,48 @@ pub const PORTRAIT_H: u16 = 18;
 pub const RENDER_W: u16 = PORTRAIT_W;
 pub const RENDER_H: u16 = PORTRAIT_H / 2;
 
-// ── Base portrait grid ──────────────────────────────────────────
+// ── Base portrait grid — clean silhouette, no face ──────────────
+// This is the EMERGENCY default. The hand-crafted "Annie face" version
+// read as a creepy llama (Casey's words), so this is now a faceless
+// silhouette: hair, neck, collar. State animation lives in border color,
+// breath luminance pulse, and posture-driven color modulation — never in
+// per-pixel row swaps at this resolution. True facial animation belongs
+// in a future TTS/STT-integrated system, not in half-blocks.
+//
+// When a `PortraitSource` is loaded (per-agent PNG/JPEG from agent memfs
+// `assets/`), all pixels come from the source and this silhouette is not
+// rendered.
+//
 // Each row must be exactly PORTRAIT_W characters wide. Validated by a test.
-
 const BASE: [&str; PORTRAIT_H as usize] = [
-    "....HH......HH....",
-    "...HHHH....HHHH...",
-    "..HHHHHH..HHHHHH..",
+    "....HHHHHHHHHH....",
+    "...HHHHHHHHHHHH...",
     "..HHHHHHHHHHHHHH..",
     "..HHHHHHHHHHHHHH..",
-    "..hhhHHHHHHHHhhh..",
-    ".HHHBBssMMssBBHHH.",
-    ".HHHsseesseessHHH.",
-    ".HHHssssssssssHHH.",
-    ".HHHsMssssssMsHHH.",
-    ".HHHHssssssssHHHH.",
-    ".HHHHsssLLsssHHHH.",
-    ".HHHHHssssssHHHHH.",
-    ".HHHHHHssssHHHHHH.",
-    ".HHHcCcccCcccCHHH.",
+    "..HHHHHHHHHHHHHH..",
+    "..HHHHHHHHHHHHHH..",
+    "..HHHHssssssssHH..",
+    "..HHHssssssssssH..",
+    "..HHHssssssssssH..",
+    "..HHHssssssssssH..",
+    "..HHHssssssssssH..",
+    "..HHHssssssssssH..",
+    "..HHHHsssssssHHH..",
+    "..HHHHHHHHHHHHHH..",
+    "..HHHCCCCCCCCHHH..",
     "..CCCCCCCCCCCCCC..",
-    "..CCCCcCccCcCCCC..",
+    "..CCCCCCCCCCCCCC..",
     "..CCCC      CCCC..",
 ];
 
 // ── State-aware pixel lookup ────────────────────────────────────
 
-/// Read a pixel from the base grid, applying state-driven cell overrides
-/// before returning. Each posture has its own row swaps so the portrait's
-/// SHAPE shifts (not just color) when state changes.
-fn pixel_at(x: usize, y: usize, p: &Presence) -> char {
-    let row = BASE[y];
-    let ch = row.as_bytes()[x] as char;
-
-    // Eye row override — replace `e` with `-` while blinking OR yawning.
-    if y == 7 && ch == 'e' && (p.eye == Eye::Blinking || p.posture == Posture::Yawning) {
-        return '-';
-    }
-
-    // Posture-specific row swaps.
-    match p.posture {
-        Posture::Yawning => {
-            // Half-lid eyes (already handled above) + open mouth.
-            if y == 11 {
-                let yawn = b".HHHHssOOOOssHHHH.";
-                return yawn[x] as char;
-            }
-        }
-        Posture::Processing => {
-            // Eyes lock to one side: shift the cyan-glow pixels right by 1.
-            // Base eye row: ".HHHsseesseessHHH." — gaze-shift to ".HHHssseseeseesHHH" feel
-            // by stretching one pupil right.
-            if y == 7 {
-                let proc = b".HHHsesesseeseesHH";
-                return proc[x] as char;
-            }
-            // Add a faint cyan filigree pulse on the brow.
-            if y == 6 {
-                let proc = b".HHHBBssMMssBBHHH.";
-                return proc[x] as char;
-            }
-        }
-        Posture::Affectionate => {
-            // Slight smile — lips curve up at the corners.
-            // Base mouth row 11: ".HHHHsssLLsssHHHH."
-            // Affect    row 11: ".HHHHsLssssssLsHHH"  (lift the L's to the cheek line)
-            if y == 11 {
-                let aff = b".HHHHsssLLsssHHHH.";
-                return aff[x] as char;
-            }
-            // Cheek line gets a soft warm fold above the mouth.
-            if y == 10 {
-                let aff = b".HHHHsssLLsssHHHH.";
-                return aff[x] as char;
-            }
-        }
-        Posture::Straining => {
-            // Furrowed brow — brow row darkens and tightens.
-            // Base row 6:    ".HHHBBssMMssBBHHH."
-            // Strain row 6:  ".HHBBBssMMssBBBHH."  (brow encroaches inward)
-            if y == 6 {
-                let strain = b".HHBBBssMMssBBBHH.";
-                return strain[x] as char;
-            }
-            // Slight frown — straighten the lips.
-            if y == 11 {
-                let strain = b".HHHHsss--sssHHHH.";
-                return strain[x] as char;
-            }
-        }
-        Posture::Idle => {}
-    }
-
-    ch
+/// Read a pixel from the base silhouette grid. The default silhouette has no
+/// facial features, so no per-pixel row swaps are needed — state expression
+/// at this resolution lives in border color, breath luminance pulse, and the
+/// posture-driven color modulation in [`color_for`].
+fn pixel_at(x: usize, y: usize, _p: &Presence) -> char {
+    BASE[y].as_bytes()[x] as char
 }
 
 // ── Palette ─────────────────────────────────────────────────────
@@ -243,21 +187,47 @@ fn color_for(key: char, posture: Posture, breath: f32) -> Option<Color> {
 
 // ── Render ──────────────────────────────────────────────────────
 
-/// Resolve a single pixel's color, preferring the PortraitSource (if any)
-/// for non-overlay rows and falling back to the palette grid elsewhere.
+/// Resolve a single pixel's color: source-when-loaded, modulated by posture
+/// and breath. With no source the silhouette palette grid is used.
 fn pixel_color(px: usize, py: usize, p: &Presence, breath: f32) -> Option<Color> {
-    let overlay = OVERLAY_ROWS.contains(&py);
-    // Posture overlays still come from BASE for the affected rows even when a
-    // PortraitSource is loaded — that's how blink / yawn / strain stay visible.
-    if !overlay {
-        if let Some(source) = p.portrait_source.as_ref() {
-            if let Some(c) = source.at(px, py) {
-                return Some(c);
-            }
+    if let Some(source) = p.portrait_source.as_ref() {
+        if let Some(c) = source.at(px, py) {
+            return Some(modulate(c, p.posture, breath));
         }
     }
     let key = pixel_at(px, py, p);
     color_for(key, p.posture, breath)
+}
+
+/// Apply posture-driven modulation to a source pixel — desaturate when
+/// straining, dim when yawning, breathe luminance on cyan-leaning hues,
+/// warm-tint on affection. This is how state shows on a loaded portrait
+/// at half-block resolution: across-the-image tone, not per-pixel swaps.
+fn modulate(c: Color, posture: Posture, breath: f32) -> Color {
+    let Color::Rgb(r, g, b) = c else { return c };
+
+    let strained = matches!(posture, Posture::Straining);
+    let yawning = matches!(posture, Posture::Yawning);
+    let warm = matches!(posture, Posture::Affectionate);
+    let processing = matches!(posture, Posture::Processing);
+
+    let avg = ((r as u16 + g as u16 + b as u16) / 3) as f32;
+    let sat = if strained { 0.55 } else { 1.0 };
+    let dim = if yawning { 0.82 } else { 1.0 };
+    // Subtle breath pulse — only on the cyan-leaning pixels so skin stays calm.
+    let cyan_lean = b > r && b > g;
+    let breath_gain = if cyan_lean {
+        1.0 + breath * 0.10 * if processing { 1.6 } else { 1.0 }
+    } else { 1.0 };
+    // Warm tint shifts the red/green channels up a little.
+    let warm_r = if warm { 1.06 } else { 1.0 };
+    let warm_g = if warm { 1.02 } else { 1.0 };
+
+    let mix = |c: u8, warm_chan: f32| {
+        let f = (c as f32 * sat + avg * (1.0 - sat)) * dim * breath_gain * warm_chan;
+        f.clamp(0.0, 255.0) as u8
+    };
+    Color::Rgb(mix(r, warm_r), mix(g, warm_g), mix(b, 1.0))
 }
 
 /// Render the portrait scaled-up by `scale` (1 = native half-block density).
@@ -385,64 +355,32 @@ mod tests {
     }
 
     #[test]
-    fn pixel_at_returns_base_when_idle() {
-        let p = Presence::new("Annie");
-        // Row 7 has eyes at base.
-        let row7 = "_".repeat(PORTRAIT_W as usize);
-        let _ = row7;
-        // Position of an 'e' in BASE[7] = ".HHHsseesseessHHH."
-        //  index 5 should be 's', index 6 should be 'e'
-        assert_eq!(pixel_at(6, 7, &p), 'e');
-        assert_eq!(pixel_at(7, 7, &p), 'e');
-    }
-
-    #[test]
-    fn pixel_at_swaps_eye_to_dash_on_blink() {
-        let mut p = Presence::new("Annie");
-        // Force blink state.
-        p.handle_event(&crate::ui::component::TuiEvent::Tick(200));
-        // Eye is now Blinking; pixel_at row 7 should be '-' where it was 'e'.
-        assert_eq!(pixel_at(6, 7, &p), '-');
-    }
-
-    #[test]
-    fn pixel_at_swaps_eye_to_dash_on_yawn() {
-        let mut p = Presence::new("Annie");
-        p.handle_event(&crate::ui::component::TuiEvent::PressureChanged(0.9));
-        assert_eq!(pixel_at(6, 7, &p), '-');
-    }
-
-    #[test]
-    fn yawning_changes_mouth_row() {
-        let mut p = Presence::new("Annie");
-        p.handle_event(&crate::ui::component::TuiEvent::PressureChanged(0.9));
-        // Base row 11: ".HHHHsssLLsssHHHH." — yawn replaces LL with OOOO.
-        // Position 8 in yawn row is 'O'.
-        assert_eq!(pixel_at(8, 11, &p), 'O');
-    }
-
-    #[test]
     fn color_for_transparent_pixels_returns_none() {
         assert!(color_for('.', Posture::Idle, 0.5).is_none());
         assert!(color_for('?', Posture::Idle, 0.5).is_none());
     }
 
     #[test]
-    fn straining_desaturates_eye_color() {
-        let idle = color_for('e', Posture::Idle, 0.5).unwrap();
-        let strained = color_for('e', Posture::Straining, 0.5).unwrap();
-        // The eye colour at idle is very blue-leaning; under strain the rgb
-        // channels should drift closer together (toward grey).
-        if let (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) = (idle, strained) {
-            let spread_idle = g1.abs_diff(r1) as u16 + b1.abs_diff(r1) as u16;
-            let spread_strained = g2.abs_diff(r2) as u16 + b2.abs_diff(r2) as u16;
-            assert!(
-                spread_strained < spread_idle,
-                "expected straining to desaturate; got idle spread {} vs strained spread {}",
-                spread_idle, spread_strained
-            );
+    fn modulate_dims_on_yawn() {
+        let base = Color::Rgb(200, 200, 200);
+        let yawn = modulate(base, Posture::Yawning, 0.5);
+        if let Color::Rgb(r, _, _) = yawn {
+            assert!(r < 200, "yawn should dim luminance; got {}", r);
         } else {
-            panic!("expected RGB colors");
+            panic!("expected RGB");
+        }
+    }
+
+    #[test]
+    fn modulate_desaturates_on_strain() {
+        let blue = Color::Rgb(60, 60, 220);
+        let strained = modulate(blue, Posture::Straining, 0.5);
+        if let Color::Rgb(r, _, b) = strained {
+            // Strain pulls channels toward the average — blue and red should
+            // be closer together than they started.
+            assert!(b - r < 220 - 60, "strain should desaturate");
+        } else {
+            panic!("expected RGB");
         }
     }
 }

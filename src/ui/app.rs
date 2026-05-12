@@ -28,7 +28,7 @@ use tracing::info;
 use crate::core::config::ConsciousnessConfig;
 use crate::ui::chat::{ChatState, draw as draw_chat};
 use crate::ui::cockpit_panel::CockpitPane;
-use crate::ui::presence::{Presence, draw_overlay as draw_presence_overlay, draw_welcome as draw_presence_welcome};
+use crate::ui::presence::{Presence, draw_overlay as draw_presence_overlay};
 use crate::ui::color_support::rgb;
 use crate::ui::component::{Component, Scene, SceneLayout, TuiEvent};
 use crate::backend::BackendEvent;
@@ -981,21 +981,29 @@ impl App {
     }
 
     fn draw_welcome(&self, frame: &mut Frame) {
+        use crate::ui::portrait;
+
         let area = frame.size();
 
         // Background
         let bg = Block::default().style(Style::default().bg(Color::Black));
         frame.render_widget(bg, area);
 
+        // Avatar card occupies its own row in the welcome stack — centered,
+        // framed, modest. It IS the "your agent is loaded" indicator. The
+        // menu beneath then reads as actions on that agent.
+        let avatar_card_w: u16 = portrait::RENDER_W + 2;
+        let avatar_card_h: u16 = portrait::RENDER_H + 3;
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .margin(2)
             .constraints([
-                Constraint::Length(2),
-                Constraint::Length(4),
-                Constraint::Length(1),
-                Constraint::Min(12),
-                Constraint::Length(3),
+                Constraint::Length(2),            // top breathing room
+                Constraint::Length(4),            // title + subtitle
+                Constraint::Length(avatar_card_h), // centered avatar
+                Constraint::Min(8),               // menu
+                Constraint::Length(3),            // footer
             ])
             .split(area);
 
@@ -1017,6 +1025,57 @@ impl App {
         ])
         .alignment(Alignment::Center);
         frame.render_widget(title, chunks[1]);
+
+        // Centered avatar card under the title.
+        if chunks[2].width >= avatar_card_w {
+            let card_x = chunks[2].x + (chunks[2].width - avatar_card_w) / 2;
+            let card_y = chunks[2].y;
+            let card_area = Rect {
+                x: card_x,
+                y: card_y,
+                width: avatar_card_w,
+                height: avatar_card_h.min(chunks[2].height),
+            };
+            let border_col = if self.presence.subconscious_active {
+                Color::Rgb(120, 200, 220)
+            } else {
+                Color::Rgb(120, 130, 150)
+            };
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(border_col).add_modifier(Modifier::DIM));
+            frame.render_widget(block, card_area);
+
+            let portrait_area = Rect {
+                x: card_area.x + 1,
+                y: card_area.y + 1,
+                width: portrait::RENDER_W,
+                height: portrait::RENDER_H,
+            };
+            portrait::render(frame.buffer_mut(), portrait_area, &self.presence);
+
+            let name_area = Rect {
+                x: card_area.x + 1,
+                y: card_area.y + 1 + portrait::RENDER_H,
+                width: card_area.width.saturating_sub(2),
+                height: 1,
+            };
+            let glyph = if self.presence.subconscious_active { "◈" } else { "·" };
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(format!(" {} ", glyph), Style::default().fg(border_col)),
+                    Span::styled(
+                        self.presence.name.clone(),
+                        Style::default()
+                            .fg(border_col)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]))
+                .alignment(Alignment::Center),
+                name_area,
+            );
+        }
 
         let menu_items = vec![
             ("📊 Dashboard", "See how your agent is doing"),
@@ -1076,9 +1135,6 @@ impl App {
             .style(Style::default().fg(Color::DarkGray))
             .alignment(Alignment::Center);
         frame.render_widget(footer, chunks[4]);
-
-        // Draw the welcome-screen presence card (no portrait yet — see C2).
-        draw_presence_welcome(frame, &self.presence, area, Some(&self.agent_pref));
     }
 
     fn draw_dashboard(&self, frame: &mut Frame) {
