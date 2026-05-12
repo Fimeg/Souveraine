@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -288,6 +288,10 @@ pub struct LocalBackend {
     server: Arc<SouveraineServer>,
     event_bus: EventBus,
     seed_id: Arc<SeedId>,
+    /// Live count of in-flight turns (user-initiated or heartbeat-injected).
+    /// CronSensors read this to pause firing while a conversation is active —
+    /// scheduled events shouldn't interrupt presence.
+    active_sessions: Arc<AtomicU32>,
 }
 
 impl LocalBackend {
@@ -320,11 +324,55 @@ impl LocalBackend {
             crate::core::nervous::event_log::EventLog::new(events_dir, event_bus.subscribe());
         tokio::spawn(async move { event_log.run().await });
 
-        Ok(Self {
+        let active_sessions = Arc::new(AtomicU32::new(0));
+        let backend = Self {
             server: Arc::new(server),
-            event_bus,
+            event_bus: event_bus.clone(),
             seed_id,
-        })
+            active_sessions: active_sessions.clone(),
+        };
+
+        // Spawn one CronSensor per agent (each agent owns its own schedules
+        // directory), and one HeartbeatHandler on the bus that injects turns
+        // when a schedule fires. The handler holds an Arc<dyn TurnInjector>
+        // pointing back at us — clean dep direction, no LocalBackend leak
+        // into the nervous module.
+        let agents_dir = base.join("agents");
+        match backend.server.agents.list(None).await {
+            Ok(summaries) => {
+                for summary in summaries {
+                    let schedules_dir = agents_dir.join(&summary.id).join("schedules");
+                    if let Err(e) = std::fs::create_dir_all(&schedules_dir) {
+                        tracing::warn!(
+                            agent = %summary.id,
+                            error = %e,
+                            "could not create schedules dir; skipping cron sensor"
+                        );
+                        continue;
+                    }
+                    let sensor = crate::core::nervous::cron::CronSensor::new(
+                        summary.id.clone(),
+                        schedules_dir,
+                        event_bus.clone(),
+                        active_sessions.clone(),
+                    );
+                    tokio::spawn(async move { sensor.run().await });
+                    tracing::info!(agent = %summary.id, "cron sensor spawned");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "agent listing failed; no cron sensors spawned");
+            }
+        }
+
+        let injector: Arc<dyn crate::core::nervous::handler::TurnInjector> =
+            Arc::new(backend.clone());
+        let mut handler =
+            crate::core::nervous::handler::HeartbeatHandler::new(event_bus.subscribe(), injector);
+        tokio::spawn(async move { handler.run().await });
+        tracing::info!("heartbeat handler spawned");
+
+        Ok(backend)
     }
 
     pub fn from_server(server: Arc<SouveraineServer>) -> Self {
@@ -337,6 +385,7 @@ impl LocalBackend {
             event_bus: EventBus::default(),
             server,
             seed_id,
+            active_sessions: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -520,15 +569,45 @@ impl Backend for LocalBackend {
         let server = self.server.clone();
         let conv_id = conversation_id.to_string();
         let event_bus = self.event_bus.clone();
+        let active = self.active_sessions.clone();
 
+        active.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
             if let Err(e) = run_turn(server, conv_id, &tx, event_bus).await {
                 let _ = tx.send(Err(e)).await;
             }
             let _ = tx.send(Ok(BackendEvent::Done)).await;
+            active.fetch_sub(1, Ordering::Relaxed);
         });
 
         Ok(ReceiverStream::new(rx).boxed())
+    }
+}
+
+#[async_trait]
+impl crate::core::nervous::handler::TurnInjector for LocalBackend {
+    /// Heartbeat-driven turn injection. The cron loop pauses while
+    /// `active_sessions > 0`, so by the time we get here the agent is
+    /// idle. We grab the most recent conversation (or create a fresh one
+    /// if the agent has none), append the scheduled prompt as a user
+    /// message, and drain the resulting stream — the turn runs silently
+    /// in the background. Anything Aster surfaces lands in the inbox.
+    async fn inject_background_turn(
+        &self,
+        agent_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        let conv_id = match self.server.sessions.list_for_agent(agent_id).last().cloned() {
+            Some(id) => id,
+            None => self.ensure_conversation(agent_id).await?,
+        };
+        let stream = self.send(&conv_id, text).await?;
+        // Drain the stream in the background — no UI is listening.
+        tokio::spawn(async move {
+            let mut s = stream;
+            while s.next().await.is_some() {}
+        });
+        Ok(())
     }
 }
 

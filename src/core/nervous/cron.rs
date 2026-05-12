@@ -251,6 +251,7 @@ impl CronSensor {
                     target: Some(entry.name.clone()),
                     urgency: entry.urgency,
                     payload: Some(serde_json::json!({
+                        "agent_id": self.agent_id,
                         "kind": entry.kind,
                         "prompt": entry.prompt,
                         "source": entry.source,

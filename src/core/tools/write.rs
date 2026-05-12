@@ -108,6 +108,8 @@ Paths inside my memory directories contain frontmatter, are git-tracked, and hav
                 }
                 file.write_all(content.as_bytes()).await
                     .map_err(|e| ToolError::io_error(resolved.clone(), e))?;
+                file.flush().await
+                    .map_err(|e| ToolError::io_error(resolved.clone(), e))?;
 
                 Ok(ToolOutput {
                     content: format!("Appended {} chars to {}", content.len(), resolved.display()),
