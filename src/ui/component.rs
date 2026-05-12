@@ -67,6 +67,9 @@ pub enum TuiEvent {
     CompactionWarning { pressure: f32, tier: u8 },
     /// Backend connectivity status.
     BackendStatus { mode: String, healthy: bool },
+    /// Inference strain — model is slow/hoarse, retry in flight.
+    /// Presence reads this to drop into Posture::Straining.
+    InferenceStrain { attempt: u32, status: u16 },
 
     // ── Animation tick ─────────────────────────────────────────
     /// Monotonic tick counter, increments every frame.

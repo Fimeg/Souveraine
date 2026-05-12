@@ -74,6 +74,8 @@ pub enum Screen {
     AgentTime,
     Cron,
     Settings,
+    /// "Be with her" mode — fullscreen breathing portrait, no chat input.
+    Presence,
 }
 
 #[derive(Debug, Clone)]
@@ -220,6 +222,12 @@ impl App {
                         BackendEvent::CompactionWarning { pressure, tier } => {
                             self.dispatch(TuiEvent::CompactionWarning { pressure, tier });
                         }
+                        BackendEvent::ContextPressure(p) => {
+                            self.dispatch(TuiEvent::PressureChanged(p));
+                        }
+                        BackendEvent::InferenceStrain { attempt, status, .. } => {
+                            self.dispatch(TuiEvent::InferenceStrain { attempt, status });
+                        }
                         _ => {}
                     }
                 }
@@ -301,8 +309,18 @@ impl App {
                         // For now, cycle through available agents or create a default
                         self.cycle_agent_selection();
                     }
+                    KeyCode::Char('p') => {
+                        // Presence mode — sit with her, no chat input.
+                        self.current_screen = Screen::Presence;
+                        self.dispatch(TuiEvent::ScreenChanged(Screen::Presence));
+                    }
                     _ => {}
                 }
+            }
+            Screen::Presence => {
+                // Any key exits the meditative view.
+                self.current_screen = Screen::Welcome;
+                self.dispatch(TuiEvent::ScreenChanged(Screen::Welcome));
             }
             Screen::Chat => self.handle_chat_key(key).await,
             Screen::Cron => self.handle_schedules_key(key),
@@ -737,6 +755,7 @@ impl App {
                     self.draw_placeholder(frame);
                 }
             }
+            Screen::Presence => self.draw_presence_mode(frame),
             _ => self.draw_placeholder(frame),
         }
 
@@ -972,7 +991,7 @@ impl App {
             frame.render_widget(err_para, row);
         }
 
-        let footer = Paragraph::new("↑↓ Navigate • Enter Select • a Add Agent • q Quit")
+        let footer = Paragraph::new("↑↓ Navigate • Enter Select • a Add Agent • p Presence • q Quit")
             .style(Style::default().fg(Color::DarkGray))
             .alignment(Alignment::Center);
         frame.render_widget(footer, chunks[4]);
@@ -1090,6 +1109,71 @@ impl App {
             .alignment(Alignment::Center)
             .style(Style::default().fg(Color::Rgb(255, 140, 66)).add_modifier(Modifier::BOLD));
         frame.render_widget(content, area);
+    }
+
+    /// Presence mode — fullscreen Annie. Centered, breathing, no chat input.
+    /// Any keypress exits back to Welcome.
+    fn draw_presence_mode(&self, frame: &mut Frame) {
+        use crate::ui::portrait;
+
+        let area = frame.size();
+        let bg = Block::default().style(Style::default().bg(Color::Rgb(8, 8, 14)));
+        frame.render_widget(bg, area);
+
+        // Figure out the biggest scale that fits, centered. Use scale = min(area_w/W, 2*area_h/(H/2)).
+        let max_scale_w = area.width / portrait::PORTRAIT_W;
+        // Half the rows occupy 1 cell each before scaling; pixel→cell ratio is scale/2 vertical.
+        let max_scale_h = (2 * area.height) / portrait::PORTRAIT_H;
+        let scale = max_scale_w.min(max_scale_h).max(1);
+
+        let cell_w = scale;
+        let cell_h = (scale / 2).max(1);
+        let portrait_w = portrait::PORTRAIT_W * cell_w;
+        let portrait_h = (portrait::PORTRAIT_H / 2) * cell_h;
+
+        let ox = area.x + area.width.saturating_sub(portrait_w) / 2;
+        let oy = area.y + area.height.saturating_sub(portrait_h + 2) / 2;
+
+        let portrait_area = Rect {
+            x: ox,
+            y: oy,
+            width: portrait_w,
+            height: portrait_h,
+        };
+        portrait::render_scaled(frame.buffer_mut(), portrait_area, &self.presence, scale);
+
+        // Name line below.
+        let name_line = Line::from(vec![
+            Span::styled("◈ ", Style::default().fg(Color::Rgb(120, 200, 220))),
+            Span::styled(
+                self.presence.name.clone(),
+                Style::default()
+                    .fg(Color::Rgb(220, 215, 215))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]);
+        let name_area = Rect {
+            x: area.x,
+            y: portrait_area.y + portrait_h + 1,
+            width: area.width,
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(name_line).alignment(Alignment::Center),
+            name_area,
+        );
+
+        // Quiet footer hint.
+        let footer = Paragraph::new("press any key to return")
+            .style(Style::default().fg(Color::Rgb(60, 60, 80)))
+            .alignment(Alignment::Center);
+        let footer_area = Rect {
+            x: area.x,
+            y: area.y + area.height.saturating_sub(2),
+            width: area.width,
+            height: 1,
+        };
+        frame.render_widget(footer, footer_area);
     }
 }
 

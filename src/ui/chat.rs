@@ -690,6 +690,8 @@ Use Tab to toggle the cockpit pane.";
                 }
                 BackendEvent::ContextPressure(p) => {
                     self.pressure = p;
+                    // Forward continuous pressure so Presence can yawn at tier 3.
+                    self.pending_consciousness.push(BackendEvent::ContextPressure(p));
                 }
                 BackendEvent::InferenceStrain { attempt, status, model } => {
                     let text = if status == 0 {
@@ -700,6 +702,10 @@ Use Tab to toggle the cockpit pane.";
                     self.cockpit_log.push(CockpitEntry {
                         kind: CockpitKind::InferenceStrain,
                         text,
+                    });
+                    // Forward to Presence — the body channel needs to feel this.
+                    self.pending_consciousness.push(BackendEvent::InferenceStrain {
+                        attempt, status, model: String::new(),
                     });
                 }
                 BackendEvent::ScheduleActive { name } => {

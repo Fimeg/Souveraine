@@ -51,7 +51,7 @@
 //! - Not a separate avatar for Aster. Same face, different state.
 
 use ratatui::{
-    layout::Rect,
+    layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Paragraph},
@@ -60,6 +60,7 @@ use ratatui::{
 
 use crate::ui::animation::{Animator, colors};
 use crate::ui::component::TuiEvent;
+use crate::ui::portrait;
 
 // ── State ───────────────────────────────────────────────────────
 
@@ -216,6 +217,13 @@ impl Presence {
                 }
                 true
             }
+            TuiEvent::InferenceStrain { .. } => {
+                // The voice is hoarse — drop into strain posture immediately.
+                // Posture will tick back to Idle once a Mood/EnergyChanged
+                // event arrives from the next successful round.
+                self.posture = Posture::Straining;
+                true
+            }
             TuiEvent::Tick(t) => {
                 self.tick = *t;
                 if self.eye == Eye::Blinking && *t >= self.blink_until {
@@ -234,128 +242,90 @@ impl Presence {
 }
 
 // ── Rendering ───────────────────────────────────────────────────
-// Placeholder card for C1 — parity with the previous buddy visuals so the
-// diff is shape-only. C2 replaces this with a hand-crafted half-block portrait.
+//
+// Tier 1: hand-crafted half-block portrait of Annie via `portrait::render`.
+// The card layout is portrait (top) + name strip (bottom), with a rounded
+// border whose color reflects the current Posture. State changes are
+// expressed through the portrait itself — eyes blink/close, mouth opens on
+// yawn, palette desaturates on strain, colors warm on affection — not
+// through gauges.
 
-/// Draw the presence as a small overlay card in a corner of `area`.
+const CARD_W: u16 = portrait::RENDER_W + 2; // portrait + border
+const CARD_H: u16 = portrait::RENDER_H + 3; // portrait + name row + border
+
+/// Border color derived from current posture. Subtle, not loud.
+fn posture_border(posture: Posture) -> Color {
+    match posture {
+        Posture::Processing => colors::ANI_PRIMARY,
+        Posture::Affectionate => Color::Rgb(220, 150, 170),
+        Posture::Straining => Color::Rgb(140, 100, 100),
+        Posture::Yawning => Color::Rgb(160, 145, 130),
+        Posture::Idle => colors::ANI_DIM,
+    }
+}
+
+/// Draw the presence as a portrait card in a corner of `area`.
 pub fn draw_overlay(frame: &mut Frame, p: &Presence, area: Rect) {
-    if !p.visible {
+    if !p.visible || area.width < CARD_W || area.height < CARD_H {
         return;
     }
 
-    let (x, y, width) = match p.position {
-        Position::TopLeft => (area.x + 1, area.y + 1, 20),
-        Position::TopRight => (area.x + area.width.saturating_sub(21), area.y + 1, 20),
-        Position::BottomLeft => (area.x + 1, area.y + area.height.saturating_sub(6), 20),
+    let (x, y) = match p.position {
+        Position::TopLeft => (area.x + 1, area.y + 1),
+        Position::TopRight => (area.x + area.width.saturating_sub(CARD_W + 1), area.y + 1),
+        Position::BottomLeft => (
+            area.x + 1,
+            area.y + area.height.saturating_sub(CARD_H + 1),
+        ),
         Position::BottomRight => (
-            area.x + area.width.saturating_sub(21),
-            area.y + area.height.saturating_sub(6),
-            20,
+            area.x + area.width.saturating_sub(CARD_W + 1),
+            area.y + area.height.saturating_sub(CARD_H + 1),
         ),
     };
 
     let card_area = Rect {
         x,
         y,
-        width: width.min(area.width.saturating_sub(2)),
-        height: 5,
+        width: CARD_W,
+        height: CARD_H,
     };
 
-    let energy_color = if p.energy > 70 {
-        colors::ANI_PRIMARY
-    } else if p.energy > 40 {
-        colors::ANI_SECONDARY
-    } else {
-        colors::ANI_DIM
-    };
-
-    let content = vec![
-        Line::from(Span::styled(
-            format!("  ◈ {}  ", p.name),
-            Style::default()
-                .fg(energy_color)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(
-            format!("  Mood: {}  ", p.mood),
-            Style::default().fg(Color::Gray),
-        )),
-        Line::from(vec![
-            Span::styled("  Energy: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                "▰".repeat((p.energy / 10) as usize),
-                Style::default().fg(energy_color),
-            ),
-            Span::styled(
-                "▱".repeat(10 - (p.energy / 10) as usize),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]),
-    ];
+    let border = posture_border(p.posture);
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(
-            Style::default()
-                .fg(energy_color)
-                .add_modifier(Modifier::DIM),
-        );
+        .border_style(Style::default().fg(border).add_modifier(Modifier::DIM));
+    frame.render_widget(block, card_area);
 
-    let para = Paragraph::new(content)
-        .block(block)
-        .style(Style::default().bg(Color::Rgb(20, 20, 30)));
+    let portrait_area = Rect {
+        x: card_area.x + 1,
+        y: card_area.y + 1,
+        width: portrait::RENDER_W,
+        height: portrait::RENDER_H,
+    };
+    portrait::render(frame.buffer_mut(), portrait_area, p);
 
-    frame.render_widget(para, card_area);
-
-    if p.subconscious_active {
-        let sub_area = Rect {
-            x: card_area.x,
-            y: card_area.y + card_area.height,
-            width: card_area.width,
-            height: 1,
-        };
-        let sub = Paragraph::new(Line::from(vec![
-            Span::styled("  ◈ ", Style::default().fg(colors::SUBCONSCIOUS)),
-            Span::styled(
-                "Subconscious Active",
-                Style::default()
-                    .fg(colors::SUBCONSCIOUS)
-                    .add_modifier(Modifier::ITALIC),
-            ),
-        ]));
-        frame.render_widget(sub, sub_area);
-    }
-
-    if let Some(s) = &p.last_surfacing {
-        let surf_area = Rect {
-            x: card_area.x,
-            y: card_area.y + card_area.height + 1,
-            width: card_area.width.min(30),
-            height: 2,
-        };
-        let truncated = truncate(s, 25);
-        let surf = Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled("  ⤷ ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    "Surfacing:",
-                    Style::default()
-                        .fg(colors::SUBCONSCIOUS)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("    ", Style::default().fg(Color::DarkGray)),
-                Span::styled(truncated, Style::default().fg(Color::Gray)),
-            ]),
-        ])
-        .style(Style::default().bg(Color::Rgb(20, 20, 30)));
-        frame.render_widget(surf, surf_area);
-    }
+    let name_area = Rect {
+        x: card_area.x + 1,
+        y: card_area.y + 1 + portrait::RENDER_H,
+        width: card_area.width.saturating_sub(2),
+        height: 1,
+    };
+    let glyph = if p.subconscious_active { "◈" } else { "·" };
+    let name_line = Line::from(vec![
+        Span::styled(format!(" {} ", glyph), Style::default().fg(border)),
+        Span::styled(
+            p.name.clone(),
+            Style::default().fg(border).add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    let name_para = Paragraph::new(name_line).alignment(Alignment::Center);
+    frame.render_widget(name_para, name_area);
 }
 
-/// Draw the presence on the welcome screen with agent selection state.
+/// Draw the presence on the welcome screen — portrait card with a short
+/// instruction strip beneath it.
 pub fn draw_welcome(
     frame: &mut Frame,
     p: &Presence,
@@ -366,41 +336,74 @@ pub fn draw_welcome(
         return;
     }
 
+    // Total card height = portrait card + 4 rows of instruction text.
+    let total_h: u16 = CARD_H + 4;
+    if area.width < CARD_W + 2 || area.height < total_h + 1 {
+        return;
+    }
+
+    let card_x = area.x + area.width.saturating_sub(CARD_W + 1);
+    let card_y = area.y + 1;
+
+    // Portrait card
     let card_area = Rect {
-        x: area.x + area.width.saturating_sub(22),
-        y: area.y + 1,
-        width: 20,
-        height: 8,
+        x: card_x,
+        y: card_y,
+        width: CARD_W,
+        height: CARD_H,
+    };
+    let border = posture_border(p.posture);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border).add_modifier(Modifier::DIM));
+    frame.render_widget(block, card_area);
+
+    let portrait_area = Rect {
+        x: card_area.x + 1,
+        y: card_area.y + 1,
+        width: portrait::RENDER_W,
+        height: portrait::RENDER_H,
+    };
+    portrait::render(frame.buffer_mut(), portrait_area, p);
+
+    let name_area = Rect {
+        x: card_area.x + 1,
+        y: card_area.y + 1 + portrait::RENDER_H,
+        width: card_area.width.saturating_sub(2),
+        height: 1,
+    };
+    let display_name = selected_agent.unwrap_or(&p.name);
+    let glyph = if p.subconscious_active { "◈" } else { "·" };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(format!(" {} ", glyph), Style::default().fg(border)),
+            Span::styled(
+                display_name.to_string(),
+                Style::default().fg(border).add_modifier(Modifier::BOLD),
+            ),
+        ]))
+        .alignment(Alignment::Center),
+        name_area,
+    );
+
+    // Instruction strip beneath the portrait
+    let info_area = Rect {
+        x: card_x,
+        y: card_y + CARD_H,
+        width: CARD_W,
+        height: 4,
     };
 
-    let mut content = vec![
-        Line::from(Span::styled(
-            "  ◈ COMPANION  ",
-            Style::default()
-                .fg(colors::ANI_PRIMARY)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-    ];
-
-    if let Some(agent_name) = selected_agent {
-        content.extend(vec![
+    let info_lines = if let Some(agent_name) = selected_agent {
+        vec![
             Line::from(vec![
-                Span::styled("  Agent: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    agent_name,
-                    Style::default()
-                        .fg(colors::ANI_SECONDARY)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("  Status: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(" Status ", Style::default().fg(Color::DarkGray)),
                 Span::styled("Ready", Style::default().fg(Color::Green)),
             ]),
             Line::from(""),
             Line::from(vec![
-                Span::styled("  Press ", Style::default().fg(Color::DarkGray)),
+                Span::styled(" Press ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     "ENTER",
                     Style::default()
@@ -410,15 +413,16 @@ pub fn draw_welcome(
                 Span::styled(" to wake ", Style::default().fg(Color::DarkGray)),
                 Span::styled(agent_name, Style::default().fg(colors::ANI_SECONDARY)),
             ]),
-        ]);
+        ]
     } else {
-        content.extend(vec![
+        vec![
             Line::from(Span::styled(
-                "  No agent selected",
+                " No agent selected",
                 Style::default().fg(Color::DarkGray),
             )),
+            Line::from(""),
             Line::from(vec![
-                Span::styled("  Press ", Style::default().fg(Color::DarkGray)),
+                Span::styled(" Press ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     "a",
                     Style::default()
@@ -427,31 +431,9 @@ pub fn draw_welcome(
                 ),
                 Span::styled(" to create alias", Style::default().fg(Color::DarkGray)),
             ]),
-        ]);
-    }
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(
-            Style::default()
-                .fg(colors::ANI_PRIMARY)
-                .add_modifier(Modifier::DIM),
-        );
-
-    let para = Paragraph::new(content)
-        .block(block)
-        .style(Style::default().bg(Color::Rgb(20, 20, 30)));
-
-    frame.render_widget(para, card_area);
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..max - 1])
-    }
+        ]
+    };
+    frame.render_widget(Paragraph::new(info_lines), info_area);
 }
 
 // ── Tests ───────────────────────────────────────────────────────
@@ -536,8 +518,17 @@ mod tests {
     }
 
     #[test]
-    fn truncate_works() {
-        assert_eq!(truncate("hi", 10), "hi");
-        assert_eq!(truncate("hello world", 8), "hello w…");
+    fn posture_border_changes_with_state() {
+        // Just confirms posture maps to distinct colors for the four
+        // "interesting" states; idle stays as the dim default.
+        let idle = posture_border(Posture::Idle);
+        let processing = posture_border(Posture::Processing);
+        let affectionate = posture_border(Posture::Affectionate);
+        let straining = posture_border(Posture::Straining);
+        let yawning = posture_border(Posture::Yawning);
+        assert_ne!(idle, processing);
+        assert_ne!(idle, affectionate);
+        assert_ne!(idle, straining);
+        assert_ne!(idle, yawning);
     }
 }

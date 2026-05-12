@@ -5,6 +5,7 @@ pub mod cockpit_panel;
 pub mod color_support;
 pub mod component;
 pub mod markdown;
+pub mod portrait;
 pub mod presence;
 pub mod schedules;
 
