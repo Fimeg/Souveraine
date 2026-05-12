@@ -1,3 +1,3 @@
 pub mod seed;
 
-pub use seed::SeedId;
+pub use seed::{glyph_from_pubkey, SeedId};

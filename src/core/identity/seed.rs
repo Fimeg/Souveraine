@@ -87,6 +87,14 @@ impl SeedId {
         self.verifying_key.to_bytes()
     }
 
+    /// Deterministic 4-glyph rendering of the public key. Used as a
+    /// terminal-friendly per-agent badge in the manager view. Drawn from
+    /// a 16-symbol palette indexed by 4-bit nibbles of the first two
+    /// bytes of the public key.
+    pub fn glyph(&self) -> String {
+        glyph_from_pubkey(&self.public_key_bytes())
+    }
+
     pub fn sign(&self, data: &[u8]) -> Signature {
         self.signing_key.sign(data)
     }
@@ -112,6 +120,22 @@ impl SeedId {
     pub fn default_dir(base_path: &Path) -> PathBuf {
         base_path.join("seed-id")
     }
+}
+
+/// Standalone glyph renderer — also usable on remote agents we only know
+/// the pubkey bytes for. Reads the first two bytes of `pubkey` and emits
+/// four glyphs from the geometric-shapes palette.
+pub fn glyph_from_pubkey(pubkey: &[u8]) -> String {
+    const PALETTE: [char; 16] = [
+        '◇', '◆', '○', '●', '△', '▲', '▽', '▼',
+        '□', '■', '◐', '◑', '◒', '◓', '☆', '★',
+    ];
+    let mut out = String::with_capacity(4);
+    for byte in pubkey.iter().take(2) {
+        out.push(PALETTE[(byte >> 4) as usize]);
+        out.push(PALETTE[(byte & 0x0f) as usize]);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -142,5 +166,21 @@ mod tests {
         let seed1 = SeedId::load_or_generate(dir.path()).unwrap();
         let seed2 = SeedId::load_or_generate(dir.path()).unwrap();
         assert_eq!(seed1.public_key_hex(), seed2.public_key_hex());
+    }
+
+    #[test]
+    fn test_glyph_is_deterministic_and_four_chars() {
+        let seed = SeedId::generate();
+        let g1 = seed.glyph();
+        let g2 = seed.glyph();
+        assert_eq!(g1, g2);
+        assert_eq!(g1.chars().count(), 4);
+    }
+
+    #[test]
+    fn test_glyph_known_input() {
+        // pubkey bytes [0x00, 0xff, ...] → nibbles 0,0,f,f → ◇◇★★
+        let g = glyph_from_pubkey(&[0x00, 0xff]);
+        assert_eq!(g, "◇◇★★");
     }
 }

@@ -68,6 +68,19 @@ impl AgentInventory {
         self.subconscious_dir.join(&sub_id).join("memory.git")
     }
 
+    /// Per-agent seed directory: `~/.souveraine/agents/{id}/seed/`.
+    /// Lives alongside the memfs so the agent's identity travels with its
+    /// memory — federation can later sync this directory as one unit.
+    pub fn seed_dir(&self, agent_id: &str) -> PathBuf {
+        self.memfs_dir.join(agent_id).join("seed")
+    }
+
+    /// Load or initialize a per-agent Ed25519 seed identity. First call
+    /// generates and persists; subsequent calls return the same keypair.
+    pub fn seed_id(&self, agent_id: &str) -> anyhow::Result<crate::core::identity::SeedId> {
+        crate::core::identity::SeedId::load_or_generate(&self.seed_dir(agent_id))
+    }
+
     pub async fn list(&self, filters: Option<String>) -> anyhow::Result<Vec<AgentSummary>> {
         let query = if let Some(filter) = filters {
             sqlx::query_as::<_, AgentSummaryRow>(
@@ -116,6 +129,24 @@ impl AgentInventory {
 
         let repo = git2::Repository::init(&memfs)?;
         drop(repo);
+
+        // Initialize this agent's per-agent seed alongside its memfs.
+        // Failure is non-fatal — the agent can still be created and we'll
+        // try again on first use via seed_id().
+        let seed_dir = self.memfs_dir.join(&uuid).join("seed");
+        match crate::core::identity::SeedId::load_or_generate(&seed_dir) {
+            Ok(seed) => {
+                tracing::info!(
+                    agent_id = %uuid,
+                    glyph = %seed.glyph(),
+                    pubkey_prefix = %&seed.public_key_hex()[..16],
+                    "initialized per-agent seed",
+                );
+            }
+            Err(e) => {
+                tracing::warn!(agent_id = %uuid, error = %e, "per-agent seed init failed (will retry on demand)");
+            }
+        }
 
         let mut blocks = request.memory_blocks;
         if blocks.is_empty() {

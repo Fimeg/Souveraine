@@ -89,13 +89,13 @@ It is not a tool you operate — it is the world your agents inhabit.\n\n\
 Run `souveraine chat` to begin a conversation. \
 Run `souveraine tui` for the full presence. \
 Run `souveraine init` to summon Souveraine into a new place.",
-    after_help = "EXAMPLES:\n  souveraine init              Summon Souveraine here\n  souveraine chat               Enter the world (interactive)\n  souveraine chat \"hello\"       Speak to the world (one-shot)\n  souveraine --agent Ani chat   Speak as Ani\n  souveraine --json status      The world speaks in data\n  souveraine completions bash   Announce capabilities to your shell",
+    after_help = "EXAMPLES:\n  souveraine init                  Summon Souveraine here\n  souveraine chat                   Enter the world (interactive)\n  souveraine chat \"hello\"           Speak to the world (one-shot)\n  souveraine --agent <name> chat    Speak as a specific agent\n  souveraine --json status          The world speaks in data\n  souveraine completions bash       Announce capabilities to your shell",
     max_term_width = 100,
 )]
 struct Cli {
-    /// Which agent to speak as
-    #[arg(short, long, global = true, default_value = "Ani")]
-    agent: String,
+    /// Which agent to speak as. If omitted, the first available agent is used.
+    #[arg(short, long, global = true)]
+    agent: Option<String>,
 
     /// Speak in data, not prose
     #[arg(long, global = true)]
@@ -200,6 +200,11 @@ enum Commands {
     Identity {
         #[command(subcommand)]
         action: IdentityAction,
+
+        /// Operate on the machine's host seed instead of the per-agent seed.
+        /// The host seed is for federation transport between Souveraine clients.
+        #[arg(long, global = true)]
+        host: bool,
     },
 
     /// Query the event firehose log
@@ -250,7 +255,7 @@ enum ScheduleAction {
 
 #[derive(Subcommand)]
 enum IdentityAction {
-    /// Show this instance's seed identity (public key)
+    /// Show the seed identity (public key + glyph)
     Show,
     /// Generate a new seed identity (WARNING: replaces existing)
     Generate,
@@ -344,12 +349,12 @@ async fn main() -> anyhow::Result<()> {
 
     // Handle schedule early — reads files directly, no backend needed
     if let Some(Commands::Schedule { action }) = &cli.command {
-        return run_schedule(action, &cli.agent, cli.json).await;
+        return run_schedule(action, cli.agent.as_deref(), cli.json).await;
     }
 
     // Handle identity early — crypto ops, no backend needed
-    if let Some(Commands::Identity { action }) = &cli.command {
-        return run_identity(action, cli.json).await;
+    if let Some(Commands::Identity { action, host }) = &cli.command {
+        return run_identity(action, *host, cli.agent.as_deref(), cli.json).await;
     }
 
     // Handle events early — file reads, no backend needed
@@ -362,7 +367,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command.as_ref().unwrap_or(&Commands::Chat { message: None }) {
         Commands::Tui => run_tui(config.clone(), cli.agent.clone()).await?,
-        Commands::Chat { message } => run_chat(config, cli.agent, message.clone(), cli.json, cli.quiet, cli.local).await?,
+        Commands::Chat { message } => run_chat(config, cli.agent.clone(), message.clone(), cli.json, cli.quiet, cli.local).await?,
         Commands::Agents => run_agents(config, cli.json, cli.local).await?,
         Commands::Model { model, json, verbose } => {
             cli::run_model_command(model.as_deref(), *json, *verbose).await?
@@ -480,24 +485,116 @@ async fn run_auth(action: &AuthAction, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_identity(action: &IdentityAction, json: bool) -> anyhow::Result<()> {
+/// Resolve a user-provided string (agent name or UUID) to an agent UUID by
+/// walking `~/.souveraine/server/agents/*/agent.json`. Returns the matching
+/// UUID if found, or the input unchanged if it already looks like a UUID-style
+/// directory under server/agents/.
+fn resolve_agent_id_from_disk(base: &std::path::Path, name_or_id: &str) -> anyhow::Result<String> {
+    let agents_dir = base.join("server").join("agents");
+    if !agents_dir.exists() {
+        anyhow::bail!("no agents directory at {} — has any agent been created yet?", agents_dir.display());
+    }
+
+    let direct = agents_dir.join(name_or_id);
+    if direct.join("agent.json").exists() {
+        return Ok(name_or_id.to_string());
+    }
+
+    for entry in std::fs::read_dir(&agents_dir)? {
+        let entry = entry?;
+        let path = entry.path().join("agent.json");
+        if !path.exists() { continue; }
+        let raw = match std::fs::read_to_string(&path) { Ok(s) => s, Err(_) => continue };
+        let json: serde_json::Value = match serde_json::from_str(&raw) { Ok(v) => v, Err(_) => continue };
+        let name = json.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let id = json.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        if name == name_or_id || id == name_or_id {
+            return Ok(id.to_string());
+        }
+    }
+
+    anyhow::bail!("no agent matched '{}' (checked name and id across {})", name_or_id, agents_dir.display())
+}
+
+/// Return the first agent UUID found on disk. Used when --agent is omitted
+/// so the CLI can still operate without forcing a default name.
+///
+/// Walks the user-side memfs directory (`~/.souveraine/agents/`) and picks
+/// the first entry whose `memory/` subdirectory exists. This naturally
+/// filters out stale server-side records (orphans without a memfs).
+fn first_agent_id_on_disk(base: &std::path::Path) -> anyhow::Result<String> {
+    let memfs_dir = base.join("agents");
+    if !memfs_dir.exists() {
+        anyhow::bail!("no agents directory at {} — run `souveraine init` first", memfs_dir.display());
+    }
+    let mut candidates: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(&memfs_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() { continue; }
+        let name = match path.file_name().and_then(|s| s.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        // Skip the system/ marker directory and anything without a memory dir.
+        if name == "system" || !path.join("memory").is_dir() {
+            continue;
+        }
+        candidates.push(name);
+    }
+    candidates.sort();
+    candidates.into_iter().next().ok_or_else(|| {
+        anyhow::anyhow!("no agents with memory found under {} — run `souveraine init`", memfs_dir.display())
+    })
+}
+
+async fn run_identity(
+    action: &IdentityAction,
+    host: bool,
+    agent: Option<&str>,
+    json: bool,
+) -> anyhow::Result<()> {
     use crate::core::identity::SeedId;
 
     let base = dirs::home_dir()
         .unwrap_or_default()
         .join(".souveraine");
-    let seed_dir = SeedId::default_dir(&base);
+
+    // Identity defaults to per-agent. --host opts out to the machine seed
+    // used for federation transport. Verify is identity-agnostic — it just
+    // checks a signature against a pubkey, no seed lookup.
+    //
+    // Per-agent seeds live at ~/.souveraine/agents/{uuid}/seed/.
+    let (seed_dir, scope_label, agent_uuid) = if host {
+        (SeedId::default_dir(&base), "Host Seed Identity".to_string(), None)
+    } else {
+        let uuid = match agent {
+            Some(name_or_id) => resolve_agent_id_from_disk(&base, name_or_id)?,
+            None => first_agent_id_on_disk(&base)?,
+        };
+        let dir = base.join("agents").join(&uuid).join("seed");
+        (dir, "Per-Agent Seed Identity".to_string(), Some(uuid))
+    };
 
     match action {
         IdentityAction::Show => {
             let seed = SeedId::load_or_generate(&seed_dir)?;
             if json {
-                println!("{}", serde_json::json!({
+                let mut obj = serde_json::json!({
                     "public_key": seed.public_key_hex(),
+                    "glyph": seed.glyph(),
                     "seed_dir": seed_dir.display().to_string(),
-                }));
+                });
+                if let Some(id) = &agent_uuid {
+                    obj["agent_id"] = serde_json::Value::String(id.clone());
+                }
+                println!("{}", obj);
             } else {
-                println!("Seed Identity");
+                println!("{scope_label}");
+                if let Some(id) = &agent_uuid {
+                    println!("  Agent:      {}", id);
+                }
+                println!("  Glyph:      {}", seed.glyph());
                 println!("  Public key: {}", seed.public_key_hex());
                 println!("  Location:   {}", seed_dir.display());
             }
@@ -510,7 +607,7 @@ async fn run_identity(action: &IdentityAction, json: bool) -> anyhow::Result<()>
                 anyhow::bail!("Refusing to overwrite existing seed identity. Delete {} manually first.", seed_dir.display());
             }
             let seed = SeedId::load_or_generate(&seed_dir)?;
-            println!("Generated seed identity: {}", seed.public_key_hex());
+            println!("Generated seed identity: {} (glyph: {})", seed.public_key_hex(), seed.glyph());
         }
         IdentityAction::Sign { message } => {
             let seed = SeedId::load_or_generate(&seed_dir)?;
@@ -521,6 +618,7 @@ async fn run_identity(action: &IdentityAction, json: bool) -> anyhow::Result<()>
                     "message": message,
                     "signature": sig_hex,
                     "public_key": seed.public_key_hex(),
+                    "glyph": seed.glyph(),
                 }));
             } else {
                 println!("Signature: {sig_hex}");
@@ -615,14 +713,19 @@ async fn run_events(action: &EventsAction, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_schedule(action: &ScheduleAction, agent: &str, json: bool) -> anyhow::Result<()> {
+async fn run_schedule(action: &ScheduleAction, agent: Option<&str>, json: bool) -> anyhow::Result<()> {
     use crate::core::nervous::cron::parse_schedule_file;
 
-    let base = dirs::home_dir()
+    let souveraine_base = dirs::home_dir()
         .unwrap_or_default()
-        .join(".souveraine")
+        .join(".souveraine");
+    let agent_id = match agent {
+        Some(name_or_id) => resolve_agent_id_from_disk(&souveraine_base, name_or_id)?,
+        None => first_agent_id_on_disk(&souveraine_base)?,
+    };
+    let base = souveraine_base
         .join("agents")
-        .join(agent)
+        .join(&agent_id)
         .join("memory")
         .join("schedules");
 
@@ -730,9 +833,9 @@ async fn run_schedule(action: &ScheduleAction, agent: &str, json: bool) -> anyho
 
 async fn run_tui(
     config: Arc<RwLock<ConsciousnessConfig>>,
-    agent_pref: String,
+    agent_pref: Option<String>,
 ) -> anyhow::Result<()> {
-    let mut app = App::new(config, agent_pref);
+    let mut app = App::new(config, agent_pref.unwrap_or_default());
     app.run().await?;
     Ok(())
 }
@@ -776,7 +879,7 @@ async fn resolve_backend(
 
 async fn run_chat(
     config: Arc<RwLock<ConsciousnessConfig>>,
-    agent_name: String,
+    agent_name: Option<String>,
     message: Option<String>,
     json: bool,
     quiet: bool,
@@ -787,10 +890,12 @@ async fn run_chat(
 
     let (backend, mode) = resolve_backend(&config, force_local, json, quiet).await?;
 
-    // Resolve the agent: if `--agent` matches a name on the backend, use its id.
+    // Resolve the agent: if `--agent` matches a name or id, use it; else first available.
     let agents = backend.list_agents().await?;
-    let resolved = agents.iter().find(|a| a.name == agent_name || a.id == agent_name)
-        .or_else(|| agents.first());
+    let resolved = match &agent_name {
+        Some(n) => agents.iter().find(|a| a.name == *n || a.id == *n).or_else(|| agents.first()),
+        None => agents.first(),
+    };
     let agent = match resolved {
         Some(a) => a.clone(),
         None => {
@@ -879,7 +984,7 @@ async fn run_chat(
 
 async fn run_reflect(
     config: Arc<RwLock<ConsciousnessConfig>>,
-    agent_name: String,
+    agent_name: Option<String>,
     conversation: Option<String>,
     json: bool,
 ) -> anyhow::Result<()> {
@@ -889,11 +994,11 @@ async fn run_reflect(
     let server = local.server();
 
     let summaries = server.agents.list(None).await?;
-    let agent = summaries
-        .iter()
-        .find(|a| a.name == agent_name || a.id == agent_name)
-        .or_else(|| summaries.first())
-        .ok_or_else(|| anyhow::anyhow!("no agents configured"))?;
+    let agent = match &agent_name {
+        Some(n) => summaries.iter().find(|a| a.name == *n || a.id == *n).or_else(|| summaries.first()),
+        None => summaries.first(),
+    }
+    .ok_or_else(|| anyhow::anyhow!("no agents configured"))?;
 
     // Resolve a conversation. Explicit --conversation wins; otherwise
     // pick the most recent active conversation for this agent.
