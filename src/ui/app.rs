@@ -27,9 +27,8 @@ use tracing::info;
 
 use crate::core::config::ConsciousnessConfig;
 use crate::ui::chat::{ChatState, draw as draw_chat};
-use crate::ui::buddy::{BuddyState, draw_buddy, draw_welcome_buddy};
-use crate::ui::buddy_panel::BuddyPanel;
 use crate::ui::cockpit_panel::CockpitPane;
+use crate::ui::presence::{Presence, draw_overlay as draw_presence_overlay, draw_welcome as draw_presence_welcome};
 use crate::ui::color_support::rgb;
 use crate::ui::component::{Component, Scene, SceneLayout, TuiEvent};
 use crate::backend::BackendEvent;
@@ -51,8 +50,9 @@ pub struct App {
     schedules: Option<crate::ui::schedules::SchedulesView>,
     /// Agent name preference (from `--agent` CLI flag).
     agent_pref: String,
-    /// Companion buddy for visual agent representation (WIP).
-    buddy: BuddyState,
+    /// Annie Composite made felt — body channel for the running agent.
+    /// See `src/ui/presence.rs` for the state model and event subscriptions.
+    presence: Presence,
     /// Available agents for selection.
     available_agents: Vec<String>,
     /// The component scene — owns event dispatch and layout.
@@ -125,19 +125,27 @@ impl App {
             chat_error: None,
             schedules: None,
             agent_pref: agent_pref.clone(),
-            buddy: BuddyState::new(&agent_pref),
+            presence: Presence::new(&agent_pref),
             available_agents: Vec::new(),
             scene: Scene::new(SceneLayout::Single),
             tick: 0,
             bloom: crate::ui::animation::bloom::BloomState::new(),
         };
 
-        // Register standard components so they receive events from the start.
-        // BuddyPanel and CockpitPane listen for surfacing events from Aster.
-        app.scene.add(BuddyPanel::new(&agent_pref));
+        // CockpitPane listens for Aster's surfacing events as scrollable text.
+        // Presence (Annie's body channel) lives outside the Scene because it's
+        // an overlay, not a zoned component — App feeds it events via `dispatch`.
         app.scene.add(CockpitPane::new());
 
         app
+    }
+
+    /// Dispatch a TuiEvent to every listener: scene components AND Presence.
+    /// Returns true if a redraw is needed.
+    fn dispatch(&mut self, event: TuiEvent) -> bool {
+        let scene_dirty = self.scene.event_all(&event);
+        let presence_dirty = self.presence.handle_event(&event);
+        scene_dirty || presence_dirty
     }
 
     /// Add an available agent for selection (WIP - called from backend discovery)
@@ -151,8 +159,7 @@ impl App {
     pub fn select_agent(&mut self, agent_name: &str) {
         self.agent_pref = agent_name.to_string();
         self.agent_status.name = agent_name.to_string();
-        self.buddy.sprite.name = agent_name.to_string();
-        self.scene.event_all(&TuiEvent::AgentSelected(agent_name.to_string()));
+        self.dispatch(TuiEvent::AgentSelected(agent_name.to_string()));
     }
 
     /// Cycle through available agents for selection (WIP)
@@ -198,19 +205,20 @@ impl App {
 
                 // Forward consciousness events (surfacing, reflection, archivist)
                 // from chat to the scene so Aster's observations reach Components.
-                for ev in chat.pending_consciousness.drain(..) {
+                let drained: Vec<BackendEvent> = chat.pending_consciousness.drain(..).collect();
+                for ev in drained {
                     match ev {
                         BackendEvent::Surfacing { source, content, priority } => {
-                            self.scene.event_all(&TuiEvent::Surfacing { source, content, priority });
+                            self.dispatch(TuiEvent::Surfacing { source, content, priority });
                         }
                         BackendEvent::Reflection(content) => {
-                            self.scene.event_all(&TuiEvent::Reflection { content });
+                            self.dispatch(TuiEvent::Reflection { content });
                         }
                         BackendEvent::Archivist { synthesis, pressure } => {
-                            self.scene.event_all(&TuiEvent::Archivist { synthesis, pressure });
+                            self.dispatch(TuiEvent::Archivist { synthesis, pressure });
                         }
                         BackendEvent::CompactionWarning { pressure, tier } => {
-                            self.scene.event_all(&TuiEvent::CompactionWarning { pressure, tier });
+                            self.dispatch(TuiEvent::CompactionWarning { pressure, tier });
                         }
                         _ => {}
                     }
@@ -219,7 +227,7 @@ impl App {
 
             // Tick dispatch
             self.tick = self.tick.wrapping_add(1);
-            self.scene.event_all(&TuiEvent::Tick(self.tick));
+            self.dispatch(TuiEvent::Tick(self.tick));
 
             terminal.draw(|f| self.draw(f))?;
 
@@ -231,15 +239,14 @@ impl App {
                 let crossterm_event = event::read()?;
                 match crossterm_event {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        // Dispatch to scene first, then handle App-level keys
-                        let tui_event = TuiEvent::Key(key);
-                        let handled = self.scene.event_all(&tui_event);
+                        // Dispatch to listeners first, then handle App-level keys
+                        let handled = self.dispatch(TuiEvent::Key(key));
                         if !handled {
                             self.handle_key(key).await;
                         }
                     }
                     Event::Resize(w, h) => {
-                        self.scene.event_all(&TuiEvent::Resize { width: w, height: h });
+                        self.dispatch(TuiEvent::Resize { width: w, height: h });
                         self.scene.layout = match self.current_screen {
                             Screen::Chat | Screen::Code => SceneLayout::ChatWithSidebar {
                                 sidebar_ratio: 0.3,
@@ -257,7 +264,7 @@ impl App {
             if self.current_screen == Screen::Splash {
                 if self.splash_start.elapsed() > Duration::from_secs(8) {
                     self.current_screen = Screen::Welcome;
-                    self.scene.event_all(&TuiEvent::ScreenChanged(Screen::Welcome));
+                    self.dispatch(TuiEvent::ScreenChanged(Screen::Welcome));
                 }
             }
 
@@ -281,7 +288,7 @@ impl App {
         match self.current_screen {
             Screen::Splash => {
                 self.current_screen = Screen::Welcome;
-                self.scene.event_all(&TuiEvent::ScreenChanged(Screen::Welcome));
+                self.dispatch(TuiEvent::ScreenChanged(Screen::Welcome));
             }
             Screen::Welcome => {
                 match key.code {
@@ -659,9 +666,7 @@ impl App {
         if let Some(a) = chosen {
             self.agent_status.name = a.name.clone();
             self.agent_status.subconscious_active = true;
-            // Sync with buddy state
-            self.buddy.sprite.name = a.name.clone();
-            self.buddy.sprite.subconscious_active = true;
+            // Presence learns about the agent through the event stream below.
         }
 
         // Local mode: pull memory repo stats.
@@ -688,16 +693,17 @@ impl App {
         // Energy stub: derive from agent count (cosmetic).
         self.agent_status.energy = ((self.agent_status.agent_count.min(10)) * 10) as u8;
 
-        // Sync buddy state with agent status (WIP)
-        self.buddy.sprite.update_mood(&self.agent_status.mood);
-        self.buddy.sprite.set_energy(self.agent_status.energy);
-        self.buddy.sprite.set_health(100); // Placeholder - will be calculated from actual metrics
-
-        // Dispatch events to scene so any listening components can react
-        self.scene.event_all(&TuiEvent::EnergyChanged(self.agent_status.energy));
-        self.scene.event_all(&TuiEvent::MoodChanged(self.agent_status.mood.clone()));
-        self.scene.event_all(&TuiEvent::BackendStatus {
-            mode: mode.to_string(),
+        // Dispatch state changes to all listeners (scene components + Presence).
+        // Presence updates its own internal state via handle_event; no polling.
+        let agent_name = self.agent_status.name.clone();
+        let energy = self.agent_status.energy;
+        let mood = self.agent_status.mood.clone();
+        let mode_str = mode.to_string();
+        self.dispatch(TuiEvent::AgentSelected(agent_name));
+        self.dispatch(TuiEvent::EnergyChanged(energy));
+        self.dispatch(TuiEvent::MoodChanged(mood));
+        self.dispatch(TuiEvent::BackendStatus {
+            mode: mode_str,
             healthy: true,
         });
     }
@@ -734,10 +740,10 @@ impl App {
             _ => self.draw_placeholder(frame),
         }
 
-        // Buddy overlay on Welcome and Dashboard only — in Chat mode,
-        // the cockpit panel shows agent state instead.
+        // Presence overlay on Welcome and Dashboard only — in Chat mode,
+        // the cockpit panel shows agent state in its own register (words).
         if matches!(self.current_screen, Screen::Welcome | Screen::Dashboard) {
-            draw_buddy(frame, &self.buddy, area);
+            draw_presence_overlay(frame, &self.presence, area);
         }
     }
 
@@ -893,7 +899,7 @@ impl App {
             ])
             .split(area);
 
-        let breathe = self.buddy.animator.breathe(3000);
+        let breathe = self.presence.animator.breathe(3000);
         let glow = (140.0 + breathe * 60.0) as u8;
 
         let title = Paragraph::new(vec![
@@ -971,8 +977,8 @@ impl App {
             .alignment(Alignment::Center);
         frame.render_widget(footer, chunks[4]);
 
-        // Draw companion buddy on welcome screen
-        draw_welcome_buddy(frame, &self.buddy, area, Some(&self.agent_pref));
+        // Draw the welcome-screen presence card (no portrait yet — see C2).
+        draw_presence_welcome(frame, &self.presence, area, Some(&self.agent_pref));
     }
 
     fn draw_dashboard(&self, frame: &mut Frame) {
