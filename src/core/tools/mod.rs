@@ -12,6 +12,7 @@ pub mod glob;
 pub mod grep;
 pub mod list_dir;
 pub mod read;
+pub mod schedule;
 pub mod subagent;
 pub mod write;
 
@@ -30,6 +31,7 @@ use self::list_dir::ListDir;
 use self::read::Read;
 use self::subagent::Subagent;
 use self::agent::Agent;
+use self::schedule::Schedule;
 use self::write::Write;
 
 // ── Re-export for backward compat ───────────────────────────────
@@ -79,6 +81,7 @@ impl Sensorium {
                 Box::new(ListDir),
                 Box::new(Subagent),
                 Box::new(Agent),
+                Box::new(Schedule),
             ],
             bash,
             context: ToolContext {
@@ -89,6 +92,7 @@ impl Sensorium {
                 subagent_runner: None,
                 subagent_depth: 0,
                 compaction_engine: None,
+                event_bus: None,
             },
         }
     }

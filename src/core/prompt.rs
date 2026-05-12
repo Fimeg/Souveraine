@@ -197,29 +197,107 @@ pub async fn build_system_prompt(
     }
 }
 
-/// Build Aster's system prompt from her own identity files.
-/// Falls back to the hardcoded default if files don't exist.
+/// Build the subconscious agent's system prompt from its own memfs.
+/// Reads identity, mandate, and ledger orientation from the subconscious
+/// agent's memory root. Falls back to empty (caller uses hardcoded
+/// default) if files don't exist.
 pub async fn build_aster_prompt(
-    primary_memory_root: &Path,
+    subconscious_memory_root: &Path,
 ) -> String {
     let mut sections: Vec<String> = Vec::new();
 
-    // Aster's files live in the primary's memfs under aster/
-    let identity = read_memory_file(primary_memory_root, "aster/identity.md").await;
+    let identity = read_memory_file(subconscious_memory_root, "system/persona.md").await;
     if !identity.is_empty() {
         sections.push(identity);
     }
 
-    let mandate = read_memory_file(primary_memory_root, "aster/mandate.md").await;
+    let mandate = read_memory_file(subconscious_memory_root, "system/subconscious.md").await;
     if !mandate.is_empty() {
         sections.push(mandate);
     }
 
+    let ledger_orientation = build_ledger_orientation(subconscious_memory_root).await;
+    if !ledger_orientation.is_empty() {
+        sections.push(ledger_orientation);
+    }
+
     if sections.is_empty() {
-        return String::new(); // caller falls back to hardcoded default
+        return String::new();
     }
 
     sections.join("\n\n---\n\n")
+}
+
+/// Build ledger orientation for the subconscious prompt.
+///
+/// Scans `ledger/` for .md files, counts entries, and injects the last
+/// few entries from each file so the subconscious has live context
+/// (OpenHarness pattern: recent journal → active context).
+async fn build_ledger_orientation(memory_root: &Path) -> String {
+    let ledger_dir = memory_root.join("ledger");
+    if !ledger_dir.exists() {
+        return String::new();
+    }
+
+    let mut files: Vec<(String, usize, Vec<String>)> = Vec::new();
+    if let Ok(mut entries) = tokio::fs::read_dir(&ledger_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("md") && p.is_file() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if let Ok(content) = tokio::fs::read_to_string(&p).await {
+                    let entries: Vec<String> = content
+                        .lines()
+                        .filter(|l| l.starts_with('[') && l.contains(']'))
+                        .map(|l| l.to_string())
+                        .collect();
+                    let count = entries.len();
+                    let recent: Vec<String> = entries.into_iter().rev().take(3).collect();
+                    files.push((name, count, recent));
+                } else {
+                    files.push((name, 0, Vec::new()));
+                }
+            }
+        }
+    }
+
+    if files.is_empty() {
+        return String::new();
+    }
+
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut listing = String::new();
+    for (name, count, recent) in &files {
+        if *count > 0 {
+            listing.push_str(&format!("  ledger/{} ({} entries)\n", name, count));
+            for line in recent.iter().rev() {
+                listing.push_str(&format!("    {}\n", line));
+            }
+        } else {
+            listing.push_str(&format!("  ledger/{}\n", name));
+        }
+    }
+
+    format!(
+        "## Ledgers\n\n\
+         Your persistent observation store. These files survive compaction and \
+         accumulate across sessions.\n\n\
+         ```\n{}\
+         ```\n\n\
+         **Workflow:** Before writing a new entry, `memory read` the relevant ledger \
+         to check if the same issue was already flagged. If new, `memory append` a \
+         timestamped line: `[YYYY-MM-DD HH:MM] observation`. To resolve, \
+         append: `[YYYY-MM-DD HH:MM] RESOLVED — note`.\n\n\
+         Route observations by type:\n\
+         - Unfulfilled promises → `ledger/commitments.md`\n\
+         - Unverified beliefs → `ledger/assumptions.md`\n\
+         - Recurring behaviors → `ledger/patterns.md`\n\
+         - Intention/action mismatch → `ledger/drift_log.md`\n\
+         - Tone or trust shifts → `ledger/relationships.md`\n\
+         - System errors or resource issues → `ledger/infrastructure.md`",
+        listing
+    )
 }
 
 #[cfg(test)]
@@ -273,20 +351,57 @@ mod tests {
     #[tokio::test]
     async fn aster_prompt_from_files() {
         let dir = tempdir().unwrap();
-        let mem = dir.path();
-        let aster = mem.join("aster");
-        std::fs::create_dir_all(&aster).unwrap();
+        let sub_mem = dir.path();
+        let sys = sub_mem.join("system");
+        std::fs::create_dir_all(&sys).unwrap();
         std::fs::write(
-            aster.join("identity.md"),
+            sys.join("persona.md"),
             "---\ndescription: WHO I AM\n---\n\n# I Am Aster\n",
         ).unwrap();
         std::fs::write(
-            aster.join("mandate.md"),
+            sys.join("subconscious.md"),
             "---\ndescription: mandate\n---\n\n# Aster's Mandate\n\nComplete what was left.\n",
         ).unwrap();
 
-        let prompt = build_aster_prompt(mem).await;
+        let prompt = build_aster_prompt(sub_mem).await;
         assert!(prompt.contains("I Am Aster"));
         assert!(prompt.contains("Complete what was left"));
+    }
+
+    #[tokio::test]
+    async fn aster_prompt_includes_ledger_orientation() {
+        let dir = tempdir().unwrap();
+        let sub_mem = dir.path();
+
+        let sys = sub_mem.join("system");
+        std::fs::create_dir_all(&sys).unwrap();
+        std::fs::write(
+            sys.join("persona.md"),
+            "---\ndescription: test\n---\n\n# I Am Aster\n",
+        ).unwrap();
+
+        let ledger_dir = sub_mem.join("ledger");
+        std::fs::create_dir_all(&ledger_dir).unwrap();
+        std::fs::write(
+            ledger_dir.join("commitments.md"),
+            "---\ndescription: test\n---\n\n# Commitments\n\n[2026-05-12 10:00] Save the config\n[2026-05-12 10:30] RESOLVED — config saved\n",
+        ).unwrap();
+        std::fs::write(
+            ledger_dir.join("patterns.md"),
+            "---\ndescription: test\n---\n\n# Patterns\n\n",
+        ).unwrap();
+
+        let prompt = build_aster_prompt(sub_mem).await;
+        assert!(prompt.contains("## Ledgers"), "should have ledger section");
+        assert!(prompt.contains("commitments.md (2 entries)"), "should count entries");
+        assert!(prompt.contains("Save the config"), "should show recent entries");
+        assert!(prompt.contains("patterns.md"), "should list empty ledger too");
+    }
+
+    #[tokio::test]
+    async fn ledger_orientation_empty_without_dir() {
+        let dir = tempdir().unwrap();
+        let orientation = build_ledger_orientation(dir.path()).await;
+        assert!(orientation.is_empty());
     }
 }

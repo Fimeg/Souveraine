@@ -8,7 +8,10 @@
 pub mod chain;
 pub mod compact;
 pub mod config;
+pub mod credentials;
 pub mod conversation;
+pub mod identity;
+pub mod nervous;
 pub mod memory;
 pub mod prompt;
 pub mod reflection;

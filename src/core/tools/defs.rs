@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::core::compact::CompactionEngine;
+use crate::core::nervous::EventBus;
 
 /// What the agent receives when she acts through a sensor.
 ///
@@ -49,6 +50,8 @@ pub struct ToolContext {
     pub subagent_depth: u32,
     /// Host-side mechanism for context compaction.
     pub compaction_engine: Option<Arc<dyn CompactionEngine>>,
+    /// The nervous system bus — sensors with nervous_system: true fire events here.
+    pub event_bus: Option<EventBus>,
 }
 
 impl Clone for ToolContext {
@@ -61,6 +64,7 @@ impl Clone for ToolContext {
             subagent_runner: self.subagent_runner.clone(),
             subagent_depth: self.subagent_depth,
             compaction_engine: self.compaction_engine.clone(),
+            event_bus: self.event_bus.clone(),
         }
     }
 }
@@ -75,6 +79,7 @@ impl std::fmt::Debug for ToolContext {
             .field("subagent_runner", &self.subagent_runner.as_ref().map(|_| "Some(...)"))
             .field("subagent_depth", &self.subagent_depth)
             .field("compaction_engine", &self.compaction_engine.as_ref().map(|_| "Some(...)"))
+            .field("event_bus", &self.event_bus.as_ref().map(|_| "Some(...)"))
             .finish()
     }
 }
@@ -89,6 +94,7 @@ impl ToolContext {
             subagent_runner: None,
             subagent_depth: 0,
             compaction_engine: None,
+            event_bus: None,
         }
     }
 
@@ -108,6 +114,14 @@ impl ToolContext {
             subagent_runner,
             subagent_depth: 0,
             compaction_engine: None,
+            event_bus: None,
+        }
+    }
+
+    /// Fire a SensorEvent onto the nervous system bus (if wired).
+    pub fn fire_event(&self, event: crate::core::nervous::SensorEvent) {
+        if let Some(bus) = &self.event_bus {
+            bus.send(event);
         }
     }
 

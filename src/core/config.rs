@@ -50,6 +50,18 @@ pub struct ConsciousnessConfig {
     /// Server bind/port + client connection URL
     #[serde(default)]
     pub server: ServerConfig,
+
+    /// Schedule system (cron sensor)
+    #[serde(default)]
+    pub schedules: SchedulesConfig,
+
+    /// Event persistence (firehose log)
+    #[serde(default)]
+    pub events: EventsConfig,
+
+    /// Federation (cross-instance sync)
+    #[serde(default)]
+    pub federation: FederationConfig,
 }
 
 // ── Server ──
@@ -494,6 +506,71 @@ impl Default for ConsciousnessConfig {
             websocket: WebSocketConfig::default(),
             sensorium: SensoriumConfig::default(),
             server: ServerConfig::default(),
+            schedules: SchedulesConfig::default(),
+            events: EventsConfig::default(),
+            federation: FederationConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchedulesConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub schedules_dir: Option<PathBuf>,
+}
+
+impl Default for SchedulesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            schedules_dir: None,
+        }
+    }
+}
+
+// ── Events / Firehose ──
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventsConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub events_dir: Option<PathBuf>,
+    #[serde(default = "default_retain_days")]
+    pub retain_days: i64,
+}
+
+fn default_retain_days() -> i64 {
+    30
+}
+
+impl Default for EventsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            events_dir: None,
+            retain_days: 30,
+        }
+    }
+}
+
+// ── Federation ──
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FederationConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub instance_label: Option<String>,
+}
+
+impl Default for FederationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            instance_label: None,
         }
     }
 }
@@ -543,7 +620,7 @@ fn default_server_bind() -> String { "127.0.0.1".to_string() }
 fn default_server_port() -> u16 { 8484 }
 fn default_server_url() -> String { "http://127.0.0.1:8484".to_string() }
 fn default_bifrost_key() -> String {
-    std::env::var("BIFROST_KEY").unwrap_or_else(|_| "sk-bf-ae0d5801-9936-4fa9-ac9e-e956ffce6cfa".to_string())
+    crate::core::credentials::get_bifrost_key()
 }
 
 fn default_bifrost_virtual_key() -> String {

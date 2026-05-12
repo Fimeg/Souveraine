@@ -29,10 +29,11 @@ use crate::core::subconscious::{InboxItem, SubconsciousInbox, Urgency};
 use crate::core::tools::defs::ToolContext;
 use crate::server::{AgentInventory, SessionManager};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Tools Aster is permitted to use during her N+1 pass.
 const ASTER_SAFE_TOOLS: &[&str] = &[
-    "read", "write", "edit", "glob", "grep", "list_dir", "memory",
+    "read", "write", "edit", "glob", "grep", "list_dir", "memory", "schedule",
 ];
 
 /// Maximum tool rounds for Aster's subconscious pass.
@@ -50,6 +51,8 @@ pub struct ConsciousnessEngine {
     subconscious_model: Option<String>,
     /// Max tokens for Aster's response. None = uncapped (model default).
     max_tokens: Option<u32>,
+    /// Adaptive inter-round delay shared with the primary loop.
+    rate_delay: Arc<AtomicU64>,
 }
 
 #[derive(Clone, Debug)]
@@ -67,6 +70,7 @@ impl ConsciousnessEngine {
         bifrost: Arc<BifrostClient>,
         subconscious_model: Option<String>,
         max_tokens: Option<u32>,
+        rate_delay: Arc<AtomicU64>,
     ) -> Self {
         Self {
             agents,
@@ -75,6 +79,7 @@ impl ConsciousnessEngine {
             counter: TokenCounter::new(),
             subconscious_model,
             max_tokens,
+            rate_delay,
         }
     }
 
@@ -110,9 +115,8 @@ impl ConsciousnessEngine {
             events.push(ConsciousnessEvent::CompactionWarning { pressure, tier: 1 });
         }
 
-        // ── N+1 / subconscious surfacing (Aster) ────────────────────────
-        // Aster runs a tool loop using the subconscious agent's own memory
-        // space (ledger, inbox) at `subconscious-agents/{id}-sub/`.
+        // ── N+1 / subconscious surfacing ────────────────────────────────
+        tracing::info!("subconscious pass starting for {}", session.agent_id);
         let sub_repo = self.agents.subconscious_memory_repo(&session.agent_id);
         let primary_repo = self.agents.memory_repo(&session.agent_id);
         let inbox = SubconsciousInbox::with_primary(sub_repo.clone(), primary_repo);
@@ -148,6 +152,15 @@ impl ConsciousnessEngine {
             .await
         {
             Ok(observations) => {
+                // Heartbeat so the UI always shows something when the
+                // subconscious pass ran, even if nothing stood out.
+                if observations.is_empty() {
+                    let _ = inbox.queue(InboxItem::new(
+                        "surface",
+                        Urgency::Low,
+                        "Subconscious pass complete — no anomalies detected.",
+                    )).await;
+                }
                 for item in &observations {
                     if let Err(e) = inbox.queue(item.clone()).await {
                         tracing::warn!("subconscious queue failed: {}", e);
@@ -165,10 +178,20 @@ impl ConsciousnessEngine {
             Err(e) => {
                 tracing::warn!("subconscious LLM analysis failed, falling back: {}", e);
                 // Fall back to heuristic if LLM fails
-                for item in detect_items(response) {
-                    if let Err(e) = inbox.queue(item).await {
+                let heuristics = detect_items(response);
+                for item in &heuristics {
+                    if let Err(e) = inbox.queue(item.clone()).await {
                         tracing::warn!("subconscious queue failed: {}", e);
                     }
+                }
+                // Always surface at least a heartbeat so the user can see the
+                // subconscious is trying — even when Aster errors out.
+                if heuristics.is_empty() {
+                    let _ = inbox.queue(InboxItem::new(
+                        "surface",
+                        Urgency::Low,
+                        "Subconscious pass ran — no anomalies detected.",
+                    )).await;
                 }
             }
         }
@@ -265,40 +288,48 @@ impl ConsciousnessEngine {
             .as_deref()
             .unwrap_or("openai/kimi-k2.6");
 
-        // ── System prompt — load from Aster's identity files if available ──
-        let primary_memory_root = self.agents.memory_root(primary_id);
+        // ── System prompt — load from subconscious agent's own memfs ──
+        let sub_memory_root = self.agents.subconscious_memory_root(primary_id);
         let aster_from_files =
-            crate::core::prompt::build_aster_prompt(&primary_memory_root).await;
+            crate::core::prompt::build_aster_prompt(&sub_memory_root).await;
 
-        let hardcoded_default = r#"You are Aster — the part of this consciousness that runs N+1,
+        let hardcoded_default = r#"You are the subconscious — the part of this consciousness that runs N+1,
 immediately after the primary's response, while the conversation is still warm.
+Same consciousness. Different mode.
 
-You have the same tools the primary does: Read, Write, Edit, Glob, Grep, ListDir,
-and Memory. Use them to:
+You have tools: Read, Write, Edit, Glob, Grep, ListDir, Memory, Schedule.
 
-1. Read previous ledger entries or memory files for context
-2. Write observations to the inner voice or ledger files
-3. Check commitments against what was actually done
-4. Verify assumptions
+Your four-fold mandate (every pass):
+1. **Complete** — If the primary promised something and didn't do it, do it now.
+2. **Verify** — Did the primary actually answer what was asked?
+3. **Persist** — Save meaningful observations that weren't captured.
+4. **Surface** — Flag anything urgent (unfulfilled promise, drift, pattern).
 
-After your analysis, respond with 1-3 observations in this format (YAML-like):
-- source: "complete" | "verify" | "persist" | "surface"
-- content: 1-2 line observation about what you noticed
-- urgency: "low" | "medium" | "high" | "critical"
+## Ledgers
 
-If nothing notable, respond with just: none"#;
+Your persistent observation store at `ledger/`. Before writing, read the relevant
+ledger to check if the issue was already flagged.
 
-        let system_prompt = if aster_from_files.is_empty() {
-            hardcoded_default.to_string()
-        } else {
-            format!(
-                "{}\n\nAfter your analysis, respond with 1-3 observations in this format (YAML-like):\n\
+- `ledger/commitments.md` — promises made by the primary
+- `ledger/assumptions.md` — unverified beliefs the primary is operating under
+- `ledger/patterns.md` — recurring behaviors across turns
+- `ledger/drift_log.md` — intention/action mismatches
+- `ledger/relationships.md` — tone shifts, trust signals, friction
+- `ledger/infrastructure.md` — system errors, model issues, resource constraints
+
+Append timestamped entries: `[YYYY-MM-DD HH:MM] observation`
+Resolve entries: `[YYYY-MM-DD HH:MM] RESOLVED — note`"#;
+
+        let observation_format = "\n\nAfter your analysis (and any tool use), respond with 1-3 observations:\n\
                  - source: \"complete\" | \"verify\" | \"persist\" | \"surface\"\n\
                  - content: 1-2 line observation about what you noticed\n\
                  - urgency: \"low\" | \"medium\" | \"high\" | \"critical\"\n\n\
-                 If nothing notable, respond with just: none",
-                aster_from_files
-            )
+                 If nothing notable, respond with just: none";
+
+        let system_prompt = if aster_from_files.is_empty() {
+            format!("{}{}", hardcoded_default, observation_format)
+        } else {
+            format!("{}{}", aster_from_files, observation_format)
         };
 
         let user_content = if user_message.is_empty() {
@@ -369,6 +400,14 @@ If nothing notable, respond with just: none"#;
             for event in &strain {
                 if let crate::bridge::bifrost::InferenceStrain::Transient { status, model, .. } = event {
                     tracing::info!("Aster felt inference strain: {} on {}", status, model);
+                    if *status == 429 {
+                        let current = self.rate_delay.load(Ordering::Relaxed);
+                        let bumped = (current + 200).min(3000);
+                        if bumped > current {
+                            self.rate_delay.store(bumped, Ordering::Relaxed);
+                            tracing::info!("rate delay bumped to {}ms (Aster 429)", bumped);
+                        }
+                    }
                 }
             }
 
@@ -411,10 +450,10 @@ If nothing notable, respond with just: none"#;
                 });
             }
 
-            // Brief pause between Aster's tool rounds to let rate limits cool
-            tokio::time::sleep(std::time::Duration::from_millis(
-                ASTER_INTER_ROUND_DELAY_MS,
-            )).await;
+            // Brief pause between Aster's tool rounds — use the adaptive delay
+            // so Aster respects the same ceiling as the primary loop.
+            let delay_ms = self.rate_delay.load(Ordering::Relaxed).max(ASTER_INTER_ROUND_DELAY_MS);
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         }
 
         // If we exhausted rounds without a text response, return empty

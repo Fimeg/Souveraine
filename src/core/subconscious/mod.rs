@@ -214,6 +214,10 @@ impl SubconsciousInbox {
         let raw = tokio::fs::read_to_string(self.repo.root().join(path))
             .await
             .with_context(|| format!("reading subconscious box: {}", path))?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || !trimmed.starts_with("---") {
+            return Ok(Vec::new());
+        }
         let parsed = parse_memory_file(&raw)
             .with_context(|| format!("parsing subconscious box: {}", path))?;
         let body = parsed.body.trim();

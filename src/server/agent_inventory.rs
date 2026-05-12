@@ -193,7 +193,6 @@ impl AgentInventory {
         tokio::fs::create_dir_all(agent_dir.join("memory.git")).await?;
         tokio::fs::create_dir_all(agent_dir.join("memory.git").join("system")).await?;
         tokio::fs::create_dir_all(agent_dir.join("memory.git").join("ledger")).await?;
-        tokio::fs::create_dir_all(agent_dir.join("memory.git").join("ledger/infrastructure")).await?;
         tokio::fs::create_dir_all(agent_dir.join("memory.git").join("inbox")).await?;
 
         let repo = git2::Repository::init(agent_dir.join("memory.git"))?;

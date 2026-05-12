@@ -60,6 +60,10 @@ pub enum BackendEvent {
         status: u16,
         model: String,
     },
+    /// A scheduled event is being processed.
+    ScheduleActive { name: String },
+    /// A scheduled event completed.
+    ScheduleComplete { name: String, silent: bool },
     /// Stream ended cleanly.
     Done,
 }

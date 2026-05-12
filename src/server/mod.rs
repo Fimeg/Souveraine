@@ -4,6 +4,7 @@ use crate::core::config::ConsciousnessConfig;
 use crate::server::gitea_memory::GiteaMemory;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
 
 pub mod agent_inventory;
@@ -34,6 +35,9 @@ pub struct SouveraineServer {
     pub data_dir: PathBuf,
     pub memory: Option<Arc<ServerMemory>>,
     pub app_config: Arc<RwLock<ConsciousnessConfig>>,
+    /// Adaptive inter-round delay — starts at 500ms, bumps +200ms on 429.
+    /// Shared across primary loop and Aster so both respect the same ceiling.
+    pub rate_delay: Arc<AtomicU64>,
 }
 
 pub struct ServerConfig {
@@ -82,12 +86,16 @@ impl SouveraineServer {
             primary,
         ).with_fallbacks(fallbacks));
 
+        let rate_delay = Arc::new(AtomicU64::new(1000));
+        tracing::info!("rate delay initialized at 1000ms");
+
         let consciousness = Arc::new(ConsciousnessEngine::new(
             agents.clone(),
             sessions.clone(),
             bifrost.clone(),
             config.subconscious.model.clone(),
             config.subconscious.max_tokens,
+            rate_delay.clone(),
         ));
 
         // Build compaction engine with closure-based session access
@@ -161,6 +169,7 @@ impl SouveraineServer {
             data_dir,
             memory,
             app_config: Arc::new(RwLock::new(config)),
+            rate_delay,
         })
     }
 

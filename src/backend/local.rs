@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -20,24 +21,23 @@ use crate::bridge::bifrost::{ChatCompletionRequest, Message as BifrostMessage};
 use crate::bridge::model_router::TokenCounter;
 use crate::core::compact::CompactionEngine;
 use crate::core::config::ConsciousnessConfig;
+use crate::core::identity::SeedId;
+use crate::core::nervous::EventBus;
 use crate::core::session::{ContentBlock, ConversationMessage, MessageRole};
 use crate::core::tools::defs::{SubagentParams, SubagentRunner, ToolContext};
 use crate::server::{ConsciousnessEvent, SouveraineServer};
 
 use super::{AgentInfo, Backend, BackendEvent, ConversationInfo};
 
-/// Scale max output tokens proportionally to remaining context room.
-/// Below 80%: no cap. Above 80%: linear taper from the model's configured
-/// output_limit to a minimum floor at saturation. The agent feels the throat
-/// tighten progressively rather than hitting a cliff.
+/// Below 95%: no cap. At 95%+: scale max_tokens so context + output
+/// stays under the model's limit. The agent feels the room shrink.
 fn pressure_to_max_tokens(pressure: f32, output_limit: u32) -> Option<u32> {
-    if pressure <= 0.80 {
+    if pressure <= 0.95 {
         return None;
     }
-    let remaining = (1.0 - pressure) / 0.20; // 1.0 at 80%, 0.0 at 100%
+    let remaining = (1.0 - pressure) / 0.05;
     let ratio = remaining.max(0.0).min(1.0);
-    let budget = (output_limit as f32 * ratio) as u32;
-    Some(budget.max(512))
+    Some((output_limit as f32 * ratio) as u32)
 }
 
 /// Mirror of `ConsciousnessEngine::calculate_pressure` for the in-loop
@@ -49,6 +49,19 @@ fn bifrost_pressure(counter: &TokenCounter, messages: &[BifrostMessage]) -> f32 
     let tokens: usize = messages.iter().map(|m| counter.count(&m.content)).sum();
     let limit = 128_000;
     (tokens as f32 / limit as f32).min(1.0)
+}
+
+/// Helper: bump adaptive delay when we hit a 429. No decay — once bumped,
+/// the delay stays at that level until the app restarts.
+fn bump_on_strain(delay: &AtomicU64, status: u16) {
+    if status == 429 {
+        let current = delay.load(Ordering::Relaxed);
+        let bumped = (current + 200).min(3000);
+        if bumped > current {
+            delay.store(bumped, Ordering::Relaxed);
+            tracing::info!("rate delay bumped to {}ms (429)", bumped);
+        }
+    }
 }
 
 // ── LocalSubagentRunner ──────────────────────────────────────────
@@ -273,18 +286,66 @@ impl SubagentRunner for LocalSubagentRunner {
 #[derive(Clone)]
 pub struct LocalBackend {
     server: Arc<SouveraineServer>,
+    event_bus: EventBus,
+    seed_id: Arc<SeedId>,
 }
 
 impl LocalBackend {
     pub async fn new(config: ConsciousnessConfig) -> Result<Self> {
-        let server = SouveraineServer::new(config)
+        let server = SouveraineServer::new(config.clone())
             .await
             .context("LocalBackend: SouveraineServer init")?;
-        Ok(Self { server: Arc::new(server) })
+        let event_bus = EventBus::default();
+
+        let base = config
+            .memory
+            .base_path
+            .clone()
+            .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".souveraine"));
+
+        // Load or generate the seed identity (trust root)
+        let seed_dir = SeedId::default_dir(&base);
+        let seed_id = Arc::new(
+            SeedId::load_or_generate(&seed_dir)
+                .context("SeedId init")?,
+        );
+        tracing::info!(
+            pubkey = %seed_id.public_key_hex(),
+            "seed identity loaded"
+        );
+
+        // Spawn the persistent event log (firehose to disk)
+        let events_dir = base.join("events");
+        let mut event_log =
+            crate::core::nervous::event_log::EventLog::new(events_dir, event_bus.subscribe());
+        tokio::spawn(async move { event_log.run().await });
+
+        Ok(Self {
+            server: Arc::new(server),
+            event_bus,
+            seed_id,
+        })
     }
 
     pub fn from_server(server: Arc<SouveraineServer>) -> Self {
-        Self { server }
+        let base = dirs::home_dir().unwrap_or_default().join(".souveraine");
+        let seed_id = Arc::new(
+            SeedId::load_or_generate(&SeedId::default_dir(&base))
+                .unwrap_or_else(|_| SeedId::generate()),
+        );
+        Self {
+            event_bus: EventBus::default(),
+            server,
+            seed_id,
+        }
+    }
+
+    pub fn event_bus(&self) -> &EventBus {
+        &self.event_bus
+    }
+
+    pub fn seed_id(&self) -> &SeedId {
+        &self.seed_id
     }
 
     /// Underlying agent inventory — used by the TUI dashboard to pull a
@@ -458,9 +519,10 @@ impl Backend for LocalBackend {
         let (tx, rx) = mpsc::channel::<Result<BackendEvent>>(64);
         let server = self.server.clone();
         let conv_id = conversation_id.to_string();
+        let event_bus = self.event_bus.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = run_turn(server, conv_id, &tx).await {
+            if let Err(e) = run_turn(server, conv_id, &tx, event_bus).await {
                 let _ = tx.send(Err(e)).await;
             }
             let _ = tx.send(Ok(BackendEvent::Done)).await;
@@ -476,6 +538,7 @@ async fn run_turn(
     server: Arc<SouveraineServer>,
     conversation_id: String,
     tx: &mpsc::Sender<Result<BackendEvent>>,
+    event_bus: EventBus,
 ) -> Result<()> {
     // Snapshot history for the Bifrost call, then drop the dashmap ref before
     // any await — `Ref` is not Send across awaits.
@@ -537,9 +600,9 @@ async fn run_turn(
         env,
         subagent_runner,
     );
-    // Inject compaction engine from server (not part of for_agent API).
     let tool_ctx = ToolContext {
         compaction_engine: Some(server.compaction_engine.clone() as Arc<dyn CompactionEngine>),
+        event_bus: Some(event_bus),
         ..tool_ctx
     };
 
@@ -590,7 +653,13 @@ async fn run_turn(
                     status: *status,
                     model: model.clone(),
                 })).await;
+                bump_on_strain(&server.rate_delay, *status);
             }
+        }
+
+        // Emit reasoning trace if present
+        if let Some(reasoning) = &response.reasoning {
+            let _ = tx.send(Ok(BackendEvent::Reasoning(reasoning.clone()))).await;
         }
 
         if response.tool_calls.is_empty() || tool_round >= max_rounds {
@@ -667,9 +736,16 @@ async fn run_turn(
             });
         }
 
-        // Brief pause between tool rounds to let rate limits cool
-        if inter_round_delay > Duration::ZERO {
-            tokio::time::sleep(inter_round_delay).await;
+        // Brief pause between tool rounds to let rate limits cool.
+        // Use the higher of the configured delay and the adaptive delay.
+        let adaptive = Duration::from_millis(server.rate_delay.load(Ordering::Relaxed));
+        let effective = if inter_round_delay > adaptive {
+            inter_round_delay
+        } else {
+            adaptive
+        };
+        if effective > Duration::ZERO {
+            tokio::time::sleep(effective).await;
         }
 
         // Continue loop — model will see tool results and respond
@@ -680,6 +756,10 @@ async fn run_turn(
         &conversation_id,
         ConversationMessage::assistant_text(&final_content),
     )?;
+
+    // Breather between Ani finishing and Aster firing — unconditional,
+    // so the upstream always gets a gap before the N+1 pass starts.
+    tokio::time::sleep(Duration::from_millis(2000)).await;
 
     let events = {
         let session = server

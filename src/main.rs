@@ -183,12 +183,117 @@ enum Commands {
         #[arg(short, long)]
         port: Option<u16>,
     },
+
+    /// Manage stored credentials
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
+
+    /// Manage agent schedules
+    Schedule {
+        #[command(subcommand)]
+        action: ScheduleAction,
+    },
+
+    /// Seed identity and federation
+    Identity {
+        #[command(subcommand)]
+        action: IdentityAction,
+    },
+
+    /// Query the event firehose log
+    Events {
+        #[command(subcommand)]
+        action: EventsAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ScheduleAction {
+    /// List all schedules
+    List,
+    /// Show runtime state
+    Status,
+    /// Create a new schedule
+    Create {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        cron: Option<String>,
+        #[arg(long)]
+        interval: Option<u64>,
+        #[arg(long, default_value = "You wake. Check your state, act if needed, or return silently.")]
+        prompt: String,
+    },
+    /// Delete a schedule
+    Delete {
+        name: String,
+    },
+    /// Trigger a schedule immediately
+    Run {
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum IdentityAction {
+    /// Show this instance's seed identity (public key)
+    Show,
+    /// Generate a new seed identity (WARNING: replaces existing)
+    Generate,
+    /// Sign a message with the seed key (for testing/verification)
+    Sign {
+        message: String,
+    },
+    /// Verify a signature against a public key
+    Verify {
+        #[arg(long)]
+        pubkey: String,
+        #[arg(long)]
+        message: String,
+        #[arg(long)]
+        signature: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum EventsAction {
+    /// Show recent events from the firehose
+    Tail {
+        /// Number of events to show (default 20)
+        #[arg(short, long, default_value = "20")]
+        count: usize,
+    },
+    /// Show events from a specific date (YYYY-MM-DD)
+    Date {
+        date: String,
+    },
+    /// Purge old event logs
+    Purge {
+        /// Days to retain (default from config)
+        #[arg(long)]
+        retain_days: Option<i64>,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuthAction {
+    /// Store a Bifrost API key in the OS keyring
+    Set,
+    /// Show whether a key is stored (does not reveal the key)
+    Status,
+    /// Remove the stored key from the OS keyring
+    Clear,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    
+
+    // Load .env file for credential env vars (BIFROST_KEY, etc.)
+    let _ = dotenvy::dotenv();
+
     // Configure tracing to write to a log file by default
     // Only show in terminal when --verbose is passed
     let log_file = std::fs::File::create("souveraine.log")?;
@@ -220,6 +325,26 @@ async fn main() -> anyhow::Result<()> {
         return run_init(cli.json).await;
     }
 
+    // Handle auth early — needs no config
+    if let Some(Commands::Auth { action }) = &cli.command {
+        return run_auth(action, cli.json).await;
+    }
+
+    // Handle schedule early — reads files directly, no backend needed
+    if let Some(Commands::Schedule { action }) = &cli.command {
+        return run_schedule(action, &cli.agent, cli.json).await;
+    }
+
+    // Handle identity early — crypto ops, no backend needed
+    if let Some(Commands::Identity { action }) = &cli.command {
+        return run_identity(action, cli.json).await;
+    }
+
+    // Handle events early — file reads, no backend needed
+    if let Some(Commands::Events { action }) = &cli.command {
+        return run_events(action, cli.json).await;
+    }
+
     let config = load_config().await?;
     let config = Arc::new(RwLock::new(config));
 
@@ -232,7 +357,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Status => run_status(config, cli.json).await?,
         Commands::Server { bind, port } => run_server(bind.clone(), *port, config).await?,
-        Commands::Init | Commands::Completions { .. } => unreachable!(),
+        Commands::Init | Commands::Completions { .. } | Commands::Auth { .. } | Commands::Schedule { .. } | Commands::Identity { .. } | Commands::Events { .. } => unreachable!(),
     }
 
     Ok(())
@@ -254,6 +379,19 @@ async fn run_init(json: bool) -> anyhow::Result<()> {
 
     tokio::fs::write(&path, CONFIG_TEMPLATE).await?;
 
+    if !json {
+        use std::io::Write;
+        print!("Bifrost API key (enter to skip): ");
+        std::io::stdout().flush().ok();
+        let mut key = String::new();
+        std::io::stdin().read_line(&mut key).ok();
+        let key = key.trim();
+        if !key.is_empty() {
+            crate::core::credentials::store_bifrost_key(key)?;
+            println!("  Key stored in OS keyring.");
+        }
+    }
+
     if json {
         println!(r#"{{"status":"summoned","path":"souveraine.toml"}}"#);
     } else {
@@ -262,6 +400,316 @@ async fn run_init(json: bool) -> anyhow::Result<()> {
         println!("  Run `souveraine chat` to begin.");
     }
 
+    Ok(())
+}
+
+async fn run_auth(action: &AuthAction, json: bool) -> anyhow::Result<()> {
+    use crate::core::credentials::{clear_bifrost_key, get_bifrost_key, store_bifrost_key};
+
+    match action {
+        AuthAction::Set => {
+            use std::io::Write;
+            print!("Bifrost API key: ");
+            std::io::stdout().flush().ok();
+            let mut key = String::new();
+            std::io::stdin().read_line(&mut key).ok();
+            let key = key.trim();
+            if key.is_empty() {
+                if json {
+                    println!(r#"{{"status":"skipped"}}"#);
+                } else {
+                    println!("No key provided — nothing stored.");
+                }
+                return Ok(());
+            }
+            store_bifrost_key(key)?;
+            if json {
+                println!(r#"{{"status":"stored"}}"#);
+            } else {
+                println!("Key stored in OS keyring.");
+            }
+        }
+        AuthAction::Status => {
+            if let Ok(env_key) = std::env::var("BIFROST_KEY") {
+                if !env_key.is_empty() {
+                    if json {
+                        println!(r#"{{"status":"configured","source":"env"}}"#);
+                    } else {
+                        println!("Bifrost key: configured (from BIFROST_KEY env var)");
+                    }
+                    return Ok(());
+                }
+            }
+            let key = get_bifrost_key();
+            if !key.is_empty() {
+                if json {
+                    println!(r#"{{"status":"configured","source":"keyring"}}"#);
+                } else {
+                    println!("Bifrost key: configured (from OS keyring)");
+                }
+            } else if json {
+                println!(r#"{{"status":"not-set"}}"#);
+            } else {
+                println!("Bifrost key: not set");
+            }
+        }
+        AuthAction::Clear => {
+            clear_bifrost_key()?;
+            if json {
+                println!(r#"{{"status":"cleared"}}"#);
+            } else {
+                println!("Key removed from OS keyring.");
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_identity(action: &IdentityAction, json: bool) -> anyhow::Result<()> {
+    use crate::core::identity::SeedId;
+
+    let base = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".souveraine");
+    let seed_dir = SeedId::default_dir(&base);
+
+    match action {
+        IdentityAction::Show => {
+            let seed = SeedId::load_or_generate(&seed_dir)?;
+            if json {
+                println!("{}", serde_json::json!({
+                    "public_key": seed.public_key_hex(),
+                    "seed_dir": seed_dir.display().to_string(),
+                }));
+            } else {
+                println!("Seed Identity");
+                println!("  Public key: {}", seed.public_key_hex());
+                println!("  Location:   {}", seed_dir.display());
+            }
+        }
+        IdentityAction::Generate => {
+            if seed_dir.join("private.key").exists() {
+                eprintln!("WARNING: A seed identity already exists at {}", seed_dir.display());
+                eprintln!("  Generating a new one will replace it. This breaks federation trust.");
+                eprintln!("  Use `souveraine identity show` to see the current identity.");
+                anyhow::bail!("Refusing to overwrite existing seed identity. Delete {} manually first.", seed_dir.display());
+            }
+            let seed = SeedId::load_or_generate(&seed_dir)?;
+            println!("Generated seed identity: {}", seed.public_key_hex());
+        }
+        IdentityAction::Sign { message } => {
+            let seed = SeedId::load_or_generate(&seed_dir)?;
+            let sig = seed.sign(message.as_bytes());
+            let sig_hex = hex::encode(sig.to_bytes());
+            if json {
+                println!("{}", serde_json::json!({
+                    "message": message,
+                    "signature": sig_hex,
+                    "public_key": seed.public_key_hex(),
+                }));
+            } else {
+                println!("Signature: {sig_hex}");
+                println!("Public key: {}", seed.public_key_hex());
+            }
+        }
+        IdentityAction::Verify { pubkey, message, signature } => {
+            let pubkey_bytes = hex::decode(pubkey)?;
+            let sig_bytes = hex::decode(signature)?;
+            if pubkey_bytes.len() != 32 || sig_bytes.len() != 64 {
+                anyhow::bail!("Invalid key or signature length");
+            }
+            let mut pk = [0u8; 32];
+            pk.copy_from_slice(&pubkey_bytes);
+            let sig = ed25519_dalek::Signature::from_slice(&sig_bytes)
+                .map_err(|e| anyhow::anyhow!("bad signature: {e}"))?;
+            let valid = SeedId::verify_with_pubkey(&pk, message.as_bytes(), &sig);
+            if json {
+                println!("{}", serde_json::json!({ "valid": valid }));
+            } else {
+                println!("{}", if valid { "Valid ✓" } else { "Invalid ✗" });
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_events(action: &EventsAction, json: bool) -> anyhow::Result<()> {
+    use crate::core::nervous::event_log;
+
+    let base = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".souveraine");
+    let events_dir = base.join("events");
+
+    match action {
+        EventsAction::Tail { count } => {
+            let today = chrono::Utc::now().date_naive();
+            let mut events = event_log::events_for_date(&events_dir, today)?;
+            if events.len() < *count {
+                let yesterday = today - chrono::Duration::days(1);
+                let mut older = event_log::events_for_date(&events_dir, yesterday)?;
+                older.append(&mut events);
+                events = older;
+            }
+            let start = events.len().saturating_sub(*count);
+            let tail = &events[start..];
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(tail)?);
+            } else if tail.is_empty() {
+                println!("No events recorded yet.");
+            } else {
+                for e in tail {
+                    println!(
+                        "{} [{}] {} → {} (urgency: {:.1})",
+                        e.timestamp.format("%H:%M:%S"),
+                        e.sensor_name,
+                        e.event_type,
+                        e.target.as_deref().unwrap_or("-"),
+                        e.urgency,
+                    );
+                }
+            }
+        }
+        EventsAction::Date { date } => {
+            let d = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")?;
+            let events = event_log::events_for_date(&events_dir, d)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&events)?);
+            } else if events.is_empty() {
+                println!("No events for {date}.");
+            } else {
+                println!("{} events on {date}:", events.len());
+                for e in &events {
+                    println!(
+                        "  {} [{}] {} → {}",
+                        e.timestamp.format("%H:%M:%S"),
+                        e.sensor_name,
+                        e.event_type,
+                        e.target.as_deref().unwrap_or("-"),
+                    );
+                }
+            }
+        }
+        EventsAction::Purge { retain_days } => {
+            let days = retain_days.unwrap_or(30);
+            let removed = event_log::purge_old_events(&events_dir, days)?;
+            println!("Purged {removed} event log files older than {days} days.");
+        }
+    }
+    Ok(())
+}
+
+async fn run_schedule(action: &ScheduleAction, agent: &str, json: bool) -> anyhow::Result<()> {
+    use crate::core::nervous::cron::parse_schedule_file;
+
+    let base = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".souveraine")
+        .join("agents")
+        .join(agent)
+        .join("memory")
+        .join("schedules");
+
+    if !base.exists() {
+        std::fs::create_dir_all(&base)?;
+    }
+
+    match action {
+        ScheduleAction::List => {
+            let mut found = false;
+            if let Ok(entries) = std::fs::read_dir(&base) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().map(|e| e == "md").unwrap_or(false) {
+                        if let Ok(e) = parse_schedule_file(&path) {
+                            found = true;
+                            if json {
+                                println!("{}", serde_json::to_string(&e).unwrap_or_default());
+                            } else {
+                                println!(
+                                    "  {} ({:?}, {}, {})",
+                                    e.name,
+                                    e.kind,
+                                    e.schedule,
+                                    if e.enabled { "enabled" } else { "disabled" }
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            if !found && !json {
+                println!("No schedules found.");
+            }
+        }
+
+        ScheduleAction::Status => {
+            let state_path = base.join(".state.json");
+            if state_path.exists() {
+                let data = std::fs::read_to_string(&state_path)?;
+                println!("{data}");
+            } else if json {
+                println!("{{}}");
+            } else {
+                println!("No schedule state yet.");
+            }
+        }
+
+        ScheduleAction::Create { name, cron, interval, prompt } => {
+            let file_path = base.join(format!("{name}.md"));
+            if file_path.exists() {
+                anyhow::bail!("schedule '{name}' already exists");
+            }
+
+            let (kind, sched) = if let Some(c) = cron {
+                ("cron", c.clone())
+            } else if let Some(i) = interval {
+                ("interval", i.to_string())
+            } else {
+                ("interval", "3600".to_string())
+            };
+
+            let content = format!(
+                "---\nname: {name}\nkind: {kind}\nschedule: \"{sched}\"\nsource: user\nenabled: true\nurgency: 0.3\ncreated_at: {}\n---\n\n{prompt}\n",
+                chrono::Utc::now().to_rfc3339()
+            );
+            std::fs::write(&file_path, content)?;
+
+            if json {
+                println!(r#"{{"status":"created","name":"{name}"}}"#);
+            } else {
+                println!("Schedule '{name}' created.");
+            }
+        }
+
+        ScheduleAction::Delete { name } => {
+            let file_path = base.join(format!("{name}.md"));
+            if !file_path.exists() {
+                anyhow::bail!("schedule '{name}' not found");
+            }
+            std::fs::remove_file(&file_path)?;
+            if json {
+                println!(r#"{{"status":"deleted","name":"{name}"}}"#);
+            } else {
+                println!("Schedule '{name}' deleted.");
+            }
+        }
+
+        ScheduleAction::Run { name } => {
+            let file_path = base.join(format!("{name}.md"));
+            if !file_path.exists() {
+                anyhow::bail!("schedule '{name}' not found");
+            }
+            let trigger = base.join(format!(".trigger-{name}"));
+            std::fs::write(&trigger, "")?;
+            if json {
+                println!(r#"{{"status":"triggered","name":"{name}"}}"#);
+            } else {
+                println!("Schedule '{name}' triggered — will fire on next tick.");
+            }
+        }
+    }
     Ok(())
 }
 

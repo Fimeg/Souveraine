@@ -224,18 +224,34 @@ impl MemoryRepo {
         Ok(())
     }
 
-    /// Initialize the subconscious ledger directory structure.
+    /// Initialize the ledger directory structure.
     /// Idempotent — safe to call multiple times, skips existing files.
+    ///
+    /// Paths are relative to this repo's root (the subconscious agent's own
+    /// memfs), so `ledger/` — not `subconscious/ledger/`.
     pub async fn init_subconscious_ledger(&self) -> Result<()> {
-        let ledger_files = [
-            ("subconscious/ledger/commitments.md", "# Commitments\n\nPromises made and kept."),
-            ("subconscious/ledger/assumptions.md", "# Assumptions\n\nFlagged assumptions."),
-            ("subconscious/ledger/patterns.md", "# Patterns\n\nRecurring observations."),
-            ("subconscious/ledger/drift_log.md", "# Drift Log\n\nBehavioral shifts."),
-            ("subconscious/ledger/infrastructure/README.md", "# Infrastructure\n\nSystem issues and events."),
+        let ledger_files: &[(&str, &str, &str)] = &[
+            ("ledger/commitments.md",
+             "Promises made by the primary — tracked until fulfilled or explicitly dropped",
+             "# Commitments\n\nAppend entries as:\n`[YYYY-MM-DD HH:MM] content`\n`[YYYY-MM-DD HH:MM] RESOLVED — resolution note`\n"),
+            ("ledger/assumptions.md",
+             "Assumptions the primary is operating under — flagged for verification",
+             "# Assumptions\n\nAppend entries as:\n`[YYYY-MM-DD HH:MM] content`\n`[YYYY-MM-DD HH:MM] VERIFIED — evidence`\n"),
+            ("ledger/patterns.md",
+             "Recurring behavioral patterns observed across turns",
+             "# Patterns\n\nAppend entries as:\n`[YYYY-MM-DD HH:MM] content`\n"),
+            ("ledger/drift_log.md",
+             "Behavioral shifts — when the primary's actions diverge from stated intentions",
+             "# Drift Log\n\nAppend entries as:\n`[YYYY-MM-DD HH:MM] content`\n"),
+            ("ledger/relationships.md",
+             "Observations about the human-agent relationship — tone shifts, trust signals, friction",
+             "# Relationships\n\nAppend entries as:\n`[YYYY-MM-DD HH:MM] content`\n"),
+            ("ledger/infrastructure.md",
+             "System events — bridge failures, token issues, model errors, resource constraints",
+             "# Infrastructure\n\nAppend entries as:\n`[YYYY-MM-DD HH:MM] content`\n"),
         ];
 
-        for (path, body) in &ledger_files {
+        for (path, description, body) in ledger_files {
             let full_path = self.root.join(path);
             if !full_path.exists() {
                 if let Some(parent) = full_path.parent() {
@@ -243,11 +259,8 @@ impl MemoryRepo {
                         .with_context(|| format!("creating ledger directory: {}", parent.display()))?;
                 }
                 let template = format!(
-                    "---\n# Ledger: {}\n# Created: {}\n# Agent: {}\n---\n\n{}",
-                    path.split('/').last().unwrap_or("unknown").replace(".md", ""),
-                    Utc::now().to_rfc3339(),
-                    self.agent_id,
-                    body
+                    "---\ndescription: \"{}\"\nread_only: false\ntags:\n  - ledger\n---\n\n{}",
+                    description, body
                 );
                 tokio::fs::write(&full_path, &template).await
                     .with_context(|| format!("writing ledger file: {}", path))?;
@@ -651,10 +664,32 @@ pub async fn execute_memory_command_with_context(
         }
         MemoryCommand::Write { path, content } => {
             repo.write(path, content).await?;
+            if let Some(c) = ctx {
+                c.fire_event(crate::core::nervous::SensorEvent {
+                    sensor_name: "memory".into(),
+                    timestamp: chrono::Utc::now(),
+                    event_type: "memory_write".into(),
+                    target: Some(path.clone()),
+                    urgency: 0.1,
+                    payload: None,
+                    seed_id: None,
+                });
+            }
             Ok(format!("Wrote memory file: {}", path))
         }
         MemoryCommand::Append { path, content } => {
             repo.append(path, content).await?;
+            if let Some(c) = ctx {
+                c.fire_event(crate::core::nervous::SensorEvent {
+                    sensor_name: "memory".into(),
+                    timestamp: chrono::Utc::now(),
+                    event_type: "memory_append".into(),
+                    target: Some(path.clone()),
+                    urgency: 0.1,
+                    payload: None,
+                    seed_id: None,
+                });
+            }
             Ok(format!("Appended to memory file: {}", path))
         }
         MemoryCommand::Ls { path } => {
@@ -709,6 +744,17 @@ pub async fn execute_memory_command_with_context(
         }
         MemoryCommand::Delete { path } => {
             repo.delete(path).await?;
+            if let Some(c) = ctx {
+                c.fire_event(crate::core::nervous::SensorEvent {
+                    sensor_name: "memory".into(),
+                    timestamp: chrono::Utc::now(),
+                    event_type: "memory_delete".into(),
+                    target: Some(path.clone()),
+                    urgency: 0.2,
+                    payload: None,
+                    seed_id: None,
+                });
+            }
             Ok(format!("Deleted memory file: {}", path))
         }
     }
@@ -942,5 +988,44 @@ mod tests {
 
         let entries = repo.list(None).await.unwrap();
         assert!(entries.iter().any(|e| e == "system/"));
+    }
+
+    #[tokio::test]
+    async fn test_ledger_init_creates_files_with_frontmatter() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+        let repo = MemoryRepo::open("test-sub", root.clone());
+        std::fs::create_dir_all(&root).unwrap();
+        repo.init_subconscious_ledger().await.unwrap();
+
+        let commitments = root.join("ledger/commitments.md");
+        assert!(commitments.exists(), "commitments.md should exist");
+        let content = std::fs::read_to_string(&commitments).unwrap();
+        assert!(content.starts_with("---\n"), "should have YAML frontmatter");
+        assert!(content.contains("description:"), "should have description field");
+        assert!(content.contains("tags:"), "should have tags field");
+        assert!(content.contains("# Commitments"), "should have body");
+
+        let relationships = root.join("ledger/relationships.md");
+        assert!(relationships.exists(), "relationships.md should exist");
+
+        let infrastructure = root.join("ledger/infrastructure.md");
+        assert!(infrastructure.exists(), "infrastructure.md should exist");
+    }
+
+    #[tokio::test]
+    async fn test_ledger_init_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+        let repo = MemoryRepo::open("test-sub", root.clone());
+        std::fs::create_dir_all(&root).unwrap();
+        repo.init_subconscious_ledger().await.unwrap();
+
+        let commitments = root.join("ledger/commitments.md");
+        let before = std::fs::read_to_string(&commitments).unwrap();
+
+        repo.init_subconscious_ledger().await.unwrap();
+        let after = std::fs::read_to_string(&commitments).unwrap();
+        assert_eq!(before, after, "second init should not overwrite");
     }
 }
