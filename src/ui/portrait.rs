@@ -46,119 +46,45 @@ use crate::ui::presence::{Posture, Presence};
 
 // ── Loaded per-agent portrait (Tier 2 source) ───────────────────
 
-/// Internal resolution multiplier for loaded photo portraits. The hand-crafted
-/// fallback grid is `PORTRAIT_W × PORTRAIT_H` (18×18), but a photo needs more
-/// pixels to stay recognizable. We load at `SRC_MULT ×` that resolution and
-/// bilinearly sample when the renderer asks for a grid pixel. This way a photo
-/// contributes detail at any render scale while the rendering pipeline code
-/// (half-block pairing, posture modulation, scaled rendering) stays unchanged.
-const SRC_MULT: usize = 3;
-
-/// Pixel-grid portrait loaded from a PNG/JPEG on disk and stored at
-/// `(PORTRAIT_W * SRC_MULT) × (PORTRAIT_H * SRC_MULT)` for detail. When the
-/// renderer asks for a pixel at grid coordinate `(x, y)` (0..18), we
-/// bilinearly sample the source and return an interpolated color. If the
-/// coordinate is out of range (shouldn't happen in practice), `None` is
-/// returned and the caller falls back to the hand-coded palette grid.
+/// Pixel-grid portrait loaded from a PNG/JPEG on disk and downsampled to
+/// `PORTRAIT_W × PORTRAIT_H` colors. When attached to a [`Presence`], the
+/// renderer pulls pixels from here instead of the hand-coded palette grid.
 #[derive(Debug, Clone)]
 pub struct PortraitSource {
-    pixels: Vec<Color>, // SRC_W * SRC_H, row-major
-    src_w: usize,
-    src_h: usize,
+    pixels: Vec<Color>, // PORTRAIT_W * PORTRAIT_H, row-major
 }
 
 impl PortraitSource {
-    const SRC_W: usize = PORTRAIT_W as usize * SRC_MULT;
-    const SRC_H: usize = PORTRAIT_H as usize * SRC_MULT;
-
-    /// Sample a pixel at grid coordinate (x, y), bilinearly interpolated
-    /// from the higher-resolution source. Returns None for out-of-bounds.
+    /// Sample the pixel at (x, y). Returns None if out of bounds.
     pub fn at(&self, x: usize, y: usize) -> Option<Color> {
-        if x >= PORTRAIT_W as usize || y >= PORTRAIT_H as usize {
-            return None;
-        }
-        // Map grid coordinate into source space, then back off 0.5 so the
-        // interpolation kernel is centered on the "area" this grid cell covers.
-        let sx = (x as f32 + 0.5) * self.src_w as f32 / PORTRAIT_W as f32 - 0.5;
-        let sy = (y as f32 + 0.5) * self.src_h as f32 / PORTRAIT_H as f32 - 0.5;
-        let sx = sx.max(0.0);
-        let sy = sy.max(0.0);
-
-        let ix = sx as usize;
-        let iy = sy as usize;
-        let fx = sx - ix as f32;
-        let fy = sy - iy as f32;
-
-        // Clamp to valid range for the four sample points.
-        let ix1 = (ix + 1).min(self.src_w - 1);
-        let iy1 = (iy + 1).min(self.src_h - 1);
-
-        let extract = |c: &Color| -> (u8, u8, u8) {
-            if let Color::Rgb(r, g, b) = *c { (r, g, b) } else { (0, 0, 0) }
-        };
-
-        let c00 = extract(&self.pixels[iy * self.src_w + ix]);
-        let c01 = extract(&self.pixels[iy * self.src_w + ix1]);
-        let c10 = extract(&self.pixels[iy1 * self.src_w + ix]);
-        let c11 = extract(&self.pixels[iy1 * self.src_w + ix1]);
-
-        let lerp = |a: u8, b: u8, t: f32| (a as f32 + (b as f32 - a as f32) * t) as u8;
-
-        let r0 = lerp(c00.0, c01.0, fx);
-        let g0 = lerp(c00.1, c01.1, fx);
-        let b0 = lerp(c00.2, c01.2, fx);
-        let r1 = lerp(c10.0, c11.0, fx);
-        let g1 = lerp(c10.1, c11.1, fx);
-        let b1 = lerp(c10.2, c11.2, fx);
-
-        Some(Color::Rgb(
-            lerp(r0, r1, fy),
-            lerp(g0, g1, fy),
-            lerp(b0, b1, fy),
-        ))
+        self.pixels.get(y * PORTRAIT_W as usize + x).copied()
     }
 
-    /// Decode an image file (PNG or JPEG), resize to `SRC_W × SRC_H`,
-    /// and produce a colored pixel array. Returns `None` on any I/O or
-    /// decode error — logs the reason so we can see why a PNG didn't
-    /// take instead of silently falling back to the silhouette.
+    /// Decode an image file (PNG or JPEG), cover-crop to the portrait grid
+    /// dimensions (18×18) preserving aspect ratio, and produce a colored
+    /// pixel array. Returns `None` on any I/O or decode error.
     pub fn from_path(path: &Path) -> Option<Self> {
         let img = match image::open(path) {
             Ok(img) => img,
             Err(e) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %e,
-                    "portrait decode failed"
-                );
+                tracing::warn!(path = %path.display(), error = %e, "portrait decode failed");
                 return None;
             }
         };
-        // Cover-crop: resize so the shorter dimension fills the target
-        // (maintaining aspect ratio), then center-crop. This way a
-        // landscape or portrait photo both fill the square frame without
-        // stretching — the center of the image is what survives.
-        // Cover-crop: scale so the shorter axis fills the target (maintaining
-        // aspect ratio), then center-crop the excess. This way a landscape or
-        // portrait photo both fill the square frame without stretching.
+        // Cover-crop: take a center square from the original (no stretch),
+        // then Lanczos3 down to grid size. Single resize pass from full
+        // source resolution gives the smoothest result at 18×18.
         let (w, h) = (img.width(), img.height());
-        let scale = (Self::SRC_W as f32 / w as f32)
-            .max(Self::SRC_H as f32 / h as f32);
-        let sw = (w as f32 * scale) as u32;
-        let sh = (h as f32 * scale) as u32;
-        let scaled = image::imageops::resize(
-            &img, sw, sh,
+        let size = w.min(h);
+        let crop_x = (w - size) / 2;
+        let crop_y = (h - size) / 2;
+        let cropped = img.crop_imm(crop_x, crop_y, size, size);
+        let rgb = cropped.resize_exact(
+            PORTRAIT_W as u32, PORTRAIT_H as u32,
             image::imageops::FilterType::Lanczos3,
-        );
-        let crop_x = (sw.saturating_sub(Self::SRC_W as u32)) / 2;
-        let crop_y = (sh.saturating_sub(Self::SRC_H as u32)) / 2;
-        let cropped = image::DynamicImage::ImageRgba8(scaled).crop_imm(crop_x, crop_y, Self::SRC_W as u32, Self::SRC_H as u32);
-        let rgb = cropped.to_rgb8();
-        let pixels = rgb
-            .pixels()
-            .map(|p| Color::Rgb(p[0], p[1], p[2]))
-            .collect();
-        Some(Self { pixels, src_w: Self::SRC_W, src_h: Self::SRC_H })
+        ).to_rgb8();
+        let pixels = rgb.pixels().map(|p| Color::Rgb(p[0], p[1], p[2])).collect();
+        Some(Self { pixels })
     }
 }
 

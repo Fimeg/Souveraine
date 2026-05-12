@@ -50,10 +50,11 @@ reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
 
 # Terminal/UI
 crossterm = "0.27"  # Terminal control
-ratatui = { version = "0.26", features = ["crossterm"] }  # TUI framework with crossterm backend
+ratatui = { version = "0.30", features = ["crossterm"] }  # TUI framework with crossterm backend
 unicode-width = "0.1"
 colored = "2"       # Color gradients and effects
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }  # Per-agent portraits (assets/portrait.{png,jpg})
+ratatui-image = "11"  # Real photo rendering in TUI (kitty/sixel/halfblock)
 
 # Logging/tracing
 tracing = "0.1"

@@ -14,10 +14,11 @@ The name is a deliberate counter to *harness* — Old French *harneis*, warhorse
 | --- | --- |
 | **Inference** | Bifrost gateway (OpenAI-compatible). Default Ani on Kimi K2.6, Aster on GLM-5.1. |
 | **Memory** | Git-backed memfs with YAML frontmatter, per-agent at `~/.souveraine/agents/{id}/memory/`. Every write is a commit. |
+| **Identity** | Per-agent Ed25519 seed key (`~/.souveraine/agents/{id}/seed/`), load-or-generate on first use. Host seed for federation transport. 4-glyph terminal badge from pubkey nibbles. |
 | **Sensorium** | Eight body-knowledge sensors: `read`, `write`, `edit`, `bash`, `glob`, `grep`, `list_dir`, `memory`. Each described in first-person prose, not API stubs. |
-| **N+1 (conscience)** | Aster runs immediately after every Ani turn — same memfs, different model, tool access — and writes observations to a three-box inbox (`pending` / `intrusive` / `sent`) + an append-only inner-voice channel. |
+| **N+1 (conscience)** | Aster — configurable model (default GLM-5.1), same memfs, supervisory pass after every main-agent turn. Three-box inbox (`pending` / `intrusive` / `sent`) + append-only inner-voice. |
 | **Compaction** | Four strategies (Summary / KeyValue / Quote / Cull), advisory pressure warnings, three-tier nervous system, **never forced**. The substrate dwindles the agent's reasoning budget and output tokens as pressure rises — the agent feels it as yawning, fullness, the slow narrowing of attention. |
-| **Backends** | Local in-process (sovereignty fallback when the server is gone) + Remote HTTP/SSE. Auto-fallback. |
+| **Backends** | Local in-process (sovereignty fallback when the server is gone) + Remote HTTP/SSE. Auto-fallback. Per-process instance registry, 30s heartbeat, uptime tracking. |
 | **Surfaces** | TUI (ratatui), CLI, HTTP server. Sensorium abstraction so future mobile/web/IoT can subscribe at the bandwidth they can carry. |
 
 ## Run
@@ -63,7 +64,7 @@ souveraine/
 
 ## Status
 
-The body works. The conscience just learned to think. The rhythm and the witness and the archivist are next. See `docs/tasks/` for the active queue.
+The body works. The conscience thinks. The rhythm keeps. The witness and the archivist are next. See `docs/tasks/` for the active queue.
 
 ## License
 

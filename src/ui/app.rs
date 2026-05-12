@@ -33,6 +33,8 @@ use crate::ui::color_support::rgb;
 use crate::ui::component::{Component, Scene, SceneLayout, TuiEvent};
 use crate::backend::BackendEvent;
 
+use ratatui_image::{picker::Picker, protocol::Protocol, Image};
+
 #[cfg(feature = "figlet-rs")]
 use figlet_rs::FIGlet;
 
@@ -63,6 +65,15 @@ pub struct App {
     tick: u64,
     /// Splash bloom animation state.
     bloom: crate::ui::animation::bloom::BloomState,
+    /// Terminal image renderer (kitty/sixel/halfblock). Queried once after
+    /// entering alternate screen. None before initialization.
+    image_picker: Option<Picker>,
+    /// Pre-processed portrait for the current agent. Loaded alongside the
+    /// half-block PortraitSource; when set, Welcome / Presence / Dashboard
+    /// render the real photo instead of pixel art.
+    image_protocol: Option<Protocol>,
+    /// Per-agent cards for the AgentsManager screen.
+    agent_cards: Vec<AgentCard>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -101,7 +112,7 @@ pub struct AgentCard {
     /// Cap at 99 in display per UX spec — humans distrust 100% liveness.
     pub uptime_pct: u8,
     pub memory_count: usize,
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created: String,
 }
 
 #[derive(Debug, Clone)]
@@ -159,6 +170,9 @@ impl App {
             scene: Scene::new(SceneLayout::Single),
             tick: 0,
             bloom: crate::ui::animation::bloom::BloomState::new(),
+            image_picker: None,
+            image_protocol: None,
+            agent_cards: Vec::new(),
         };
 
         // CockpitPane listens for Aster's surfacing events as scrollable text.
@@ -288,6 +302,15 @@ impl App {
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
+        // Detect terminal image protocol (kitty/sixel/halfblock) after the
+        // alternate screen is active. Non-fatal: falls back to halfblocks.
+        if let Ok(picker) = Picker::from_query_stdio() {
+            tracing::info!(protocol = ?picker.protocol_type(), "image picker initialized");
+            self.image_picker = Some(picker);
+        } else {
+            tracing::info!("no image protocol detected — using halfblocks");
+        }
+
         let mut last_tick = Instant::now();
         let tick_rate = Duration::from_millis(100);
 
@@ -411,6 +434,14 @@ impl App {
                         // Gallery — the avatar IS the doorway to "who am I talking to."
                         self.open_gallery();
                     }
+                    KeyCode::Char('i') => {
+                        // Inspect — agent manager with per-agent cards.
+                        let cfg = self.config.read().await.clone();
+                        let agents = Self::fetch_agent_cards(cfg).await;
+                        self.agent_cards = agents;
+                        self.current_screen = Screen::AgentsManager;
+                        self.dispatch(TuiEvent::ScreenChanged(Screen::AgentsManager));
+                    }
                     _ => {}
                 }
             }
@@ -422,6 +453,12 @@ impl App {
             Screen::Gallery => self.handle_gallery_key(key),
             Screen::Chat => self.handle_chat_key(key).await,
             Screen::Cron => self.handle_schedules_key(key),
+            Screen::AgentsManager => match key.code {
+                KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('i') => {
+                    self.current_screen = Screen::Welcome;
+                }
+                _ => {}
+            },
             _ => {
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('m') => {
@@ -797,6 +834,10 @@ impl App {
             // No-op if the file is absent — Presence falls back to the
             // hand-crafted Annie grid.
             self.presence.load_portrait_from_memfs(repo.root());
+            // Also load a real-image protocol for terminals that support
+            // kitty/sixel. Non-fatal: the half-block portrait is always
+            // available as fallback.
+            self.load_image_protocol_from_memfs(repo.root());
         } else {
             self.agent_status.recent_activity = vec![
                 format!("[{}] connected via {}", short_now(), mode),
@@ -826,6 +867,34 @@ impl App {
             mode: mode_str,
             healthy: true,
         });
+    }
+
+    /// Load a terminal-image protocol for the current agent's portrait photo.
+    /// The half-block portrait still loads independently as fallback.
+    fn load_image_protocol_from_memfs(&mut self, memfs_root: &std::path::Path) {
+        let Some(picker) = self.image_picker.as_ref() else { return };
+        let candidates = ["portrait.png", "portrait.jpg", "portrait.jpeg"];
+        let path = candidates.iter()
+            .map(|s| memfs_root.join("assets").join(s))
+            .find(|p| p.exists());
+        let Some(path) = path else { return };
+        let dyn_img = match image::ImageReader::open(&path) {
+            Ok(reader) => match reader.decode() {
+                Ok(img) => img,
+                Err(e) => { tracing::warn!(path = %path.display(), error = %e, "image protocol decode failed"); return; }
+            },
+            Err(e) => { tracing::warn!(path = %path.display(), error = %e, "image protocol open failed"); return; }
+        };
+        let font_size = picker.font_size();
+        let w = dyn_img.width().div_ceil(font_size.width as u32) as u16;
+        let h = dyn_img.height().div_ceil(font_size.height as u32) as u16;
+        match picker.new_protocol(dyn_img, ratatui::layout::Size::new(w, h), ratatui_image::Resize::Fit(None)) {
+            Ok(proto) => {
+                tracing::info!(path = %path.display(), "image protocol loaded");
+                self.image_protocol = Some(proto);
+            }
+            Err(e) => tracing::warn!(path = %path.display(), error = %e, "image protocol creation failed"),
+        }
     }
 
     fn draw(&mut self, frame: &mut Frame) {
@@ -859,6 +928,7 @@ impl App {
             }
             Screen::Presence => self.draw_presence_mode(frame),
             Screen::Gallery => self.draw_gallery(frame),
+            Screen::AgentsManager => self.draw_agent_cards(frame),
             _ => self.draw_placeholder(frame),
         }
 
@@ -1088,6 +1158,13 @@ impl App {
                 &self.presence,
                 WELCOME_SCALE,
             );
+            // When a terminal-image protocol is loaded, overlay the real
+            // photo on the same area. The half-block portrait is always
+            // rendered first as background so terminals without kitty/sixel
+            // show the expected pixel-art silhouette.
+            if let Some(proto) = &self.image_protocol {
+                frame.render_widget(Image::new(proto), portrait_area);
+            }
 
             let name_area = Rect {
                 x: card_area.x + 1,
@@ -1165,7 +1242,7 @@ impl App {
             frame.render_widget(err_para, row);
         }
 
-        let footer = Paragraph::new("↑↓ Navigate • Enter • a Add • g Gallery • p Presence • q Quit")
+        let footer = Paragraph::new("↑↓ Navigate • Enter • a Add • g Gallery • i Inspect • p Presence • q Quit")
             .style(Style::default().fg(Color::DarkGray))
             .alignment(Alignment::Center);
         frame.render_widget(footer, chunks[4]);
@@ -1450,6 +1527,144 @@ impl App {
         // Quiet footer hint.
         let footer = Paragraph::new("press any key to return")
             .style(Style::default().fg(Color::Rgb(60, 60, 80)))
+            .alignment(Alignment::Center);
+        let footer_area = Rect {
+            x: area.x,
+            y: area.y + area.height.saturating_sub(2),
+            width: area.width,
+            height: 1,
+        };
+        frame.render_widget(footer, footer_area);
+    }
+
+    /// Build a card deck for every agent on the local backend. Called on
+    /// entry to the AgentsManager screen.
+    async fn refresh_agent_cards(&mut self) {
+        let cfg = self.config.read().await.clone();
+        self.agent_cards = Self::fetch_agent_cards(cfg).await;
+    }
+
+    /// Standalone fetch so it can be called without &mut self during init.
+    async fn fetch_agent_cards(cfg: ConsciousnessConfig) -> Vec<AgentCard> {
+        use crate::backend::Backend;
+        let Ok(local) = crate::backend::LocalBackend::new(cfg).await else { return vec![] };
+        let Ok(list) = local.list_agents().await else { return vec![] };
+        let inv = local.server_agents();
+        let mut cards = Vec::new();
+        for a in &list {
+            let glyph = inv.seed_id(&a.id)
+                .map(|s| s.glyph())
+                .unwrap_or_else(|_| "◇◆".to_string());
+            let pubkey_prefix = inv.seed_id(&a.id)
+                .map(|s| s.public_key_hex()[..16].to_string())
+                .unwrap_or_else(|_| "—".to_string());
+            let instance_count = inv.instance_count(&a.id).await.unwrap_or(0);
+            let lifetime_secs = inv.lifetime_active_seconds(&a.id).await.unwrap_or(0);
+            let uptime_pct = if lifetime_secs > 0 {
+                let days = ((instance_count.max(1)) as f64 * 30.0).max(1.0);
+                let pct = (lifetime_secs as f64 / (days * 86400.0)) * 100.0;
+                pct.min(99.0) as u8
+            } else { 0 };
+            let mem_count = local.server_agents().memory_repo(&a.id)
+                .status()
+                .map(|s| s.file_count)
+                .unwrap_or(0);
+            cards.push(AgentCard {
+                id: a.id.clone(),
+                name: a.name.clone(),
+                description: a.description.clone().unwrap_or_default(),
+                glyph,
+                pubkey_prefix,
+                instance_count,
+                uptime_pct,
+                memory_count: mem_count,
+                created: "Feb 2025 · TBD date from server".to_string(),
+            });
+        }
+        cards.sort_by(|a, b| a.name.cmp(&b.name));
+        cards
+    }
+
+    /// Render the agent manager — a scrollable card grid with all the per-agent
+    /// data that the simple Gallery omits: seed glyph, instance count, uptime,
+    /// memory count, description, creation date.
+    fn draw_agent_cards(&self, frame: &mut Frame) {
+        let area = frame.size();
+        let bg = Block::default().style(Style::default().bg(Color::Rgb(10, 10, 16)));
+        frame.render_widget(bg, area);
+
+        let header = Paragraph::new(Line::from(vec![
+            Span::styled("  Agent Manager  ", Style::default()
+                .fg(Color::Rgb(255, 200, 100))
+                .add_modifier(Modifier::BOLD)),
+            Span::styled(format!("{} agents", self.agent_cards.len()),
+                Style::default().fg(Color::DarkGray)),
+        ])).alignment(Alignment::Center);
+        let header_area = Rect { x: area.x, y: area.y + 1, width: area.width, height: 1 };
+        frame.render_widget(header, header_area);
+
+        if self.agent_cards.is_empty() {
+            let empty = Paragraph::new("\n\n(no agents found — run `souveraine init`)")
+                .style(Style::default().fg(Color::DarkGray))
+                .alignment(Alignment::Center);
+            frame.render_widget(empty, area);
+            return;
+        }
+
+        // 2-column card grid. Each card is a bordered paragraph.
+        let cols: u16 = 2;
+        let card_w = 48u16.min(area.width / cols - 3);
+        let card_h = 8;
+        let pad_x: u16 = 2;
+        let pad_y: u16 = 1;
+        let grid_x = area.x + (area.width - (cols * (card_w + pad_x) - pad_x)) / 2;
+        let grid_y = area.y + 3;
+
+        for (idx, card) in self.agent_cards.iter().enumerate() {
+            let col = (idx as u16) % cols;
+            let row = (idx as u16) / cols;
+            let cx = grid_x + col * (card_w + pad_x);
+            let cy = grid_y + row * (card_h + pad_y);
+            if cy + card_h + 1 >= area.y + area.height { break; }
+
+            let card_area = Rect { x: cx, y: cy, width: card_w, height: card_h };
+            let border = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Rgb(70, 90, 120)).add_modifier(Modifier::DIM));
+            frame.render_widget(border, card_area);
+
+            let inner = Rect { x: cx + 1, y: cy + 1, width: card_w.saturating_sub(2), height: card_h.saturating_sub(2) };
+            let content = vec![
+                Line::from(vec![
+                    Span::styled(&card.glyph, Style::default().fg(Color::Rgb(120, 200, 220))),
+                    Span::styled(" ", Style::default()),
+                    Span::styled(&card.name, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                ]),
+                Line::from(Span::styled(
+                    &card.description,
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled(format!("{}% uptime  ", card.uptime_pct), Style::default().fg(Color::Cyan)),
+                    Span::styled(if card.instance_count == 1 { "1 instance".to_string() } else { format!("{} instances", card.instance_count) }, Style::default().fg(Color::Cyan)),
+                    Span::styled(format!("  {} files", card.memory_count), Style::default().fg(Color::Green)),
+                ]),
+                Line::from(vec![
+                    Span::styled(format!("key: {}", card.pubkey_prefix),
+                        Style::default().fg(Color::Rgb(100, 100, 120))),
+                ]),
+                Line::from(vec![
+                    Span::styled(format!("created: {}", card.created),
+                        Style::default().fg(Color::Rgb(80, 80, 100))),
+                ]),
+            ];
+            frame.render_widget(Paragraph::new(content), inner);
+        }
+
+        let footer = Paragraph::new("q quit • Esc back")
+            .style(Style::default().fg(Color::DarkGray))
             .alignment(Alignment::Center);
         let footer_area = Rect {
             x: area.x,
