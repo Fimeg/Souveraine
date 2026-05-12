@@ -73,5 +73,54 @@ pub async fn init_database(db_path: &Path) -> anyhow::Result<SqlitePool> {
         .execute(&pool)
         .await?;
 
+    // Instance registry — one row per running souveraine process per agent.
+    // last_seen_at is heartbeated; rows stale > 5 min are pruned on startup.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS agent_instances (
+            agent_id     TEXT NOT NULL,
+            instance_id  TEXT NOT NULL,
+            pid          INTEGER NOT NULL,
+            hostname     TEXT NOT NULL,
+            started_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            last_seen_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (agent_id, instance_id)
+        );
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_instances_agent ON agent_instances(agent_id, last_seen_at DESC)")
+        .execute(&pool)
+        .await?;
+
+    // lifetime_active_seconds: cumulative time this agent has had at least
+    // one running instance. Incremented by the heartbeat tick. Drives the
+    // uptime % on the manager card (capped at 99 in the UI).
+    add_column_if_missing(&pool, "agents", "lifetime_active_seconds", "INTEGER NOT NULL DEFAULT 0").await?;
+
     Ok(pool)
+}
+
+/// SQLite-friendly idempotent column add. PRAGMA table_info is checked first
+/// because SQLite has no `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`.
+async fn add_column_if_missing(
+    pool: &SqlitePool,
+    table: &str,
+    column: &str,
+    column_decl: &str,
+) -> anyhow::Result<()> {
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        &format!("SELECT cid, name FROM pragma_table_info('{table}')"),
+    )
+    .fetch_all(pool)
+    .await?;
+    if rows.iter().any(|(_, name)| name == column) {
+        return Ok(());
+    }
+    sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {column} {column_decl}"))
+        .execute(pool)
+        .await?;
+    Ok(())
 }

@@ -6,6 +6,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
 
+fn hostname_or_unknown() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|s| s.trim().to_string())
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 pub struct AgentInventory {
     /// Server-managed dir for `agent.json` + `conversations/`.
     /// Layout: `~/.souveraine/server/agents/{id}/`.
@@ -79,6 +91,87 @@ impl AgentInventory {
     /// generates and persists; subsequent calls return the same keypair.
     pub fn seed_id(&self, agent_id: &str) -> anyhow::Result<crate::core::identity::SeedId> {
         crate::core::identity::SeedId::load_or_generate(&self.seed_dir(agent_id))
+    }
+
+    /// Register an instance row for every known agent on this process.
+    /// Idempotent: re-running with the same `instance_id` overwrites the
+    /// last_seen_at. Stale rows (>5 min since last_seen) are pruned first
+    /// so the manager view doesn't surface dead processes.
+    pub async fn register_instance(&self, instance_id: &str) -> anyhow::Result<()> {
+        let pid = std::process::id() as i64;
+        let hostname = hostname_or_unknown();
+        // Prune dead instances first.
+        sqlx::query("DELETE FROM agent_instances WHERE last_seen_at < datetime('now', '-5 minutes')")
+            .execute(&self.db)
+            .await?;
+        let agents = self.list(None).await?;
+        for a in agents {
+            sqlx::query(
+                "INSERT INTO agent_instances (agent_id, instance_id, pid, hostname, started_at, last_seen_at)
+                 VALUES (?1, ?2, ?3, ?4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                 ON CONFLICT(agent_id, instance_id) DO UPDATE SET
+                   last_seen_at = CURRENT_TIMESTAMP,
+                   pid = excluded.pid,
+                   hostname = excluded.hostname"
+            )
+            .bind(&a.id)
+            .bind(instance_id)
+            .bind(pid)
+            .bind(&hostname)
+            .execute(&self.db)
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Heartbeat the instance rows for this process: bump last_seen_at and
+    /// add `tick_seconds` to each agent's lifetime_active_seconds. Called
+    /// from a 30s loop in SouveraineServer.
+    pub async fn heartbeat_instance(&self, instance_id: &str, tick_seconds: i64) -> anyhow::Result<()> {
+        // Bump last_seen for every row owned by this instance.
+        let updated = sqlx::query(
+            "UPDATE agent_instances SET last_seen_at = CURRENT_TIMESTAMP WHERE instance_id = ?1"
+        )
+        .bind(instance_id)
+        .execute(&self.db)
+        .await?;
+        if updated.rows_affected() == 0 {
+            return Ok(());
+        }
+        // Increment lifetime_active_seconds for every agent this instance is alive on.
+        sqlx::query(
+            "UPDATE agents
+             SET lifetime_active_seconds = lifetime_active_seconds + ?1
+             WHERE id IN (SELECT agent_id FROM agent_instances WHERE instance_id = ?2)"
+        )
+        .bind(tick_seconds)
+        .bind(instance_id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    /// How many running instances does this agent currently have?
+    pub async fn instance_count(&self, agent_id: &str) -> anyhow::Result<i64> {
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM agent_instances WHERE agent_id = ?1
+             AND last_seen_at >= datetime('now', '-5 minutes')"
+        )
+        .bind(agent_id)
+        .fetch_one(&self.db)
+        .await?;
+        Ok(count)
+    }
+
+    /// Total active seconds (lifetime) for an agent, used to compute uptime %.
+    pub async fn lifetime_active_seconds(&self, agent_id: &str) -> anyhow::Result<i64> {
+        let (secs,): (i64,) = sqlx::query_as(
+            "SELECT COALESCE(lifetime_active_seconds, 0) FROM agents WHERE id = ?1"
+        )
+        .bind(agent_id)
+        .fetch_one(&self.db)
+        .await?;
+        Ok(secs)
     }
 
     pub async fn list(&self, filters: Option<String>) -> anyhow::Result<Vec<AgentSummary>> {
