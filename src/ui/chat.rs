@@ -37,6 +37,56 @@ const USER_BLUE: Color = Color::Rgb(120, 170, 240);
 const ANI_ORANGE: Color = Color::Rgb(255, 140, 66);
 const ANI_DIM: Color = Color::Rgb(180, 120, 80);
 const STATUS_GRAY: Color = Color::Rgb(140, 140, 140);
+const REFLECTION_LAVENDER: Color = Color::Rgb(180, 160, 220);
+const ARCHIVIST_TEAL: Color = Color::Rgb(120, 190, 180);
+const COMPACTION_AMBER: Color = Color::Rgb(240, 180, 60);
+const COMPACTION_RED: Color = Color::Rgb(220, 90, 80);
+const STRAIN_CRIMSON: Color = Color::Rgb(200, 80, 100);
+
+// ─── Cockpit entry ─────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub enum CockpitKind {
+    Surfacing,
+    Reflection,
+    Archivist,
+    CompactionWarn,
+    CompactionUrgent,
+    CompactionCritical,
+    InferenceStrain,
+}
+
+#[derive(Debug, Clone)]
+pub struct CockpitEntry {
+    pub kind: CockpitKind,
+    pub text: String,
+}
+
+impl CockpitEntry {
+    fn prefix(&self) -> &'static str {
+        match self.kind {
+            CockpitKind::Surfacing => "◈",
+            CockpitKind::Reflection => "◉",
+            CockpitKind::Archivist => "◆",
+            CockpitKind::CompactionWarn => "▲",
+            CockpitKind::CompactionUrgent => "▲▲",
+            CockpitKind::CompactionCritical => "▲▲▲",
+            CockpitKind::InferenceStrain => "⚡",
+        }
+    }
+
+    fn color(&self) -> Color {
+        match self.kind {
+            CockpitKind::Surfacing => SURFACING_YELLOW,
+            CockpitKind::Reflection => REFLECTION_LAVENDER,
+            CockpitKind::Archivist => ARCHIVIST_TEAL,
+            CockpitKind::CompactionWarn => COMPACTION_AMBER,
+            CockpitKind::CompactionUrgent => ANI_ORANGE,
+            CockpitKind::CompactionCritical => COMPACTION_RED,
+            CockpitKind::InferenceStrain => STRAIN_CRIMSON,
+        }
+    }
+}
 
 // ─── Overlay ────────────────────────────────────────────────────────────
 
@@ -94,7 +144,7 @@ pub struct ChatState {
     /// Recent thinking/reasoning lines for the cockpit pane.
     pub thinking: Vec<String>,
     /// Recent subconscious surfacings + reflections for the cockpit pane.
-    pub cockpit_log: Vec<String>,
+    pub cockpit_log: Vec<CockpitEntry>,
     /// Monotonic tick counter for animation timings.
     pub tick: u64,
     /// When the current turn started (for spinner animation).
@@ -581,7 +631,10 @@ Use Tab to toggle the cockpit pane.";
                     }
                 }
                 BackendEvent::Surfacing { source, content, priority } => {
-                    self.cockpit_log.push(format!("surfacing · {} · {} — {}", source, priority, content));
+                    self.cockpit_log.push(CockpitEntry {
+                        kind: CockpitKind::Surfacing,
+                        text: format!("{} · {} — {}", source, priority, content),
+                    });
                     if self.cockpit_log.len() > 200 {
                         self.cockpit_log.drain(..self.cockpit_log.len() - 200);
                     }
@@ -595,7 +648,10 @@ Use Tab to toggle the cockpit pane.";
                     self.pending_consciousness.push(BackendEvent::Surfacing { source, content, priority });
                 }
                 BackendEvent::Reflection(content) => {
-                    self.cockpit_log.push(format!("reflection — {}", content));
+                    self.cockpit_log.push(CockpitEntry {
+                        kind: CockpitKind::Reflection,
+                        text: content.clone(),
+                    });
                     self.messages.push(ChatMessage::System {
                         text: format!("reflection: {}", content),
                         ts: Instant::now(),
@@ -604,7 +660,10 @@ Use Tab to toggle the cockpit pane.";
                 }
                 BackendEvent::Archivist { synthesis, pressure } => {
                     self.pressure = pressure;
-                    self.cockpit_log.push(format!("archivist · {:.0}% — {}", pressure * 100.0, synthesis));
+                    self.cockpit_log.push(CockpitEntry {
+                        kind: CockpitKind::Archivist,
+                        text: format!("{:.0}% — {}", pressure * 100.0, synthesis),
+                    });
                     self.messages.push(ChatMessage::System {
                         text: format!("archivist: {} (pressure {:.0}%)", synthesis, pressure * 100.0),
                         ts: Instant::now(),
@@ -614,7 +673,15 @@ Use Tab to toggle the cockpit pane.";
                 BackendEvent::CompactionWarning { pressure, tier } => {
                     self.pressure = pressure;
                     let label = match tier { 3 => "critical", 2 => "urgent", _ => "warn" };
-                    self.cockpit_log.push(format!("compaction {label} · {:.0}%", pressure * 100.0));
+                    let kind = match tier {
+                        3 => CockpitKind::CompactionCritical,
+                        2 => CockpitKind::CompactionUrgent,
+                        _ => CockpitKind::CompactionWarn,
+                    };
+                    self.cockpit_log.push(CockpitEntry {
+                        kind,
+                        text: format!("{label} · {:.0}%", pressure * 100.0),
+                    });
                     self.messages.push(ChatMessage::System {
                         text: format!("context pressure {:.0}% ({label}) — consider `memory compact`", pressure * 100.0),
                         ts: Instant::now(),
@@ -625,12 +692,29 @@ Use Tab to toggle the cockpit pane.";
                     self.pressure = p;
                 }
                 BackendEvent::InferenceStrain { attempt, status, model } => {
-                    let msg = if status == 0 {
-                        format!("inference strain · {} unreachable (attempt {})", model, attempt + 1)
+                    let text = if status == 0 {
+                        format!("{} unreachable (attempt {})", model, attempt + 1)
                     } else {
-                        format!("inference strain · {} returned {} (attempt {})", model, status, attempt + 1)
+                        format!("{} returned {} (attempt {})", model, status, attempt + 1)
                     };
-                    self.cockpit_log.push(msg);
+                    self.cockpit_log.push(CockpitEntry {
+                        kind: CockpitKind::InferenceStrain,
+                        text,
+                    });
+                }
+                BackendEvent::ScheduleActive { name } => {
+                    self.cockpit_log.push(CockpitEntry {
+                        kind: CockpitKind::Reflection,
+                        text: format!("schedule: {}", name),
+                    });
+                }
+                BackendEvent::ScheduleComplete { name, silent } => {
+                    if !silent {
+                        self.cockpit_log.push(CockpitEntry {
+                            kind: CockpitKind::Reflection,
+                            text: format!("schedule done: {}", name),
+                        });
+                    }
                 }
                 BackendEvent::Done => {
                     self.finalize_streaming();
@@ -1257,14 +1341,43 @@ fn draw_cockpit(f: &mut Frame, state: &ChatState, area: Rect) {
     f.render_widget(thinking, panes[0]);
 
     // Subconscious pane (surfacings, reflections, archivist)
-    let log_view = state
+    let visible_height = panes[1].height.saturating_sub(2) as usize;
+    let visible_entries: Vec<&CockpitEntry> = state
         .cockpit_log
         .iter()
         .rev()
-        .take(panes[1].height as usize)
+        .take(visible_height)
+        .collect::<Vec<_>>()
+        .into_iter()
         .rev()
-        .map(|t| Line::from(Span::styled(format!("· {}", t), Style::default().fg(SURFACING_YELLOW))))
-        .collect::<Vec<_>>();
+        .collect();
+    let entry_count = visible_entries.len();
+    let log_view: Vec<Line<'static>> = visible_entries
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let base = entry.color();
+            let dim = if entry_count > 1 {
+                let age = 1.0 - (i as f32 / (entry_count - 1) as f32);
+                0.4 + 0.6 * (1.0 - age)
+            } else {
+                1.0
+            };
+            let Color::Rgb(r, g, b) = base else { unreachable!() };
+            let fg = Color::Rgb(
+                (r as f32 * dim) as u8,
+                (g as f32 * dim) as u8,
+                (b as f32 * dim) as u8,
+            );
+            Line::from(vec![
+                Span::styled(
+                    format!(" {} ", entry.prefix()),
+                    Style::default().fg(fg).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(entry.text.clone(), Style::default().fg(fg)),
+            ])
+        })
+        .collect();
     let subconscious = Paragraph::new(log_view)
         .wrap(Wrap { trim: false })
         .block(
