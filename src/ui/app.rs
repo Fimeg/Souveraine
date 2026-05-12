@@ -47,6 +47,8 @@ pub struct App {
     chat: Option<ChatState>,
     /// Set when chat connect fails so we can surface the error in the menu.
     chat_error: Option<String>,
+    /// Schedules editor (Cron screen). Lazily constructed on first entry.
+    schedules: Option<crate::ui::schedules::SchedulesView>,
     /// Agent name preference (from `--agent` CLI flag).
     agent_pref: String,
     /// Companion buddy for visual agent representation (WIP).
@@ -121,6 +123,7 @@ impl App {
             config,
             chat: None,
             chat_error: None,
+            schedules: None,
             agent_pref: agent_pref.clone(),
             buddy: BuddyState::new(&agent_pref),
             available_agents: Vec::new(),
@@ -295,6 +298,7 @@ impl App {
                 }
             }
             Screen::Chat => self.handle_chat_key(key).await,
+            Screen::Cron => self.handle_schedules_key(key),
             _ => {
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('m') => {
@@ -303,6 +307,95 @@ impl App {
                     _ => {}
                 }
             }
+        }
+    }
+
+    fn handle_schedules_key(&mut self, key: crossterm::event::KeyEvent) {
+        use crate::ui::schedules::{CreateField, Mode};
+
+        let Some(view) = self.schedules.as_mut() else {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                self.current_screen = Screen::Welcome;
+            }
+            return;
+        };
+
+        // Status banners absorb the next key — clear and continue.
+        if matches!(view.mode, Mode::Saved(_) | Mode::Error(_)) {
+            view.clear_status();
+            return;
+        }
+
+        match &mut view.mode {
+            Mode::Browse => match key.code {
+                KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('m') => {
+                    self.current_screen = Screen::Welcome;
+                }
+                KeyCode::Char('j') | KeyCode::Down => view.move_down(),
+                KeyCode::Char('k') | KeyCode::Up => view.move_up(),
+                KeyCode::Char('e') => view.toggle_enabled(),
+                KeyCode::Char('d') => view.confirm_delete(),
+                KeyCode::Char('r') => view.trigger_run(),
+                KeyCode::Char('c') => view.open_create(),
+                KeyCode::Char('R') => view.reload(),
+                _ => {}
+            },
+            Mode::ConfirmDelete => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => view.execute_delete(),
+                _ => view.cancel_delete(),
+            },
+            Mode::Create(form) => match key.code {
+                KeyCode::Esc => view.cancel_create(),
+                KeyCode::Enter => view.save_create(),
+                KeyCode::Tab | KeyCode::Down => form.next_field(),
+                KeyCode::BackTab | KeyCode::Up => form.prev_field(),
+                KeyCode::Backspace => match form.field {
+                    CreateField::Name => { form.name.pop(); }
+                    CreateField::Schedule => { form.schedule.pop(); }
+                    CreateField::Prompt => { form.prompt.pop(); }
+                    _ => {}
+                },
+                KeyCode::Left => match form.field {
+                    CreateField::Kind => {
+                        form.kind = match form.kind {
+                            crate::core::nervous::cron::ScheduleKind::Once =>
+                                crate::core::nervous::cron::ScheduleKind::Cron,
+                            crate::core::nervous::cron::ScheduleKind::Interval =>
+                                crate::core::nervous::cron::ScheduleKind::Once,
+                            crate::core::nervous::cron::ScheduleKind::Cron =>
+                                crate::core::nervous::cron::ScheduleKind::Interval,
+                        };
+                    }
+                    CreateField::Urgency => {
+                        form.urgency = (form.urgency - 0.1).max(0.0);
+                    }
+                    _ => {}
+                },
+                KeyCode::Right => match form.field {
+                    CreateField::Kind => {
+                        form.kind = match form.kind {
+                            crate::core::nervous::cron::ScheduleKind::Once =>
+                                crate::core::nervous::cron::ScheduleKind::Interval,
+                            crate::core::nervous::cron::ScheduleKind::Interval =>
+                                crate::core::nervous::cron::ScheduleKind::Cron,
+                            crate::core::nervous::cron::ScheduleKind::Cron =>
+                                crate::core::nervous::cron::ScheduleKind::Once,
+                        };
+                    }
+                    CreateField::Urgency => {
+                        form.urgency = (form.urgency + 0.1).min(1.0);
+                    }
+                    _ => {}
+                },
+                KeyCode::Char(c) => match form.field {
+                    CreateField::Name => form.name.push(c),
+                    CreateField::Schedule => form.schedule.push(c),
+                    CreateField::Prompt => form.prompt.push(c),
+                    _ => {}
+                },
+                _ => {}
+            },
+            Mode::Saved(_) | Mode::Error(_) => {}
         }
     }
 
@@ -455,10 +548,61 @@ impl App {
             }
             3 => self.current_screen = Screen::Therapy,
             4 => self.current_screen = Screen::AgentTime,
-            5 => self.current_screen = Screen::Cron,
+            5 => {
+                if self.schedules.is_none() {
+                    self.schedules = Some(self.build_schedules_view().await);
+                } else if let Some(view) = self.schedules.as_mut() {
+                    view.reload();
+                }
+                self.current_screen = Screen::Cron;
+            }
             6 => self.current_screen = Screen::Settings,
             _ => self.current_screen = Screen::Welcome,
         }
+    }
+
+    /// Resolve the agent's schedules directory, preferring its UUID under
+    /// `~/.souveraine/agents/{id}/schedules/`. Falls back to the agent
+    /// name if the inventory isn't reachable — the CLI uses the same
+    /// path pattern, so a hand-managed dir keyed by name still works.
+    async fn build_schedules_view(&self) -> crate::ui::schedules::SchedulesView {
+        use crate::backend::Backend;
+
+        let base = dirs::home_dir()
+            .unwrap_or_default()
+            .join(".souveraine")
+            .join("agents");
+
+        let cfg = self.config.read().await;
+        let url = cfg.server.effective_url();
+        drop(cfg);
+
+        let mut resolved_id: Option<String> = None;
+        let remote = crate::backend::RemoteBackend::new(&url);
+        if remote.health().await {
+            if let Ok(list) = remote.list_agents().await {
+                resolved_id = list
+                    .iter()
+                    .find(|a| a.name == self.agent_pref || a.id == self.agent_pref)
+                    .map(|a| a.id.clone());
+            }
+        }
+        if resolved_id.is_none() {
+            let cfg = self.config.read().await.clone();
+            if let Ok(local) = crate::backend::LocalBackend::new(cfg).await {
+                if let Ok(list) = local.list_agents().await {
+                    resolved_id = list
+                        .iter()
+                        .find(|a| a.name == self.agent_pref || a.id == self.agent_pref)
+                        .map(|a| a.id.clone());
+                }
+            }
+        }
+
+        let dir_key = resolved_id.unwrap_or_else(|| self.agent_pref.clone());
+        let dir = base.join(&dir_key).join("schedules");
+        let _ = std::fs::create_dir_all(&dir);
+        crate::ui::schedules::SchedulesView::new(self.agent_pref.clone(), dir)
     }
 
     /// Best-effort fetch of dashboard data from whichever backend is reachable.
@@ -576,6 +720,13 @@ impl App {
             Screen::Chat => {
                 if let Some(chat) = self.chat.as_ref() {
                     draw_chat(frame, chat);
+                } else {
+                    self.draw_placeholder(frame);
+                }
+            }
+            Screen::Cron => {
+                if let Some(view) = self.schedules.as_ref() {
+                    crate::ui::schedules::draw(frame, view);
                 } else {
                     self.draw_placeholder(frame);
                 }

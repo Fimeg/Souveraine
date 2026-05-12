@@ -7,6 +7,7 @@ pub mod cockpit_panel;
 pub mod color_support;
 pub mod component;
 pub mod markdown;
+pub mod schedules;
 
 pub use app::App;
 pub use buddy::{BuddyState, CompanionSprite, BuddyPosition};
