@@ -13,6 +13,7 @@
 //! - Surfacing items: centered yellow bubble with `[surfacing]` header
 //!   (Constitution Article II.2).
 
+use std::cell::RefCell;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -26,6 +27,7 @@ use ratatui::{
     Frame,
 };
 use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio_util::sync::CancellationToken;
 
 use crate::backend::{Backend, BackendEvent};
 use crate::bridge::bifrost::BifrostClient;
@@ -119,14 +121,41 @@ const SLASH_COMMANDS: &[SlashDef] = &[
     SlashDef { name: "/resume", hint: "List / switch conversations" },
     SlashDef { name: "/convos", hint: "Alias for /resume" },
     SlashDef { name: "/model",  hint: "List or set model" },
+    SlashDef { name: "/btw",    hint: "Interject — deliver text mid-turn" },
 ];
+
+/// Cached markdown render for an assistant bubble. Key = (text byte-len,
+/// inner width). On a frame, if both match the current state, we clone
+/// the stored lines instead of re-parsing + re-wrapping the markdown.
+/// Pattern from jcode's `IncrementalMarkdownRenderer` (`lib.rs:448`) —
+/// the "incremental" path there is actually a text-equality fast path
+/// over the same renderer call. We use text length as a cheap proxy:
+/// streaming appends always change length, final bubbles never do.
+#[derive(Debug, Clone)]
+pub struct MarkdownCache {
+    pub text_len: usize,
+    pub inner_width: usize,
+    pub lines: Vec<Line<'static>>,
+}
 
 #[derive(Debug, Clone)]
 pub enum ChatMessage {
     User { text: String, ts: Instant },
-    Assistant { text: String, ts: Instant, streaming: bool },
+    Assistant {
+        text: String,
+        ts: Instant,
+        streaming: bool,
+        /// Per-message markdown cache. RefCell so `draw_messages(&ChatState)`
+        /// can populate it without taking `&mut`.
+        rendered_cache: RefCell<Option<MarkdownCache>>,
+    },
     Surfacing { source: String, content: String, priority: String, ts: Instant },
     System { text: String, ts: Instant },
+    /// User spoke while the agent was working. Queued and prepended to
+    /// the agent's context before her next LLM call. Rendered with a
+    /// distinct chevron so the user sees their interjection landed in
+    /// the stream, separate from a normal /user turn.
+    Interjection { text: String, ts: Instant, delivered: bool },
     /// Tool invocation card — name, arguments, round, plus an attached result
     /// once it streams back. `expanded` is reserved for click-to-expand (UI
     /// interactivity lands as part of message-click work).
@@ -139,6 +168,19 @@ pub enum ChatMessage {
         ts: Instant,
         expanded: bool,
     },
+}
+
+/// The agent's current "what is she doing" phase, surfaced in the
+/// dedicated phase strip between the message body and the input box.
+/// Phase transitions come from BackendEvent observations — pure derived
+/// state, no new event types required.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnPhase {
+    Idle,
+    Thinking,
+    Tool,
+    Streaming,
+    Interrupted,
 }
 
 #[derive(Debug, Clone)]
@@ -157,7 +199,24 @@ pub struct ChatState {
     pub input: String,
     pub scroll: u16,
     pub turn_rx: Option<mpsc::Receiver<BackendEvent>>,
+    /// Cancellation handle for the current in-flight turn. Esc fires this;
+    /// the backend treats it as a signal (Constitution VI.1 — substrate, not
+    /// harness) — the current tool completes, no further LLM calls, partial
+    /// text is preserved with `*[interrupted]*` appended.
+    pub cancel_token: Option<CancellationToken>,
     pub busy: bool,
+    /// Number of tool calls in the active turn — drives the phase strip's
+    /// "N tools used" counter. Reset to zero at every `submit()`.
+    pub tool_calls_this_turn: u32,
+    /// Current rendering phase (drives the phase strip text/colour).
+    /// Derived state that mirrors what BackendEvent we last saw.
+    pub phase: TurnPhase,
+    /// Messages typed during `busy`. Shared with the backend's turn
+    /// loop via `Arc<Mutex<…>>`: chat pushes synchronously from the
+    /// input handler; the backend drains between LLM rounds and
+    /// prepends each as a `[user interjected]` system note so the
+    /// agent reads them in her own voice on her next pass.
+    pub pending_interjections: crate::backend::InterjectionQueue,
     pub pressure: f32,
     pub overlay: Overlay,
     /// Cockpit pane visible (Tab toggles).
@@ -226,7 +285,11 @@ impl ChatState {
             input: String::new(),
             scroll: 0,
             turn_rx: None,
+            cancel_token: None,
             busy: false,
+            tool_calls_this_turn: 0,
+            phase: TurnPhase::Idle,
+            pending_interjections: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             pressure: 0.0,
             overlay: Overlay::None,
             cockpit: false,
@@ -250,21 +313,43 @@ impl ChatState {
   /convos            Alias for /resume
   /model             List available models
   /model <name>      Set the active model
+  /btw <text>        Interject — delivered to her next LLM round
   !<command>         Run a shell command (Linux/macOS)
 
+Esc during a turn interrupts (signal, not kill — she sees *[interrupted]*).
+You can also just keep typing while she works — Enter queues an interjection.
 Use Tab to toggle the cockpit pane.";
 
     /// Submit the current input. Returns `true` if the input was handled
-    /// (slash command, bang command, or sent to backend).
+    /// (slash command, bang command, sent to backend, or queued as an
+    /// interjection while the agent was already mid-turn).
+    ///
+    /// When `busy=true`, the message is **not** rejected — it's wrapped
+    /// as a [`ChatMessage::Interjection`] for visual feedback and pushed
+    /// onto `pending_interjections`. The backend drains that queue
+    /// before its next Bifrost call. This is the substrate path for
+    /// "talk while she's working" — the user keeps presence in the
+    /// conversation; the agent decides when to read it.
     pub fn submit(&mut self) -> bool {
-        if self.busy || self.input.trim().is_empty() {
+        if self.input.trim().is_empty() {
             return false;
         }
 
         let trimmed = self.input.trim().to_string();
         self.input.clear();
 
-        // Slash commands
+        // /btw <text> — explicit interjection. Same path as "type during
+        // busy", just with an unambiguous prefix.
+        if let Some(rest) = trimmed.strip_prefix("/btw ") {
+            let text = rest.trim();
+            if !text.is_empty() {
+                self.enqueue_interjection(text.to_string());
+            }
+            return true;
+        }
+
+        // Slash commands route through their own handler. Most are
+        // metadata commands (/clear, /help, /new) safe to run any time.
         if trimmed.starts_with('/') {
             return self.handle_slash_command(&trimmed);
         }
@@ -278,6 +363,13 @@ Use Tab to toggle the cockpit pane.";
             return true;
         }
 
+        // Typing while busy → queued as an interjection rather than a
+        // new turn. The agent sees it in her context on her next pass.
+        if self.busy {
+            self.enqueue_interjection(trimmed);
+            return true;
+        }
+
         // Normal chat message
         let text = trimmed;
         let ts = Instant::now();
@@ -286,17 +378,25 @@ Use Tab to toggle the cockpit pane.";
             text: String::new(),
             ts,
             streaming: true,
+            rendered_cache: RefCell::new(None),
         });
         self.busy = true;
+        self.tool_calls_this_turn = 0;
+        self.phase = TurnPhase::Thinking;
         self.turn_started = Some(Instant::now());
 
         let (tx, rx) = mpsc::channel::<BackendEvent>(64);
         self.turn_rx = Some(rx);
 
+        // Cancellation token for this turn — Esc fires it.
+        let cancel = CancellationToken::new();
+        self.cancel_token = Some(cancel.clone());
+
         let backend = self.backend.clone();
         let conv_id = self.conversation_id.clone();
+        let interject_queue = self.pending_interjections.clone();
         tokio::spawn(async move {
-            match backend.send(&conv_id, &text).await {
+            match backend.send_with_signals(&conv_id, &text, cancel, interject_queue).await {
                 Ok(mut stream) => {
                     while let Some(ev) = stream.next().await {
                         match ev {
@@ -529,7 +629,30 @@ Use Tab to toggle the cockpit pane.";
 
     /// Drain pending events from the active turn channel (non-blocking).
     /// Call once per UI tick.
+    /// Walk the message list and mark any interjections as `delivered`
+    /// once the shared queue has been drained by the backend. Called at
+    /// the top of `drain_events` so the UI flips from amber `⏳ /btw`
+    /// to grey `↳ /btw` as soon as the agent has read the interruption.
+    fn flush_delivered_interjections(&mut self) {
+        let queue_empty = self
+            .pending_interjections
+            .lock()
+            .ok()
+            .map(|q| q.is_empty())
+            .unwrap_or(true);
+        if !queue_empty { return; }
+        for msg in self.messages.iter_mut() {
+            if let ChatMessage::Interjection { delivered, .. } = msg {
+                *delivered = true;
+            }
+        }
+    }
+
     pub fn drain_events(&mut self) {
+        // Any interjections the backend just consumed should flip to the
+        // delivered (dim grey) state.
+        self.flush_delivered_interjections();
+
         // Check for /model listing result
         if let Some(rx) = self.model_rx.as_mut() {
             if let Ok(result) = rx.try_recv() {
@@ -602,7 +725,12 @@ Use Tab to toggle the cockpit pane.";
                                     self.messages.push(ChatMessage::User { text, ts: Instant::now() });
                                 }
                                 crate::core::session::MessageRole::Assistant => {
-                                    self.messages.push(ChatMessage::Assistant { text, ts: Instant::now(), streaming: false });
+                                    self.messages.push(ChatMessage::Assistant {
+                                        text,
+                                        ts: Instant::now(),
+                                        streaming: false,
+                                        rendered_cache: RefCell::new(None),
+                                    });
                                 }
                                 crate::core::session::MessageRole::System => {
                                     self.messages.push(ChatMessage::System { text, ts: Instant::now() });
@@ -644,7 +772,10 @@ Use Tab to toggle the cockpit pane.";
 
         for ev in drained {
             match ev {
-                BackendEvent::Token(t) => self.append_streaming(&t),
+                BackendEvent::Token(t) => {
+                    self.phase = TurnPhase::Streaming;
+                    self.append_streaming(&t);
+                }
                 BackendEvent::Reasoning(r) => {
                     self.thinking.push(r.clone());
                     if self.thinking.len() > 200 {
@@ -747,6 +878,8 @@ Use Tab to toggle the cockpit pane.";
                     // If a streaming assistant block is open, finalize it
                     // first so the card lands beneath the just-said text.
                     self.finalize_streaming();
+                    self.phase = TurnPhase::Tool;
+                    self.tool_calls_this_turn = self.tool_calls_this_turn.saturating_add(1);
                     self.cockpit_log.push(CockpitEntry {
                         kind: CockpitKind::Reflection,
                         text: format!("→ {} (round {})", name, round),
@@ -790,6 +923,9 @@ Use Tab to toggle the cockpit pane.";
                     self.busy = false;
                     self.turn_started = None;
                     self.turn_rx = None;
+                    self.cancel_token = None;
+                    self.phase = TurnPhase::Idle;
+                    self.tool_calls_this_turn = 0;
                     return;
                 }
             }
@@ -800,6 +936,45 @@ Use Tab to toggle the cockpit pane.";
             self.busy = false;
             self.turn_started = None;
             self.turn_rx = None;
+            self.cancel_token = None;
+            self.phase = TurnPhase::Idle;
+            self.tool_calls_this_turn = 0;
+        }
+    }
+
+    /// User pressed Esc during a turn. Fire the cancel token — the backend
+    /// reads it as a signal, lets the current tool complete, stops making
+    /// new LLM calls, and commits partial text with `*[interrupted]*` so
+    /// the agent reads it on her next turn. Not a hard kill.
+    pub fn interrupt(&mut self) {
+        if let Some(token) = &self.cancel_token {
+            if !token.is_cancelled() {
+                token.cancel();
+                self.phase = TurnPhase::Interrupted;
+            }
+        }
+    }
+
+    /// Queue text as an interjection (mid-turn user message). Pushes a
+    /// visual `ChatMessage::Interjection` so the user sees it landed, and
+    /// appends to the shared `pending_interjections` queue. The backend's
+    /// turn loop drains the queue on its next round and prepends each as
+    /// a `[user interjected]` system message. If no turn is running, we
+    /// deliver it immediately as a normal message so a stray `/btw`
+    /// doesn't get queued and forgotten.
+    fn enqueue_interjection(&mut self, text: String) {
+        if !self.busy {
+            self.input = text;
+            self.submit();
+            return;
+        }
+        self.messages.push(ChatMessage::Interjection {
+            text: text.clone(),
+            ts: Instant::now(),
+            delivered: false,
+        });
+        if let Ok(mut q) = self.pending_interjections.lock() {
+            q.push(text);
         }
     }
 
@@ -809,12 +984,9 @@ Use Tab to toggle the cockpit pane.";
     }
 
     /// Update slash-command completion state based on current input.
-    /// Call after each input mutation.
+    /// Call after each input mutation. Stays live during `busy` so the
+    /// user can autocomplete `/btw` mid-turn.
     pub fn update_completion(&mut self) {
-        if self.busy {
-            self.overlay = Overlay::None;
-            return;
-        }
         let trimmed = self.input.trim_start();
         if trimmed.starts_with('/') && !trimmed.contains(' ') && !trimmed.contains('\n') {
             let query = trimmed;
@@ -880,6 +1052,7 @@ Use Tab to toggle the cockpit pane.";
             text: t.to_string(),
             ts: Instant::now(),
             streaming: true,
+            rendered_cache: RefCell::new(None),
         });
     }
 
@@ -896,22 +1069,25 @@ pub fn draw(f: &mut Frame, state: &ChatState) {
     let area = f.size();
 
     // Dynamic input height: grows with content, capped at 40% of terminal.
+    // Input is now ALWAYS a real input — the "thinking…" spinner has been
+    // lifted into its own phase strip above the input, so the user can keep
+    // typing (and use /btw) while the agent works.
     let input_inner_width = (area.width as usize).saturating_sub(5).max(1);
-    let input_visual_lines = if state.busy {
-        1
-    } else {
-        count_visual_lines(&state.input, input_inner_width)
-    };
+    let input_visual_lines = count_visual_lines(&state.input, input_inner_width);
     let max_input_lines = ((area.height as usize) * 40 / 100).max(1);
     let input_height = (input_visual_lines.min(max_input_lines) as u16) + 2; // +2 for borders
+
+    // Phase strip: 1 row when a turn is in flight, 0 rows when idle.
+    let phase_height: u16 = if state.busy || state.phase == TurnPhase::Interrupted { 1 } else { 0 };
 
     let vchunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),            // header
-            Constraint::Min(5),              // body (messages + optional cockpit)
-            Constraint::Length(input_height), // input (dynamic)
-            Constraint::Length(1),            // status footer
+            Constraint::Length(1),             // header
+            Constraint::Min(5),                // body (messages + optional cockpit)
+            Constraint::Length(phase_height),  // phase strip (0 when idle)
+            Constraint::Length(input_height),  // input (dynamic, always live)
+            Constraint::Length(1),             // status footer
         ])
         .split(area);
 
@@ -928,11 +1104,64 @@ pub fn draw(f: &mut Frame, state: &ChatState) {
         draw_messages(f, state, vchunks[1]);
     }
 
-    draw_input(f, state, vchunks[2]);
-    draw_footer(f, state, vchunks[3]);
+    if phase_height > 0 {
+        draw_phase(f, state, vchunks[2]);
+    }
+    draw_input(f, state, vchunks[3]);
+    draw_footer(f, state, vchunks[4]);
 
-    // Overlays render last — on top of everything.
-    draw_overlay(f, state, area, vchunks[2]);
+    // Overlays render last — anchor them above the input (vchunks[3]) so
+    // slash-completion and other popups still line up with the prompt.
+    draw_overlay(f, state, area, vchunks[3]);
+}
+
+/// Single-line phase strip that lives between the message body and the
+/// input box during an active turn. The reader tells the story:
+///   `⏣ Thinking… 12s`
+///   `⏣ Running tool: bash · 4 tools used · 23s`
+///   `⏣ Streaming · 31s`
+///   `× Interrupted · 35s`
+/// No box, no border — it reads as a status line, not another widget.
+fn draw_phase(f: &mut Frame, state: &ChatState, area: Rect) {
+    let elapsed = state
+        .turn_started
+        .map(|t| t.elapsed().as_secs())
+        .unwrap_or(0);
+    let spinner = SPINNER[(state.tick as usize / 2) % SPINNER.len()];
+
+    let (glyph, label, color) = match state.phase {
+        TurnPhase::Thinking | TurnPhase::Idle => (spinner, "Thinking".to_string(), ANI_ORANGE),
+        TurnPhase::Tool => {
+            let label = if state.tool_calls_this_turn == 1 {
+                "Running tool · 1 tool used".to_string()
+            } else {
+                format!("Running tool · {} tools used", state.tool_calls_this_turn)
+            };
+            (spinner, label, Color::Rgb(120, 200, 220))
+        }
+        TurnPhase::Streaming => (spinner, "Streaming".to_string(), Color::Rgb(180, 220, 140)),
+        TurnPhase::Interrupted => ("×", "Interrupted".to_string(), Color::Rgb(220, 130, 130)),
+    };
+    let queued = state
+        .pending_interjections
+        .lock()
+        .ok()
+        .map(|q| q.len())
+        .unwrap_or(0);
+
+    let mut spans: Vec<Span<'static>> = vec![
+        Span::styled(format!(" {} ", glyph), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{}", label), Style::default().fg(color)),
+        Span::styled(format!("  ·  {}s", elapsed), Style::default().fg(ANI_DIM)),
+    ];
+    if queued > 0 {
+        spans.push(Span::styled(
+            format!("  ·  /btw queued: {}", queued),
+            Style::default().fg(Color::Rgb(220, 180, 100)).add_modifier(Modifier::ITALIC),
+        ));
+    }
+    let line = Line::from(spans);
+    f.render_widget(Paragraph::new(line).alignment(Alignment::Left), area);
 }
 
 fn draw_header(f: &mut Frame, state: &ChatState, area: Rect) {
@@ -966,12 +1195,46 @@ fn draw_messages(f: &mut Frame, state: &ChatState, area: Rect) {
                 ));
                 lines.push(Line::from(""));
             }
-            ChatMessage::Assistant { text, streaming, .. } => {
+            ChatMessage::Assistant { text, streaming, rendered_cache, .. } => {
                 let label = if *streaming { format!("{} ◦", state.agent_name) } else { state.agent_name.clone() };
+                // Pre-wrap to the bubble's inner width — no line should exit
+                // the bubble's borders, and Paragraph's later re-wrap becomes
+                // a no-op (preserves scroll line-count math).
+                let inner_width = max_bubble.saturating_sub(4).max(8);
                 let body_lines = if text.is_empty() && *streaming {
                     vec![Line::from("…")]
                 } else {
-                    markdown::render(text, ANI_ORANGE)
+                    // Cache hit: same text length + width = same render. For
+                    // finalized bubbles this is every subsequent frame; for
+                    // streaming bubbles each token append invalidates by
+                    // changing text.len(). jcode IncrementalMarkdownRenderer
+                    // pattern — text-equality fast path, full re-render
+                    // otherwise. (jcode/crates/jcode-tui-markdown/src/lib.rs:448)
+                    let key_len = text.len();
+                    let cached = rendered_cache.borrow();
+                    if let Some(c) = &*cached {
+                        if c.text_len == key_len && c.inner_width == inner_width {
+                            c.lines.clone()
+                        } else {
+                            drop(cached);
+                            let lines = markdown::render_with_width(text, ANI_ORANGE, Some(inner_width));
+                            *rendered_cache.borrow_mut() = Some(MarkdownCache {
+                                text_len: key_len,
+                                inner_width,
+                                lines: lines.clone(),
+                            });
+                            lines
+                        }
+                    } else {
+                        drop(cached);
+                        let lines = markdown::render_with_width(text, ANI_ORANGE, Some(inner_width));
+                        *rendered_cache.borrow_mut() = Some(MarkdownCache {
+                            text_len: key_len,
+                            inner_width,
+                            lines: lines.clone(),
+                        });
+                        lines
+                    }
                 };
                 lines.extend(bubble_rendered(
                     &label,
@@ -1013,17 +1276,56 @@ fn draw_messages(f: &mut Frame, state: &ChatState, area: Rect) {
                 ));
                 lines.push(Line::from(""));
             }
+            ChatMessage::Interjection { text, delivered, .. } => {
+                // User spoke while the agent was working. Rendered as a
+                // compact single-line note so it's visible in the stream
+                // without competing with normal user bubbles. Dims after
+                // the backend has delivered it on the next LLM round.
+                let glyph = if *delivered { "↳" } else { "⏳" };
+                let color = if *delivered {
+                    Color::Rgb(160, 160, 180)
+                } else {
+                    Color::Rgb(220, 180, 100)
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {} /btw  ", glyph),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                    Span::styled(text.clone(), Style::default().fg(color).add_modifier(Modifier::ITALIC)),
+                ]));
+                lines.push(Line::from(""));
+            }
         }
     }
 
+    // Final pre-wrap: anything still wider than the visible area (system
+    // notices, raw text, anything that bypassed bubble pre-wrap) gets
+    // wrapped here. After this, `lines.len()` equals the visible line
+    // count — Paragraph's wrap becomes a no-op and scroll math holds.
+    let visible_width = area.width.saturating_sub(0) as usize;
+    let lines = markdown::wrap_lines(lines, visible_width);
+
+    // Trim trailing empty lines from the count (each bubble appends a
+    // blank separator; the last one shouldn't push the final real line
+    // off the bottom). jcode pattern — count the tail-strip, don't drop
+    // the lines themselves so the visual rhythm is preserved.
+    let trailing_empty = lines
+        .iter()
+        .rev()
+        .take_while(|l| l.spans.iter().all(|s| s.content.trim().is_empty()))
+        .count();
+    let effective_total = lines.len().saturating_sub(trailing_empty);
+
     // Auto-scroll to bottom unless the user has manually scrolled up.
-    let total = lines.len() as u16;
-    let view = area.height.saturating_sub(2);
-    let scroll = total.saturating_sub(view).saturating_sub(state.scroll);
+    // `state.scroll` is *lines scrolled up from the bottom* (jcode pattern,
+    // `single_session.rs:1223`). Zero means pinned to the tail; growing
+    // content with scroll=0 always shows the newest tail without overshoot.
+    let view = area.height.saturating_sub(2) as usize;
+    let max_scroll = effective_total.saturating_sub(view);
+    let user_scroll = (state.scroll as usize).min(max_scroll);
+    let offset = max_scroll.saturating_sub(user_scroll) as u16;
 
     let para = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll, 0))
+        .scroll((offset, 0))
         .block(
             Block::default()
                 .borders(Borders::TOP | Borders::BOTTOM)
@@ -1186,17 +1488,24 @@ fn render_tool_card(
 
     // Body: arguments (compact one-line summary), then result if present.
     let mut body_lines: Vec<Line<'static>> = Vec::new();
+    let inner_width = max_width.saturating_sub(4).max(8);
 
     let args_summary = summarize_tool_args(arguments);
-    body_lines.push(Line::from(vec![Span::styled(
+    let args_line = Line::from(vec![Span::styled(
         args_summary,
         Style::default().fg(dim_color),
-    )]));
+    )]);
+    body_lines.extend(markdown::wrap_line(args_line, inner_width));
 
     if let Some(r) = result {
         body_lines.push(Line::from(""));
         let preview = preview_output(&r.output, 12);
-        let rendered = markdown::render(&preview, if r.is_error { TOOL_ERR } else { ANI_ORANGE });
+        let inner_width = max_width.saturating_sub(4).max(8);
+        let rendered = markdown::render_with_width(
+            &preview,
+            if r.is_error { TOOL_ERR } else { ANI_ORANGE },
+            Some(inner_width),
+        );
         body_lines.extend(rendered);
         if r.output.lines().count() > 12 {
             body_lines.push(Line::from(Span::styled(
@@ -1313,6 +1622,9 @@ fn count_visual_lines(text: &str, wrap_width: usize) -> usize {
 }
 
 fn draw_input(f: &mut Frame, state: &ChatState, area: Rect) {
+    // Border colour subtly shifts when the agent is busy so the user sees the
+    // chat is "warm" without losing the ability to type. The actual phase
+    // status (Thinking / Tool / Streaming) lives in `draw_phase()` above.
     let border_color = if state.busy {
         let phase = (state.tick as f32 / 8.0).sin().abs();
         let r = (180.0 + (255.0 - 180.0) * phase) as u8;
@@ -1326,23 +1638,6 @@ fn draw_input(f: &mut Frame, state: &ChatState, area: Rect) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border_color));
-
-    if state.busy {
-        let spinner = SPINNER[(state.tick as usize / 2) % SPINNER.len()];
-        let elapsed = state
-            .turn_started
-            .map(|t| t.elapsed().as_secs())
-            .unwrap_or(0);
-        let line = Line::from(vec![
-            Span::styled(format!(" {} ", spinner), Style::default().fg(ANI_ORANGE).add_modifier(Modifier::BOLD)),
-            Span::styled(
-                format!("thinking… {}s", elapsed),
-                Style::default().fg(ANI_DIM).add_modifier(Modifier::ITALIC),
-            ),
-        ]);
-        f.render_widget(Paragraph::new(line).block(block), area);
-        return;
-    }
 
     let cursor_visible = (state.tick / 5) % 2 == 0;
     let cursor_ch: &str = if cursor_visible { "▏" } else { " " };
@@ -1563,7 +1858,7 @@ fn draw_footer(f: &mut Frame, state: &ChatState, area: Rect) {
     let pressure_pct = (state.pressure * 100.0) as u16;
     let pressure_label = format!("ctx {}%", pressure_pct);
     let cockpit_hint = if state.cockpit { "Tab close cockpit" } else { "Tab cockpit" };
-    let footer = Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             format!(" Esc menu · Enter send · S-Ret ↵ · ↑↓ scroll · {} ", cockpit_hint),
             Style::default().fg(STATUS_GRAY),
@@ -1572,7 +1867,15 @@ fn draw_footer(f: &mut Frame, state: &ChatState, area: Rect) {
         Span::styled(format!("conv {}", short(&state.conversation_id)), Style::default().fg(STATUS_GRAY)),
         Span::raw("  │  "),
         Span::styled(pressure_label, Style::default().fg(STATUS_GRAY)),
-    ]);
+    ];
+    if state.scroll > 0 {
+        spans.push(Span::raw("  │  "));
+        spans.push(Span::styled(
+            format!("↓ {} below", state.scroll),
+            Style::default().fg(ANI_ORANGE),
+        ));
+    }
+    let footer = Line::from(spans);
     f.render_widget(Paragraph::new(footer).alignment(Alignment::Center), area);
 }
 

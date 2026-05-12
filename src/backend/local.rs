@@ -13,9 +13,10 @@ use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
 
 use crate::bridge::bifrost::{ChatCompletionRequest, Message as BifrostMessage};
 use crate::bridge::model_router::TokenCounter;
@@ -564,6 +565,29 @@ impl Backend for LocalBackend {
         conversation_id: &str,
         text: &str,
     ) -> Result<BoxStream<'static, Result<BackendEvent>>> {
+        // No cancel signal — heartbeat path, drain path. Use a token that
+        // never fires.
+        self.send_with_cancel(conversation_id, text, CancellationToken::new()).await
+    }
+
+    async fn send_with_cancel(
+        &self,
+        conversation_id: &str,
+        text: &str,
+        cancel: CancellationToken,
+    ) -> Result<BoxStream<'static, Result<BackendEvent>>> {
+        // No queue passed in — use an empty queue. Equivalent to the old behavior.
+        let empty: crate::backend::InterjectionQueue = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        self.send_with_signals(conversation_id, text, cancel, empty).await
+    }
+
+    async fn send_with_signals(
+        &self,
+        conversation_id: &str,
+        text: &str,
+        cancel: CancellationToken,
+        interject: crate::backend::InterjectionQueue,
+    ) -> Result<BoxStream<'static, Result<BackendEvent>>> {
         self.server.sessions.add_message(
             conversation_id,
             ConversationMessage::user_text(text),
@@ -577,7 +601,7 @@ impl Backend for LocalBackend {
 
         active.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
-            if let Err(e) = run_turn(server, conv_id, &tx, event_bus).await {
+            if let Err(e) = run_turn(server, conv_id, &tx, event_bus, cancel, interject).await {
                 let _ = tx.send(Err(e)).await;
             }
             let _ = tx.send(Ok(BackendEvent::Done)).await;
@@ -617,11 +641,21 @@ impl crate::core::nervous::handler::TurnInjector for LocalBackend {
 
 // ── Turn Loop ────────────────────────────────────────────────────
 
+/// Pulse prose. Terse, present-tense, observational — her register, not the
+/// harness's. No question, no verdict. The agent reads it and decides.
+fn pulse_text(elapsed: Duration) -> String {
+    let minutes = elapsed.as_secs() / 60;
+    let stamp = chrono::Local::now().format("%H:%M");
+    format!("[{} — {} minutes in. Still going.]", stamp, minutes)
+}
+
 async fn run_turn(
     server: Arc<SouveraineServer>,
     conversation_id: String,
     tx: &mpsc::Sender<Result<BackendEvent>>,
     event_bus: EventBus,
+    cancel: CancellationToken,
+    interject: crate::backend::InterjectionQueue,
 ) -> Result<()> {
     // Snapshot history for the Bifrost call, then drop the dashmap ref before
     // any await — `Ref` is not Send across awaits.
@@ -662,11 +696,21 @@ async fn run_turn(
     let inter_round_delay = Duration::from_millis(agent.llm_config.inter_round_delay_ms);
     let context_limit = agent.llm_config.context_window as usize;
 
-    // Resolve the model's configured output limit for pressure scaling
-    let output_limit = {
+    // Resolve the model's configured output limit + presence pulse settings.
+    let (output_limit, pulse_enabled, pulse_interval) = {
         let cfg = server.app_config.read().await;
-        cfg.models.get(&model).map(|m| m.output_limit as u32).unwrap_or(8192)
+        let out = cfg.models.get(&model).map(|m| m.output_limit as u32).unwrap_or(8192);
+        let p_on = cfg.presence.pulse_enabled;
+        let p_iv = Duration::from_secs(cfg.presence.pulse_interval_secs.max(60));
+        (out, p_on, p_iv)
     };
+
+    // Self-awareness pulse: track when the turn started and when she last
+    // noticed the time. Between rounds, if the interval has elapsed, drop a
+    // beat of self-awareness into her context — her own voice, not a harness
+    // signal. She reads it; she decides.
+    let turn_start = Instant::now();
+    let mut last_pulse = turn_start;
 
     // Build per-agent ToolContext with correct memory root and subagent runner
     let memory_root = Some(server.agents.memory_root(&agent_id));
@@ -704,10 +748,46 @@ async fn run_turn(
     // ── Tool-calling loop ─────────────────────────────────────
     let mut messages = initial_messages;
     let mut tool_round = 0u32;
-    let final_content: String;
+    let mut final_content: String = String::new();
+    let mut interrupted = false;
     let counter = TokenCounter::new();
 
     loop {
+        // Cancellation is a signal, not enforcement — we check it on round
+        // boundaries (between Bifrost calls, after tools have completed) so
+        // partial work is preserved. No hard-kill mid-tool.
+        if cancel.is_cancelled() {
+            interrupted = true;
+            break;
+        }
+
+        // Drain any queued interjections from the user. The user typed these
+        // while the agent was thinking; deliver them as system notes so the
+        // agent reads them in context on this round. She decides whether to
+        // address them now, after the current tool, or defer entirely —
+        // substrate, not enforcement.
+        let drained: Vec<String> = {
+            interject
+                .lock()
+                .ok()
+                .map(|mut q| q.drain(..).collect())
+                .unwrap_or_default()
+        };
+        for text in drained {
+            let stamp = chrono::Local::now().format("%H:%M");
+            let note = format!("[user interjected at {} — {}]", stamp, text.trim());
+            messages.push(BifrostMessage::text("system", note));
+        }
+
+        // Self-awareness pulse: a beat of noticing the time pass, in her
+        // own register. Injected as a system message before the next LLM
+        // call so it lands in her context naturally.
+        if pulse_enabled && last_pulse.elapsed() >= pulse_interval {
+            let elapsed_total = turn_start.elapsed();
+            messages.push(BifrostMessage::text("system", pulse_text(elapsed_total)));
+            last_pulse = Instant::now();
+        }
+
         let pressure = bifrost_pressure(&counter, &messages, context_limit);
         let max_tokens = pressure_to_max_tokens(pressure, output_limit);
         let _ = tx.send(Ok(BackendEvent::ContextPressure(pressure))).await;
@@ -725,7 +805,16 @@ async fn run_turn(
             },
         };
 
-        let (response, strain) = server.bifrost.chat_completion_with_strain(req).await?;
+        // Race the LLM call against cancellation so Esc drops the in-flight
+        // request without waiting for it to complete.
+        let (response, strain) = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                interrupted = true;
+                break;
+            }
+            res = server.bifrost.chat_completion_with_strain(req) => res?,
+        };
 
         for event in &strain {
             if let crate::bridge::bifrost::InferenceStrain::Transient { attempt, status, model, .. } = event {
@@ -754,14 +843,35 @@ async fn run_turn(
                 let _ = tx.send(Ok(BackendEvent::Token(note.to_string()))).await;
             }
 
-            // Stream the final content in chunks
+            // Stream the final content in chunks, watching the cancel token.
+            // If Esc fires mid-stream, the agent's partial text is preserved
+            // (the chunks already sent are in the user's history) and an
+            // *[interrupted]* marker lands in the session message.
             let chars: Vec<char> = final_content.chars().collect();
+            let mut streamed = String::with_capacity(final_content.len());
             for chunk in chars.chunks(10) {
                 let s: String = chunk.iter().collect();
-                if tx.send(Ok(BackendEvent::Token(s))).await.is_err() {
-                    return Ok(());
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        interrupted = true;
+                        final_content = streamed;
+                        break;
+                    }
+                    send_res = tx.send(Ok(BackendEvent::Token(s.clone()))) => {
+                        if send_res.is_err() { return Ok(()); }
+                        streamed.push_str(&s);
+                    }
                 }
-                tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        interrupted = true;
+                        final_content = streamed.clone();
+                        break;
+                    }
+                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(20)) => {}
+                }
             }
             break;
         }
@@ -839,10 +949,41 @@ async fn run_turn(
     }
 
     // ── Post-turn processing ───────────────────────────────────
+    // If the user pressed Esc, commit the partial text with a marker the
+    // agent will read on her next turn. The interrupt is a signal in her
+    // own context — same shape as a pressure warning, not a hidden harness
+    // event. She can ask for more time, wrap up, or acknowledge.
+    let committed_content = if interrupted {
+        // Emit the marker as a final token so the in-flight bubble shows it
+        // immediately, then persist the same content into the session.
+        let marker = if final_content.is_empty() {
+            "*[interrupted]*".to_string()
+        } else {
+            "\n\n*[interrupted]*".to_string()
+        };
+        let _ = tx.send(Ok(BackendEvent::Token(marker.clone()))).await;
+        format!("{}{}", final_content, marker)
+    } else {
+        final_content.clone()
+    };
+
     server.sessions.add_message(
         &conversation_id,
-        ConversationMessage::assistant_text(&final_content),
+        ConversationMessage::assistant_text(&committed_content),
     )?;
+
+    // On interrupt, skip Aster's N+1 pass entirely — the user is in the
+    // middle of redirecting, the last thing they need is a delayed
+    // surfacing landing seconds later. Pressure recalc still runs below.
+    if interrupted {
+        if let Some(mut session) = server.sessions.get_mut(&conversation_id) {
+            let pressure = server
+                .consciousness
+                .calculate_pressure(&session.messages, context_limit);
+            session.context_pressure = pressure;
+        }
+        return Ok(());
+    }
 
     // Breather between Ani finishing and Aster firing — unconditional,
     // so the upstream always gets a gap before the N+1 pass starts.

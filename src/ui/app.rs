@@ -5,6 +5,7 @@
 //! registered `Component`s. Components are extracted here incrementally.
 //! Existing draw methods remain until their panels become proper Components.
 
+use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -33,7 +34,7 @@ use crate::ui::color_support::rgb;
 use crate::ui::component::{Component, Scene, SceneLayout, TuiEvent};
 use crate::backend::BackendEvent;
 
-use ratatui_image::{picker::Picker, protocol::Protocol, Image};
+use ratatui_image::{picker::Picker, protocol::{Protocol, StatefulProtocol}, Image, Resize, StatefulImage};
 
 #[cfg(feature = "figlet-rs")]
 use figlet_rs::FIGlet;
@@ -55,10 +56,8 @@ pub struct App {
     /// Annie Composite made felt — body channel for the running agent.
     /// See `src/ui/presence.rs` for the state model and event subscriptions.
     presence: Presence,
-    /// Available agents for selection.
+    /// Available agent names (for the manager / selection).
     available_agents: Vec<String>,
-    /// Cursor index when the gallery is open.
-    gallery_selected: usize,
     /// The component scene — owns event dispatch and layout.
     scene: Scene,
     /// Monotonic tick counter, incremented each frame.
@@ -74,6 +73,12 @@ pub struct App {
     image_protocol: Option<Protocol>,
     /// Per-agent cards for the AgentsManager screen.
     agent_cards: Vec<AgentCard>,
+    /// Per-agent stateful image protocols for the Agent Manager card grid.
+    /// Keyed by agent id (the dir name under `~/.souveraine/agents/`). Each
+    /// protocol owns its own resize state so multiple cards can render at
+    /// different sizes simultaneously without conflicting. Lazily populated
+    /// when the manager is opened; survives Esc → reopen.
+    card_images: HashMap<String, StatefulProtocol>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -89,11 +94,7 @@ pub enum Screen {
     Settings,
     /// "Be with her" mode — fullscreen breathing portrait, no chat input.
     Presence,
-    /// Agent gallery — portrait grid of all available agents, choose one.
-    Gallery,
-    /// Agent Repo Manager — richer grid surfacing per-agent SeedID glyph,
-    /// instance count, uptime %, memory count. Successor to the simple
-    /// Gallery view.
+    /// Agent manager — card grid with per-agent data (seed, uptime, etc.).
     AgentsManager,
 }
 
@@ -166,10 +167,10 @@ impl App {
             agent_pref: agent_pref.clone(),
             presence: Presence::new(&agent_pref),
             available_agents: Vec::new(),
-            gallery_selected: 0,
             scene: Scene::new(SceneLayout::Single),
             tick: 0,
             bloom: crate::ui::animation::bloom::BloomState::new(),
+            card_images: HashMap::new(),
             image_picker: None,
             image_protocol: None,
             agent_cards: Vec::new(),
@@ -205,70 +206,29 @@ impl App {
         self.dispatch(TuiEvent::AgentSelected(agent_name.to_string()));
     }
 
-    /// Open the agent gallery — the portrait grid is the way to swap agents.
-    fn open_gallery(&mut self) {
-        if self.available_agents.is_empty() {
-            // Seed defaults so the gallery is never empty on first open.
-            let defaults = ["Annie", "Ani", "JeanLuc", "Eione"];
-            for name in defaults {
-                self.add_available_agent(name.to_string());
-            }
+    /// Populate `agent_cards` and `card_images` from disk. Idempotent —
+    /// run once after the image picker is ready (so Welcome can pull a
+    /// portrait from the cache) and again on entry to the Manager (in
+    /// case agents have changed since startup).
+    async fn ensure_agent_cards_loaded(&mut self) {
+        let cfg = self.config.read().await.clone();
+        let agents = Self::fetch_agent_cards(cfg).await;
+        self.agent_cards = agents;
+        if !self.agent_cards.is_empty() {
+            self.available_agents = self.agent_cards.iter().map(|c| c.name.clone()).collect();
         }
-        self.gallery_selected = self
-            .available_agents
-            .iter()
-            .position(|a| a == &self.agent_pref)
-            .unwrap_or(0);
-        self.current_screen = Screen::Gallery;
-        self.dispatch(TuiEvent::ScreenChanged(Screen::Gallery));
+        self.refresh_card_images();
     }
 
-    fn handle_gallery_key(&mut self, key: crossterm::event::KeyEvent) {
-        if self.available_agents.is_empty() {
-            self.current_screen = Screen::Welcome;
-            return;
+    /// Open the agent manager — shows per-agent cards with seed glyph,
+    /// instance count, uptime, memory count.
+    async fn open_agent_manager(&mut self) {
+        self.ensure_agent_cards_loaded().await;
+        if self.agent_cards.is_empty() {
+            self.available_agents = vec!["Annie".to_string(), "Ani".to_string()];
         }
-        let cols = self.gallery_cols();
-        let n = self.available_agents.len();
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('g') => {
-                self.current_screen = Screen::Welcome;
-                self.dispatch(TuiEvent::ScreenChanged(Screen::Welcome));
-            }
-            KeyCode::Left | KeyCode::Char('h') => {
-                if self.gallery_selected > 0 {
-                    self.gallery_selected -= 1;
-                }
-            }
-            KeyCode::Right | KeyCode::Char('l') => {
-                if self.gallery_selected + 1 < n {
-                    self.gallery_selected += 1;
-                }
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                if self.gallery_selected >= cols {
-                    self.gallery_selected -= cols;
-                }
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if self.gallery_selected + cols < n {
-                    self.gallery_selected += cols;
-                }
-            }
-            KeyCode::Enter => {
-                let chosen = self.available_agents[self.gallery_selected].clone();
-                self.select_agent(&chosen);
-                self.current_screen = Screen::Welcome;
-                self.dispatch(TuiEvent::ScreenChanged(Screen::Welcome));
-            }
-            _ => {}
-        }
-    }
-
-    fn gallery_cols(&self) -> usize {
-        // Match draw_gallery's column count; safe default of 4 when terminal
-        // dimensions aren't relevant for keyboard navigation correctness.
-        4
+        self.current_screen = Screen::AgentsManager;
+        self.dispatch(TuiEvent::ScreenChanged(Screen::AgentsManager));
     }
 
     /// Cycle through available agents for selection (WIP)
@@ -307,6 +267,10 @@ impl App {
         if let Ok(picker) = Picker::from_query_stdio() {
             tracing::info!(protocol = ?picker.protocol_type(), "image picker initialized");
             self.image_picker = Some(picker);
+            // Eagerly load every agent's portrait into the stateful card-image
+            // cache. Welcome looks up by current agent name; the Manager pulls
+            // all of them. One load per session, re-encoded per render area.
+            self.ensure_agent_cards_loaded().await;
         } else {
             tracing::info!("no image protocol detected — using halfblocks");
         }
@@ -430,17 +394,8 @@ impl App {
                         self.current_screen = Screen::Presence;
                         self.dispatch(TuiEvent::ScreenChanged(Screen::Presence));
                     }
-                    KeyCode::Char('g') => {
-                        // Gallery — the avatar IS the doorway to "who am I talking to."
-                        self.open_gallery();
-                    }
                     KeyCode::Char('i') => {
-                        // Inspect — agent manager with per-agent cards.
-                        let cfg = self.config.read().await.clone();
-                        let agents = Self::fetch_agent_cards(cfg).await;
-                        self.agent_cards = agents;
-                        self.current_screen = Screen::AgentsManager;
-                        self.dispatch(TuiEvent::ScreenChanged(Screen::AgentsManager));
+                        self.open_agent_manager().await;
                     }
                     _ => {}
                 }
@@ -450,7 +405,6 @@ impl App {
                 self.current_screen = Screen::Welcome;
                 self.dispatch(TuiEvent::ScreenChanged(Screen::Welcome));
             }
-            Screen::Gallery => self.handle_gallery_key(key),
             Screen::Chat => self.handle_chat_key(key).await,
             Screen::Cron => self.handle_schedules_key(key),
             Screen::AgentsManager => match key.code {
@@ -628,30 +582,36 @@ impl App {
         // Normal chat key handling.
         match key.code {
             KeyCode::Esc => {
-                self.current_screen = Screen::Welcome;
+                // Esc during a turn → interrupt the agent (substrate signal,
+                // not a hard kill — current tool completes, partial text is
+                // preserved with *[interrupted]*). Esc when idle → back to
+                // Welcome as before.
+                if chat.busy {
+                    chat.interrupt();
+                } else {
+                    self.current_screen = Screen::Welcome;
+                }
             }
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                if !chat.busy && chat.input.len() < 8_192 {
+                if chat.input.len() < 8_192 {
                     chat.input.push('\n');
                     chat.update_completion();
                 }
             }
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if !chat.busy && chat.input.len() < 8_192 {
+                if chat.input.len() < 8_192 {
                     chat.input.push('\n');
                     chat.update_completion();
                 }
             }
             KeyCode::Enter => {
-                if !chat.busy {
-                    chat.submit();
-                }
+                // Submit always — when busy, this becomes an interjection
+                // (queued and prepended to the agent's next LLM round).
+                chat.submit();
             }
             KeyCode::Backspace => {
-                if !chat.busy {
-                    chat.input.pop();
-                    chat.update_completion();
-                }
+                chat.input.pop();
+                chat.update_completion();
             }
             KeyCode::Up => {
                 chat.scroll = chat.scroll.saturating_add(1);
@@ -672,7 +632,7 @@ impl App {
                 self.should_quit = true;
             }
             KeyCode::Char(c) => {
-                if !chat.busy && chat.input.len() < 8_192 {
+                if chat.input.len() < 8_192 {
                     chat.input.push(c);
                     chat.update_completion();
                 }
@@ -869,16 +829,12 @@ impl App {
         });
     }
 
-    /// Load a terminal-image protocol for the current agent's portrait photo.
-    /// The half-block portrait still loads independently as fallback.
-    fn load_image_protocol_from_memfs(&mut self, memfs_root: &std::path::Path) {
+    /// Load a terminal-image protocol from a direct file path. The half-block
+    /// portrait still loads independently as fallback. Shared between startup
+    /// eager-load and dashboard refresh.
+    fn load_image_protocol(&mut self, path: &std::path::Path) {
         let Some(picker) = self.image_picker.as_ref() else { return };
-        let candidates = ["portrait.png", "portrait.jpg", "portrait.jpeg"];
-        let path = candidates.iter()
-            .map(|s| memfs_root.join("assets").join(s))
-            .find(|p| p.exists());
-        let Some(path) = path else { return };
-        let dyn_img = match image::ImageReader::open(&path) {
+        let dyn_img = match image::ImageReader::open(path) {
             Ok(reader) => match reader.decode() {
                 Ok(img) => img,
                 Err(e) => { tracing::warn!(path = %path.display(), error = %e, "image protocol decode failed"); return; }
@@ -897,6 +853,79 @@ impl App {
         }
     }
 
+    /// Convenience wrapper: find the first existing portrait in
+    /// `<memfs_root>/assets/` and load it as a terminal image protocol.
+    fn load_image_protocol_from_memfs(&mut self, memfs_root: &std::path::Path) {
+        let path = ["portrait.png", "portrait.jpg", "portrait.jpeg"]
+            .iter().map(|s| memfs_root.join("assets").join(s))
+            .find(|p| p.exists());
+        if let Some(path) = path {
+            self.load_image_protocol(&path);
+        }
+    }
+
+    /// Resolve an agent's portrait file under `~/.souveraine/agents/{id}/memory/assets/`.
+    /// Returns the first existing path among png/jpg/jpeg variants.
+    fn agent_portrait_path(agent_id: &str) -> Option<std::path::PathBuf> {
+        let base = dirs::home_dir()?
+            .join(".souveraine")
+            .join("agents")
+            .join(agent_id)
+            .join("memory")
+            .join("assets");
+        ["portrait.png", "portrait.jpg", "portrait.jpeg"]
+            .iter()
+            .map(|s| base.join(s))
+            .find(|p| p.exists())
+    }
+
+    /// Build a `StatefulProtocol` for a given agent and insert it into
+    /// `card_images`. Stateful protocols are used here (not the eager
+    /// `Protocol` used on Welcome) because each card lives in a different
+    /// rect — the protocol re-encodes itself for whatever area the
+    /// `StatefulImage` widget is rendered into, so a single load works
+    /// across resizes and grid reflows.
+    fn load_card_image(&mut self, agent_id: &str, path: &std::path::Path) {
+        let Some(picker) = self.image_picker.as_ref() else { return };
+        let dyn_img = match image::ImageReader::open(path) {
+            Ok(reader) => match reader.decode() {
+                Ok(img) => img,
+                Err(e) => { tracing::warn!(path = %path.display(), error = %e, "card image decode failed"); return; }
+            },
+            Err(e) => { tracing::warn!(path = %path.display(), error = %e, "card image open failed"); return; }
+        };
+        let proto = picker.new_resize_protocol(dyn_img);
+        tracing::info!(agent = %agent_id, path = %path.display(), "card image loaded");
+        self.card_images.insert(agent_id.to_string(), proto);
+    }
+
+    /// Refresh the card-image cache to match `agent_cards`. Loads any
+    /// missing portraits and drops entries for agents no longer present.
+    fn refresh_card_images(&mut self) {
+        let ids: Vec<(String, Option<std::path::PathBuf>)> = self.agent_cards
+            .iter()
+            .map(|c| (c.id.clone(), Self::agent_portrait_path(&c.id)))
+            .collect();
+        let valid: std::collections::HashSet<String> = ids.iter().map(|(id, _)| id.clone()).collect();
+        self.card_images.retain(|k, _| valid.contains(k));
+        for (id, path) in ids {
+            if self.card_images.contains_key(&id) { continue; }
+            if let Some(path) = path {
+                self.load_card_image(&id, &path);
+            }
+        }
+    }
+
+    /// Return the agent id (memfs dir name) whose name matches `name`,
+    /// scanning the on-disk agent inventory. Used so Welcome can pull
+    /// the active agent's portrait out of `card_images` without needing
+    /// the DB layer to round-trip name → id.
+    fn agent_id_by_name(&self, name: &str) -> Option<String> {
+        self.agent_cards.iter()
+            .find(|c| c.name.eq_ignore_ascii_case(name))
+            .map(|c| c.id.clone())
+    }
+
     fn draw(&mut self, frame: &mut Frame) {
         let area = frame.size();
         let layout = match self.current_screen {
@@ -910,7 +939,7 @@ impl App {
 
         match self.current_screen {
             Screen::Splash => self.draw_splash(frame),
-            Screen::Welcome => self.draw_welcome(frame),
+            Screen::Welcome => self.draw_welcome_mut(frame),
             Screen::Dashboard => self.draw_dashboard(frame),
             Screen::Chat => {
                 if let Some(chat) = self.chat.as_ref() {
@@ -927,8 +956,7 @@ impl App {
                 }
             }
             Screen::Presence => self.draw_presence_mode(frame),
-            Screen::Gallery => self.draw_gallery(frame),
-            Screen::AgentsManager => self.draw_agent_cards(frame),
+            Screen::AgentsManager => self.draw_agent_cards_mut(frame),
             _ => self.draw_placeholder(frame),
         }
 
@@ -1073,7 +1101,7 @@ impl App {
         frame.render_widget(bar, bar_area);
     }
 
-    fn draw_welcome(&self, frame: &mut Frame) {
+    fn draw_welcome_mut(&mut self, frame: &mut Frame) {
         use crate::ui::portrait;
 
         let area = frame.size();
@@ -1152,18 +1180,30 @@ impl App {
                 width: portrait_w_cells,
                 height: portrait_h_cells,
             };
-            portrait::render_scaled(
-                frame.buffer_mut(),
-                portrait_area,
-                &self.presence,
-                WELCOME_SCALE,
-            );
-            // When a terminal-image protocol is loaded, overlay the real
-            // photo on the same area. The half-block portrait is always
-            // rendered first as background so terminals without kitty/sixel
-            // show the expected pixel-art silhouette.
-            if let Some(proto) = &self.image_protocol {
-                frame.render_widget(Image::new(proto), portrait_area);
+            // Look up the current agent's portrait in the stateful card-image
+            // cache and render it scale-to-fit. Falls back to the half-block
+            // silhouette when no portrait file exists (or no terminal image
+            // protocol is available).
+            let active_id = self.agent_id_by_name(&self.presence.name)
+                .or_else(|| self.agent_id_by_name(&self.agent_pref));
+            let rendered_photo = active_id
+                .as_ref()
+                .and_then(|id| self.card_images.get_mut(id))
+                .map(|proto| {
+                    frame.render_stateful_widget(
+                        StatefulImage::default().resize(Resize::Fit(None)),
+                        portrait_area,
+                        proto,
+                    );
+                })
+                .is_some();
+            if !rendered_photo {
+                portrait::render_scaled(
+                    frame.buffer_mut(),
+                    portrait_area,
+                    &self.presence,
+                    WELCOME_SCALE,
+                );
             }
 
             let name_area = Rect {
@@ -1242,7 +1282,7 @@ impl App {
             frame.render_widget(err_para, row);
         }
 
-        let footer = Paragraph::new("↑↓ Navigate • Enter • a Add • g Gallery • i Inspect • p Presence • q Quit")
+        let footer = Paragraph::new("↑↓ Navigate • Enter • a Add • i Inspect • p Presence • q Quit")
             .style(Style::default().fg(Color::DarkGray))
             .alignment(Alignment::Center);
         frame.render_widget(footer, chunks[4]);
@@ -1359,119 +1399,6 @@ impl App {
         frame.render_widget(content, area);
     }
 
-    /// Gallery — the portrait grid is the way to swap agents.
-    /// 4-column grid of portrait cards; cursor highlights with a bright border.
-    /// For C3 every card shows Annie's portrait (per-agent portraits land in C4
-    /// when image-protocol PNGs arrive from `assets/`).
-    fn draw_gallery(&self, frame: &mut Frame) {
-        use crate::ui::portrait;
-
-        let area = frame.size();
-        let bg = Block::default().style(Style::default().bg(Color::Rgb(10, 10, 16)));
-        frame.render_widget(bg, area);
-
-        // Header
-        let header = Paragraph::new(Line::from(vec![
-            Span::styled(
-                "  Annie Composite — Agent Gallery  ",
-                Style::default()
-                    .fg(Color::Rgb(220, 215, 215))
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]))
-        .alignment(Alignment::Center);
-        let header_area = Rect { x: area.x, y: area.y + 1, width: area.width, height: 1 };
-        frame.render_widget(header, header_area);
-
-        if self.available_agents.is_empty() {
-            let empty = Paragraph::new("\n\n(no agents available)")
-                .style(Style::default().fg(Color::DarkGray))
-                .alignment(Alignment::Center);
-            frame.render_widget(empty, area);
-            return;
-        }
-
-        // Grid math: 4 cols, card = portrait card (CARD_W × CARD_H) + 2 row pad.
-        let cols: u16 = self.gallery_cols() as u16;
-        let card_w = portrait::RENDER_W + 2;
-        let card_h = portrait::RENDER_H + 3;
-        let pad_x: u16 = 2;
-        let pad_y: u16 = 1;
-        let total_grid_w = cols * card_w + (cols - 1) * pad_x;
-        let grid_x = area.x + area.width.saturating_sub(total_grid_w) / 2;
-        let grid_y = area.y + 3;
-
-        for (idx, name) in self.available_agents.iter().enumerate() {
-            let row = (idx as u16) / cols;
-            let col = (idx as u16) % cols;
-            let cx = grid_x + col * (card_w + pad_x);
-            let cy = grid_y + row * (card_h + pad_y + 1);
-            if cy + card_h + 1 >= area.y + area.height {
-                break;
-            }
-            let selected = idx == self.gallery_selected;
-            let border_col = if selected {
-                Color::Rgb(120, 220, 230)
-            } else {
-                Color::Rgb(70, 70, 90)
-            };
-
-            let card_area = Rect { x: cx, y: cy, width: card_w, height: card_h };
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(
-                    Style::default()
-                        .fg(border_col)
-                        .add_modifier(if selected { Modifier::BOLD } else { Modifier::DIM }),
-                );
-            frame.render_widget(block, card_area);
-
-            let portrait_area = Rect {
-                x: cx + 1,
-                y: cy + 1,
-                width: portrait::RENDER_W,
-                height: portrait::RENDER_H,
-            };
-            // For C3, all cards use the running Presence (Annie). C4 will load
-            // per-agent portraits from assets/ in each agent's memfs.
-            portrait::render(frame.buffer_mut(), portrait_area, &self.presence);
-
-            let name_area = Rect {
-                x: cx,
-                y: cy + card_h,
-                width: card_w,
-                height: 1,
-            };
-            let primary_marker = if name == &self.agent_pref { "● " } else { "  " };
-            frame.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled(primary_marker, Style::default().fg(Color::Rgb(120, 220, 230))),
-                    Span::styled(
-                        name.clone(),
-                        Style::default()
-                            .fg(if selected { Color::Rgb(220, 215, 215) } else { Color::Gray })
-                            .add_modifier(if selected { Modifier::BOLD } else { Modifier::empty() }),
-                    ),
-                ]))
-                .alignment(Alignment::Center),
-                name_area,
-            );
-        }
-
-        // Footer
-        let footer = Paragraph::new("← → ↑ ↓ navigate • Enter select • Esc cancel")
-            .style(Style::default().fg(Color::Rgb(70, 70, 90)))
-            .alignment(Alignment::Center);
-        let footer_area = Rect {
-            x: area.x,
-            y: area.y + area.height.saturating_sub(2),
-            width: area.width,
-            height: 1,
-        };
-        frame.render_widget(footer, footer_area);
-    }
-
     /// Presence mode — fullscreen Annie. Centered, breathing, no chat input.
     /// Any keypress exits back to Welcome.
     fn draw_presence_mode(&self, frame: &mut Frame) {
@@ -1585,20 +1512,36 @@ impl App {
         cards
     }
 
-    /// Render the agent manager — a scrollable card grid with all the per-agent
-    /// data that the simple Gallery omits: seed glyph, instance count, uptime,
-    /// memory count, description, creation date.
-    fn draw_agent_cards(&self, frame: &mut Frame) {
+    /// Render the agent manager — Letta-style card deck. Each card has:
+    ///   • a status badge (ACTIVE / PRIMARY) in the top-right
+    ///   • a scale-to-fit portrait photo occupying the top ~55% of the card
+    ///   • a dark metadata block below the photo, holding:
+    ///       — seed glyph row + instance count
+    ///       — agent name with `[AGENT]` tag
+    ///       — agent id prefix as a path-style monospace breadcrumb
+    ///       — a stats row (files / uptime / active duration placeholder)
+    ///   • the primary agent gets a cyan accent border and bold weight
+    ///
+    /// Cards without a portrait file fall back to the half-block silhouette
+    /// in the image slot so the grid stays geometrically uniform.
+    ///
+    /// `&mut self` is required because `StatefulImage` re-encodes the
+    /// per-card protocol on each render to match the current cell area.
+    fn draw_agent_cards_mut(&mut self, frame: &mut Frame) {
+        use crate::ui::portrait;
         let area = frame.size();
         let bg = Block::default().style(Style::default().bg(Color::Rgb(10, 10, 16)));
         frame.render_widget(bg, area);
 
+        // ── Header strip ──────────────────────────────────────────────
         let header = Paragraph::new(Line::from(vec![
-            Span::styled("  Agent Manager  ", Style::default()
+            Span::styled("  Agent Manager   ", Style::default()
                 .fg(Color::Rgb(255, 200, 100))
                 .add_modifier(Modifier::BOLD)),
-            Span::styled(format!("{} agents", self.agent_cards.len()),
-                Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} agents  ·  manage, monitor, deploy", self.agent_cards.len()),
+                Style::default().fg(Color::Rgb(120, 120, 140)),
+            ),
         ])).alignment(Alignment::Center);
         let header_area = Rect { x: area.x, y: area.y + 1, width: area.width, height: 1 };
         frame.render_widget(header, header_area);
@@ -1611,59 +1554,224 @@ impl App {
             return;
         }
 
-        // 2-column card grid. Each card is a bordered paragraph.
-        let cols: u16 = 2;
-        let card_w = 48u16.min(area.width / cols - 3);
-        let card_h = 8;
+        // ── Grid math ─────────────────────────────────────────────────
+        // Letta shows 4 cards across; we pick the column count based on
+        // available width so terminals down to ~50 cols still get usable
+        // cards. Each card is taller than wide (portrait-style).
         let pad_x: u16 = 2;
         let pad_y: u16 = 1;
-        let grid_x = area.x + (area.width - (cols * (card_w + pad_x) - pad_x)) / 2;
+        let min_card_w: u16 = 22;
+        let max_card_w: u16 = 32;
+        let n: u16 = self.agent_cards.len() as u16;
+        // Pick cols so card_w ∈ [min, max], preferring more cols on wider screens.
+        let mut cols: u16 = 4;
+        loop {
+            let avail = area.width.saturating_sub((cols + 1) * pad_x);
+            let cw = avail / cols.max(1);
+            if cw >= min_card_w || cols == 1 { break; }
+            cols -= 1;
+        }
+        cols = cols.min(n).max(1);
+        let avail = area.width.saturating_sub((cols + 1) * pad_x);
+        let card_w = (avail / cols).min(max_card_w).max(min_card_w);
+        // Card height: image area (target ~ card_w / 2 + 2, so a 24-wide card
+        // gets 14 image rows) + 6 rows of metadata + 2 rows of border/badge.
+        let image_h: u16 = (card_w / 2 + 3).max(8);
+        let meta_h: u16 = 7;
+        let card_h: u16 = image_h + meta_h + 2; // +2 for top/bottom border
+        let grid_w = cols * card_w + (cols.saturating_sub(1)) * pad_x;
+        let grid_x = area.x + area.width.saturating_sub(grid_w) / 2;
         let grid_y = area.y + 3;
 
-        for (idx, card) in self.agent_cards.iter().enumerate() {
-            let col = (idx as u16) % cols;
-            let row = (idx as u16) / cols;
-            let cx = grid_x + col * (card_w + pad_x);
-            let cy = grid_y + row * (card_h + pad_y);
-            if cy + card_h + 1 >= area.y + area.height { break; }
+        // Snapshot plans first so we can hold `&mut self.card_images` per card
+        // without overlapping the immutable borrow of `self.agent_cards`.
+        struct Plan {
+            card_area: Rect,
+            image_area: Rect,
+            badge_area: Rect,
+            meta_area: Rect,
+            agent_id: String,
+            name: String,
+            glyph: String,
+            pubkey: String,
+            instance_count: i64,
+            uptime_pct: u8,
+            memory_count: usize,
+            is_primary: bool,
+        }
+        let plans: Vec<Plan> = self.agent_cards
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, card)| {
+                let col = (idx as u16) % cols;
+                let row = (idx as u16) / cols;
+                let cx = grid_x + col * (card_w + pad_x);
+                let cy = grid_y + row * (card_h + pad_y);
+                if cy + card_h >= area.y + area.height.saturating_sub(2) {
+                    return None;
+                }
+                let card_area = Rect { x: cx, y: cy, width: card_w, height: card_h };
+                // Inner area inside the rounded border.
+                let inner_w = card_w.saturating_sub(2);
+                let inner_x = cx + 1;
+                let image_y = cy + 1;
+                let image_area = Rect { x: inner_x, y: image_y, width: inner_w, height: image_h };
+                // Badge floats in the top-right corner of the image area,
+                // overlaid as text spans (no separate widget).
+                let badge_w: u16 = 10.min(inner_w);
+                let badge_area = Rect {
+                    x: inner_x + inner_w.saturating_sub(badge_w),
+                    y: image_y,
+                    width: badge_w,
+                    height: 1,
+                };
+                let meta_area = Rect {
+                    x: inner_x,
+                    y: image_y + image_h,
+                    width: inner_w,
+                    height: meta_h,
+                };
+                Some(Plan {
+                    card_area,
+                    image_area,
+                    badge_area,
+                    meta_area,
+                    agent_id: card.id.clone(),
+                    name: card.name.clone(),
+                    glyph: card.glyph.clone(),
+                    pubkey: card.pubkey_prefix.clone(),
+                    instance_count: card.instance_count,
+                    uptime_pct: card.uptime_pct,
+                    memory_count: card.memory_count,
+                    is_primary: card.name.eq_ignore_ascii_case(&self.agent_pref),
+                })
+            })
+            .collect();
 
-            let card_area = Rect { x: cx, y: cy, width: card_w, height: card_h };
+        // ── Render each card ──────────────────────────────────────────
+        for p in plans {
+            let accent = if p.is_primary {
+                Color::Rgb(180, 140, 240) // primary: violet
+            } else if p.instance_count > 0 {
+                Color::Rgb(120, 220, 160) // active: green
+            } else {
+                Color::Rgb(90, 100, 120) // idle: cool grey
+            };
+            let border_color = if p.is_primary {
+                Color::Rgb(180, 140, 240)
+            } else {
+                Color::Rgb(60, 70, 90)
+            };
+
+            // Card background fill (dark blue-grey, lifts the card off the screen).
+            let card_bg = Block::default().style(Style::default().bg(Color::Rgb(16, 18, 28)));
+            frame.render_widget(card_bg, p.card_area);
+
+            // Border.
             let border = Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::Rgb(70, 90, 120)).add_modifier(Modifier::DIM));
-            frame.render_widget(border, card_area);
+                .border_style(
+                    Style::default()
+                        .fg(border_color)
+                        .add_modifier(if p.is_primary { Modifier::BOLD } else { Modifier::DIM }),
+                );
+            frame.render_widget(border, p.card_area);
 
-            let inner = Rect { x: cx + 1, y: cy + 1, width: card_w.saturating_sub(2), height: card_h.saturating_sub(2) };
-            let content = vec![
-                Line::from(vec![
-                    Span::styled(&card.glyph, Style::default().fg(Color::Rgb(120, 200, 220))),
-                    Span::styled(" ", Style::default()),
-                    Span::styled(&card.name, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-                ]),
-                Line::from(Span::styled(
-                    &card.description,
-                    Style::default().fg(Color::DarkGray),
-                )),
+            // Image — scale-to-fit so the whole photo is visible. The
+            // letterbox space inherits the card_bg above, which reads as
+            // a clean dark frame.
+            if let Some(proto) = self.card_images.get_mut(&p.agent_id) {
+                frame.render_stateful_widget(
+                    StatefulImage::default().resize(Resize::Fit(None)),
+                    p.image_area,
+                    proto,
+                );
+            } else {
+                portrait::render(frame.buffer_mut(), p.image_area, &self.presence);
+            }
+
+            // Top-right badge: PRIMARY (with ★) or ACTIVE (with •) or muted.
+            let (badge_text, badge_fg) = if p.is_primary {
+                ("★ PRIMARY ", Color::Rgb(245, 230, 110))
+            } else if p.instance_count > 0 {
+                ("• ACTIVE  ", Color::Rgb(120, 220, 160))
+            } else {
+                (" idle     ", Color::Rgb(120, 120, 140))
+            };
+            let badge_para = Paragraph::new(Line::from(vec![
+                Span::styled(badge_text, Style::default()
+                    .fg(badge_fg)
+                    .bg(Color::Rgb(8, 10, 16))
+                    .add_modifier(Modifier::BOLD)),
+            ])).alignment(Alignment::Right);
+            frame.render_widget(badge_para, p.badge_area);
+
+            // Metadata block — dark inset rows under the photo.
+            let meta_bg = Block::default().style(Style::default().bg(Color::Rgb(12, 14, 22)));
+            frame.render_widget(meta_bg, p.meta_area);
+
+            let instance_label = if p.instance_count == 1 {
+                "1 instance".to_string()
+            } else {
+                format!("{} instances", p.instance_count)
+            };
+            let path = format!("agents/{}", short_id(&p.agent_id));
+
+            // Compose 7 lines into the meta_area:
+            //   0: spacer
+            //   1: glyph row + instance count
+            //   2: name + [AGENT]
+            //   3: path-style id
+            //   4: separator rule
+            //   5: stats (files / uptime / commits placeholder)
+            //   6: action hint
+            let meta_lines = vec![
                 Line::from(""),
                 Line::from(vec![
-                    Span::styled(format!("{}% uptime  ", card.uptime_pct), Style::default().fg(Color::Cyan)),
-                    Span::styled(if card.instance_count == 1 { "1 instance".to_string() } else { format!("{} instances", card.instance_count) }, Style::default().fg(Color::Cyan)),
-                    Span::styled(format!("  {} files", card.memory_count), Style::default().fg(Color::Green)),
+                    Span::styled(format!(" {} ", p.glyph),
+                        Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+                    Span::styled(instance_label,
+                        Style::default().fg(Color::Rgb(150, 160, 180))),
                 ]),
                 Line::from(vec![
-                    Span::styled(format!("key: {}", card.pubkey_prefix),
-                        Style::default().fg(Color::Rgb(100, 100, 120))),
+                    Span::styled(format!(" {} ", p.name),
+                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                    Span::styled("[AGENT]",
+                        Style::default().fg(Color::Rgb(120, 130, 150))
+                            .bg(Color::Rgb(28, 32, 44))),
                 ]),
                 Line::from(vec![
-                    Span::styled(format!("created: {}", card.created),
-                        Style::default().fg(Color::Rgb(80, 80, 100))),
+                    Span::styled(format!(" {} ", path),
+                        Style::default().fg(Color::Rgb(110, 120, 140))),
+                ]),
+                Line::from(Span::styled(
+                    "─".repeat(p.meta_area.width as usize),
+                    Style::default().fg(Color::Rgb(40, 48, 64)),
+                )),
+                Line::from(vec![
+                    Span::styled(" Files  ",
+                        Style::default().fg(Color::Rgb(120, 130, 150))),
+                    Span::styled(format!("{:<5}", p.memory_count),
+                        Style::default().fg(Color::White)),
+                    Span::styled("Uptime  ",
+                        Style::default().fg(Color::Rgb(120, 130, 150))),
+                    Span::styled(format!("{}%", p.uptime_pct),
+                        Style::default().fg(Color::Rgb(120, 220, 160))),
+                ]),
+                Line::from(vec![
+                    Span::styled(" key ",
+                        Style::default().fg(Color::Rgb(90, 100, 120))),
+                    Span::styled(p.pubkey.chars().take(12).collect::<String>(),
+                        Style::default().fg(Color::Rgb(100, 110, 130))),
                 ]),
             ];
-            frame.render_widget(Paragraph::new(content), inner);
+            let meta_para = Paragraph::new(meta_lines);
+            frame.render_widget(meta_para, p.meta_area);
         }
 
-        let footer = Paragraph::new("q quit • Esc back")
+        // ── Footer ────────────────────────────────────────────────────
+        let footer = Paragraph::new("↑↓←→ navigate  •  Enter select  •  Esc back  •  q quit")
             .style(Style::default().fg(Color::DarkGray))
             .alignment(Alignment::Center);
         let footer_area = Rect {
@@ -1701,4 +1809,12 @@ fn recent_commits(repo: &crate::core::memory::MemoryRepo, n: usize) -> anyhow::R
 
 fn short_now() -> String {
     chrono::Utc::now().format("%H:%M").to_string()
+}
+
+/// Trim a UUID-style agent id to a path-friendly short form for the
+/// breadcrumb line in the agent manager. Strips a leading `agent-`
+/// prefix if present, then keeps the first 8 hex chars.
+fn short_id(agent_id: &str) -> String {
+    let trimmed = agent_id.strip_prefix("agent-").unwrap_or(agent_id);
+    trimmed.chars().take(8).collect()
 }

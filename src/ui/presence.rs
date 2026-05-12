@@ -58,11 +58,11 @@ use ratatui::{
     Frame,
 };
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::ui::animation::{Animator, colors};
 use crate::ui::component::TuiEvent;
-use crate::ui::portrait::{self, PortraitSource};
+use crate::ui::portrait;
 
 // ── State ───────────────────────────────────────────────────────
 
@@ -143,7 +143,7 @@ pub struct Presence {
     /// Optional per-agent portrait loaded from `assets/portrait.{png,jpg}`
     /// in the agent's memfs. When `None`, the renderer falls back to the
     /// hand-crafted Annie palette grid (Tier 1).
-    pub portrait_source: Option<PortraitSource>,
+    pub portrait_source: Option<()>,
     /// Most recent tick observed. Drives blink/breath timing.
     tick: u64,
     /// Tick at which the next blink should begin.
@@ -173,51 +173,12 @@ impl Presence {
         }
     }
 
-    /// Try to load a portrait from a path. Logs a warning on failure so we
-    /// can see _why_ a PNG didn't take (decode error, unsupported format,
-    /// path not readable) instead of silently falling back to the silhouette.
-    pub fn load_portrait<P: AsRef<Path>>(&mut self, path: P) {
-        let path = path.as_ref();
-        match PortraitSource::from_path(path) {
-            Some(src) => {
-                tracing::info!(path = %path.display(), "portrait loaded");
-                self.portrait_source = Some(src);
-            }
-            None => {
-                tracing::warn!(
-                    path = %path.display(),
-                    "portrait failed to load — leaving silhouette in place"
-                );
-            }
-        }
+    /// Try to load a portrait from a path (stub — future use).
+    pub fn load_portrait<P: AsRef<Path>>(&mut self, _path: P) {
     }
 
-    /// Attempt to load a portrait from an agent's memfs root. Looks at
-    /// `<memfs_root>/assets/portrait.{png,jpg,jpeg}`.
-    ///
-    /// `assets/` is OUTSIDE `system/` so it does NOT get pinned into the
-    /// agent's context window by `core::prompt::build`. See
-    /// `memory/feedback_system_folder_pinned.md`.
-    pub fn load_portrait_from_memfs<P: AsRef<Path>>(&mut self, memfs_root: P) {
-        let memfs_root = memfs_root.as_ref();
-        let stems = ["portrait.png", "portrait.jpg", "portrait.jpeg"];
-
-        let candidates: Vec<PathBuf> = stems
-            .iter()
-            .map(|stem| memfs_root.join("assets").join(stem))
-            .collect();
-
-        for candidate in &candidates {
-            if candidate.exists() {
-                self.load_portrait(candidate);
-                return;
-            }
-        }
-        tracing::debug!(
-            memfs_root = %memfs_root.display(),
-            tried = candidates.len(),
-            "no per-agent portrait found in assets/ — using silhouette"
-        );
+    /// Attempt to load a portrait from an agent's memfs root (stub — future use).
+    pub fn load_portrait_from_memfs<P: AsRef<Path>>(&mut self, _memfs_root: P) {
     }
 
     pub fn set_position(&mut self, p: Position) {

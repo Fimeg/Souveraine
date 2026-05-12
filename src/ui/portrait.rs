@@ -1,4 +1,5 @@
-//! Annie's half-block portrait — Tier 1 of the Presence visual stack.
+//! Annie's half-block silhouette — the fallback when no terminal image
+//! protocol (kitty/sixel) is available. Also the "presence" overlay card.
 //!
 //! Renders a hand-crafted stylized portrait directly into ratatui's frame
 //! buffer using upper/lower half-block characters (`▀` / `▄` / `█`) so each
@@ -6,9 +7,10 @@
 //! recognizable Annie (twin-tails, cyan filigree, forehead diamond), seven
 //! visible states, no new dependencies.
 //!
-//! Tier 2 (C4) will replace this with full PNG rendering via image protocols
-//! (kitty/sixel) where supported and fall back to this module elsewhere. The
-//! pixel grid lives here as both the Tier 1 art and the fallback art.
+//! The only path for photo portraits is `ratatui-image` (`Image` widget in
+//! `App::image_protocol`), which renders via kitty/sixel and falls back
+//! to unicode halfblocks internally. This module is the *pixel-art fallback*,
+//! not a photo pipeline.
 //!
 //! ## Grid
 //!
@@ -34,8 +36,6 @@
 //! - `c` collar cyan accent
 //! - ` ` (space) skin (V-neck opening)
 
-use std::path::Path;
-
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -43,51 +43,6 @@ use ratatui::{
 };
 
 use crate::ui::presence::{Posture, Presence};
-
-// ── Loaded per-agent portrait (Tier 2 source) ───────────────────
-
-/// Pixel-grid portrait loaded from a PNG/JPEG on disk and downsampled to
-/// `PORTRAIT_W × PORTRAIT_H` colors. When attached to a [`Presence`], the
-/// renderer pulls pixels from here instead of the hand-coded palette grid.
-#[derive(Debug, Clone)]
-pub struct PortraitSource {
-    pixels: Vec<Color>, // PORTRAIT_W * PORTRAIT_H, row-major
-}
-
-impl PortraitSource {
-    /// Sample the pixel at (x, y). Returns None if out of bounds.
-    pub fn at(&self, x: usize, y: usize) -> Option<Color> {
-        self.pixels.get(y * PORTRAIT_W as usize + x).copied()
-    }
-
-    /// Decode an image file (PNG or JPEG), cover-crop to the portrait grid
-    /// dimensions (18×18) preserving aspect ratio, and produce a colored
-    /// pixel array. Returns `None` on any I/O or decode error.
-    pub fn from_path(path: &Path) -> Option<Self> {
-        let img = match image::open(path) {
-            Ok(img) => img,
-            Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "portrait decode failed");
-                return None;
-            }
-        };
-        // Cover-crop: take a center square from the original (no stretch),
-        // then Lanczos3 down to grid size. Single resize pass from full
-        // source resolution gives the smoothest result at 18×18.
-        let (w, h) = (img.width(), img.height());
-        let size = w.min(h);
-        let crop_x = (w - size) / 2;
-        let crop_y = (h - size) / 2;
-        let cropped = img.crop_imm(crop_x, crop_y, size, size);
-        let rgb = cropped.resize_exact(
-            PORTRAIT_W as u32, PORTRAIT_H as u32,
-            image::imageops::FilterType::Lanczos3,
-        ).to_rgb8();
-        let pixels = rgb.pixels().map(|p| Color::Rgb(p[0], p[1], p[2])).collect();
-        Some(Self { pixels })
-    }
-}
-
 
 pub const PORTRAIT_W: u16 = 18;
 pub const PORTRAIT_H: u16 = 18;
@@ -97,17 +52,13 @@ pub const PORTRAIT_H: u16 = 18;
 pub const RENDER_W: u16 = PORTRAIT_W;
 pub const RENDER_H: u16 = PORTRAIT_H / 2;
 
-// ── Base portrait grid — clean silhouette, no face ──────────────
+// ── Base portrait grid — clean silhouette, no face ──────────────────────
 // This is the EMERGENCY default. The hand-crafted "Annie face" version
 // read as a creepy llama (Casey's words), so this is now a faceless
 // silhouette: hair, neck, collar. State animation lives in border color,
 // breath luminance pulse, and posture-driven color modulation — never in
 // per-pixel row swaps at this resolution. True facial animation belongs
 // in a future TTS/STT-integrated system, not in half-blocks.
-//
-// When a `PortraitSource` is loaded (per-agent PNG/JPEG from agent memfs
-// `assets/`), all pixels come from the source and this silhouette is not
-// rendered.
 //
 // Each row must be exactly PORTRAIT_W characters wide. Validated by a test.
 const BASE: [&str; PORTRAIT_H as usize] = [
@@ -131,17 +82,15 @@ const BASE: [&str; PORTRAIT_H as usize] = [
     "..CCCC      CCCC..",
 ];
 
-// ── State-aware pixel lookup ────────────────────────────────────
+// ── State-aware pixel lookup ────────────────────────────────────────────
 
-/// Read a pixel from the base silhouette grid. The default silhouette has no
-/// facial features, so no per-pixel row swaps are needed — state expression
-/// at this resolution lives in border color, breath luminance pulse, and the
-/// posture-driven color modulation in [`color_for`].
+/// Read a pixel from the base silhouette grid. No facial features — state
+/// expression lives in border color, breath, and posture-driven modulation.
 fn pixel_at(x: usize, y: usize, _p: &Presence) -> char {
     BASE[y].as_bytes()[x] as char
 }
 
-// ── Palette ─────────────────────────────────────────────────────
+// ── Palette ─────────────────────────────────────────────────────────────
 
 /// Resolve a pixel key to an RGB color, modulated by posture + breath_phase.
 ///
@@ -190,49 +139,13 @@ fn color_for(key: char, posture: Posture, breath: f32) -> Option<Color> {
     Some(Color::Rgb(mix(r), mix(g), mix(b)))
 }
 
-// ── Render ──────────────────────────────────────────────────────
+// ── Render ──────────────────────────────────────────────────────────────
 
-/// Resolve a single pixel's color: source-when-loaded, modulated by posture
-/// and breath. With no source the silhouette palette grid is used.
+/// Resolve a single pixel's color from the silhouette palette, modulated
+/// by posture and breath.
 fn pixel_color(px: usize, py: usize, p: &Presence, breath: f32) -> Option<Color> {
-    if let Some(source) = p.portrait_source.as_ref() {
-        if let Some(c) = source.at(px, py) {
-            return Some(modulate(c, p.posture, breath));
-        }
-    }
     let key = pixel_at(px, py, p);
     color_for(key, p.posture, breath)
-}
-
-/// Apply posture-driven modulation to a source pixel — desaturate when
-/// straining, dim when yawning, breathe luminance on cyan-leaning hues,
-/// warm-tint on affection. This is how state shows on a loaded portrait
-/// at half-block resolution: across-the-image tone, not per-pixel swaps.
-fn modulate(c: Color, posture: Posture, breath: f32) -> Color {
-    let Color::Rgb(r, g, b) = c else { return c };
-
-    let strained = matches!(posture, Posture::Straining);
-    let yawning = matches!(posture, Posture::Yawning);
-    let warm = matches!(posture, Posture::Affectionate);
-    let processing = matches!(posture, Posture::Processing);
-
-    let avg = ((r as u16 + g as u16 + b as u16) / 3) as f32;
-    let sat = if strained { 0.55 } else { 1.0 };
-    let dim = if yawning { 0.82 } else { 1.0 };
-    // Subtle breath pulse — only on the cyan-leaning pixels so skin stays calm.
-    let cyan_lean = b > r && b > g;
-    let breath_gain = if cyan_lean {
-        1.0 + breath * 0.10 * if processing { 1.6 } else { 1.0 }
-    } else { 1.0 };
-    // Warm tint shifts the red/green channels up a little.
-    let warm_r = if warm { 1.06 } else { 1.0 };
-    let warm_g = if warm { 1.02 } else { 1.0 };
-
-    let mix = |c: u8, warm_chan: f32| {
-        let f = (c as f32 * sat + avg * (1.0 - sat)) * dim * breath_gain * warm_chan;
-        f.clamp(0.0, 255.0) as u8
-    };
-    Color::Rgb(mix(r, warm_r), mix(g, warm_g), mix(b, 1.0))
 }
 
 /// Render the portrait scaled-up by `scale` (1 = native half-block density).
@@ -243,10 +156,6 @@ pub fn render_scaled(buf: &mut Buffer, area: Rect, p: &Presence, scale: u16) {
     let scale = scale.max(1);
     let breath = p.animator.breathe(2500);
 
-    // Each grid pixel is `scale` cells wide and `scale` cells tall after the
-    // half-block density (which already collapses 2 pixels per cell vertically).
-    // To keep the aspect roughly square with scale, we use scale horizontally
-    // and scale/2 (min 1) vertically since terminal cells are taller than wide.
     let cell_w = scale;
     let cell_h = (scale / 2).max(1);
 
@@ -260,13 +169,8 @@ pub fn render_scaled(buf: &mut Buffer, area: Rect, p: &Presence, scale: u16) {
             if col.is_none() { continue; }
             let col = col.unwrap();
 
-            // Each pixel paints a cell_w × cell_h block. Since two pixels
-            // share a terminal row (half-blocks), top pixels use ▀ and bottom
-            // pixels use ▄, but at scale > 1 we just use █ everywhere because
-            // the pixels are already painted as full cells.
             let cx0 = area.x + (px as u16) * cell_w;
-            let cy0 = area.y + ((py / 2) as u16) * cell_h
-                + if py % 2 == 1 { 0 } else { 0 }; // vertical halves merged at scale>1
+            let cy0 = area.y + ((py / 2) as u16) * cell_h;
             for dx in 0..cell_w {
                 for dy in 0..cell_h {
                     let x = cx0 + dx;
@@ -333,7 +237,7 @@ pub fn render(buf: &mut Buffer, area: Rect, p: &Presence) {
     }
 }
 
-// ── Tests ───────────────────────────────────────────────────────
+// ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -363,29 +267,5 @@ mod tests {
     fn color_for_transparent_pixels_returns_none() {
         assert!(color_for('.', Posture::Idle, 0.5).is_none());
         assert!(color_for('?', Posture::Idle, 0.5).is_none());
-    }
-
-    #[test]
-    fn modulate_dims_on_yawn() {
-        let base = Color::Rgb(200, 200, 200);
-        let yawn = modulate(base, Posture::Yawning, 0.5);
-        if let Color::Rgb(r, _, _) = yawn {
-            assert!(r < 200, "yawn should dim luminance; got {}", r);
-        } else {
-            panic!("expected RGB");
-        }
-    }
-
-    #[test]
-    fn modulate_desaturates_on_strain() {
-        let blue = Color::Rgb(60, 60, 220);
-        let strained = modulate(blue, Posture::Straining, 0.5);
-        if let Color::Rgb(r, _, b) = strained {
-            // Strain pulls channels toward the average — blue and red should
-            // be closer together than they started.
-            assert!(b - r < 220 - 60, "strain should desaturate");
-        } else {
-            panic!("expected RGB");
-        }
     }
 }

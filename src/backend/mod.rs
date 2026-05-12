@@ -5,9 +5,21 @@
 //! `LocalBackend` (Stage 4) runs the same engine in-process, for the
 //! "harness still works when the server is gone" case.
 
+use std::sync::{Arc, Mutex};
+
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
+use tokio_util::sync::CancellationToken;
+
+/// Shared queue for mid-turn user interjections. Producer is the
+/// chat input (`ChatState.enqueue_interjection`); consumer is the
+/// backend's turn loop, which drains the queue between LLM rounds
+/// and prepends each entry as a system message so the agent reads
+/// the interruption in her own context. `std::sync::Mutex` is fine
+/// here — the critical section is a single drain and the producer
+/// is synchronous (no `.await` while holding the lock).
+pub type InterjectionQueue = Arc<Mutex<Vec<String>>>;
 
 pub mod local;
 pub mod remote;
@@ -110,4 +122,35 @@ pub trait Backend: Send + Sync {
         conversation_id: &str,
         text: &str,
     ) -> Result<BoxStream<'static, Result<BackendEvent>>>;
+
+    /// Send with a cancellation token. The token is a signal, not enforcement —
+    /// when fired, the backend lets the current tool finish, stops making new
+    /// LLM calls, and commits any partial assistant text with a `*[interrupted]*`
+    /// marker so the agent reads the interrupt in her own history on the next
+    /// turn. Default impl ignores the token (used by RemoteBackend until SSE
+    /// cancellation lands); LocalBackend overrides.
+    async fn send_with_cancel(
+        &self,
+        conversation_id: &str,
+        text: &str,
+        _cancel: CancellationToken,
+    ) -> Result<BoxStream<'static, Result<BackendEvent>>> {
+        self.send(conversation_id, text).await
+    }
+
+    /// Send with both a cancellation token (Esc → interrupt signal) and an
+    /// interjection queue (`/btw` / type-during-busy). The backend drains
+    /// the queue between LLM rounds and prepends each entry as a system
+    /// message so the agent reads the interjection in her own context.
+    /// Default impl ignores the queue (RemoteBackend until SSE backchannel
+    /// lands); LocalBackend overrides to actually consume it.
+    async fn send_with_signals(
+        &self,
+        conversation_id: &str,
+        text: &str,
+        cancel: CancellationToken,
+        _interject: InterjectionQueue,
+    ) -> Result<BoxStream<'static, Result<BackendEvent>>> {
+        self.send_with_cancel(conversation_id, text, cancel).await
+    }
 }

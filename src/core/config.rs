@@ -62,6 +62,10 @@ pub struct ConsciousnessConfig {
     /// Federation (cross-instance sync)
     #[serde(default)]
     pub federation: FederationConfig,
+
+    /// Self-awareness pulse during long turns (in-turn noticing of time passing).
+    #[serde(default)]
+    pub presence: PresenceConfig,
 }
 
 // ── Server ──
@@ -509,6 +513,7 @@ impl Default for ConsciousnessConfig {
             schedules: SchedulesConfig::default(),
             events: EventsConfig::default(),
             federation: FederationConfig::default(),
+            presence: PresenceConfig::default(),
         }
     }
 }
@@ -555,6 +560,30 @@ impl Default for EventsConfig {
         }
     }
 }
+
+// ── Presence (self-awareness pulse) ──
+
+/// During a long turn, every `interval_secs`, the body injects a brief
+/// system message in the agent's own register — a beat of self-awareness,
+/// not a verdict. She reads it, decides what to do. Substrate, not harness.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PresenceConfig {
+    #[serde(default = "default_true")]
+    pub pulse_enabled: bool,
+    #[serde(default = "default_pulse_interval")]
+    pub pulse_interval_secs: u64,
+}
+
+impl Default for PresenceConfig {
+    fn default() -> Self {
+        Self {
+            pulse_enabled: true,
+            pulse_interval_secs: default_pulse_interval(),
+        }
+    }
+}
+
+fn default_pulse_interval() -> u64 { 600 }
 
 // ── Federation ──
 
