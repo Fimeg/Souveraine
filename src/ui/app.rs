@@ -80,6 +80,28 @@ pub enum Screen {
     Presence,
     /// Agent gallery — portrait grid of all available agents, choose one.
     Gallery,
+    /// Agent Repo Manager — richer grid surfacing per-agent SeedID glyph,
+    /// instance count, uptime %, memory count. Successor to the simple
+    /// Gallery view.
+    AgentsManager,
+}
+
+/// Per-agent card data shown in the manager grid. Populated on entry to
+/// the manager screen via `refresh_agent_cards`.
+#[derive(Debug, Clone)]
+pub struct AgentCard {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    /// 4-glyph SeedID badge (`SeedId::glyph()`).
+    pub glyph: String,
+    /// First 8 hex chars of the pubkey, for copy-paste.
+    pub pubkey_prefix: String,
+    pub instance_count: i64,
+    /// Cap at 99 in display per UX spec — humans distrust 100% liveness.
+    pub uptime_pct: u8,
+    pub memory_count: usize,
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, Clone)]
