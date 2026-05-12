@@ -293,7 +293,7 @@ async fn handle_conversation_stream(
             // Update pressure
             let mut session = server.sessions.get_mut(&conversation_id)
                 .ok_or_else(|| anyhow::anyhow!("Session disappeared"))?;
-            let pressure = server.consciousness.calculate_pressure(&session.messages);
+            let pressure = server.consciousness.pressure_for_session(&session).await;
             session.context_pressure = pressure;
             drop(session);
         }

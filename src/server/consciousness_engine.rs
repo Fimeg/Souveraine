@@ -89,7 +89,7 @@ impl ConsciousnessEngine {
         response: &str,
     ) -> anyhow::Result<Vec<ConsciousnessEvent>> {
         let mut events = Vec::new();
-        let pressure = self.calculate_pressure(&session.messages);
+        let pressure = self.pressure_for_session(session).await;
 
         // ── N+25 reflection (placeholder until reflection module lands) ──
         if session.turn_count % 25 == 0 && session.turn_count > 0 {
@@ -461,7 +461,17 @@ Resolve entries: `[YYYY-MM-DD HH:MM] RESOLVED — note`"#;
         Ok(Vec::new())
     }
 
-    pub fn calculate_pressure(&self, messages: &[ConversationMessage]) -> f32 {
+    /// Compute context pressure as tokens-used / context_limit.
+    ///
+    /// `context_limit` comes from the agent's `llm_config.context_window`
+    /// (falls back to model config, then a configured default). The
+    /// Constitution (Article V.3) requires per-model physics — no
+    /// hardcoded 128K here.
+    pub fn calculate_pressure(
+        &self,
+        messages: &[ConversationMessage],
+        context_limit: usize,
+    ) -> f32 {
         let tokens: usize = messages
             .iter()
             .flat_map(|m| &m.blocks)
@@ -471,8 +481,24 @@ Resolve entries: `[YYYY-MM-DD HH:MM] RESOLVED — note`"#;
             })
             .map(|t| self.counter.count(t))
             .sum();
-        let limit = 128_000;
+        let limit = context_limit.max(1);
         (tokens as f32 / limit as f32).min(1.0)
+    }
+
+    /// Async convenience: look up the agent's context_limit from its
+    /// `llm_config.context_window` (falling back to 128K only when the
+    /// agent isn't found), then compute pressure.
+    pub async fn pressure_for_session(
+        &self,
+        session: &crate::server::session_manager::Session,
+    ) -> f32 {
+        let limit = self
+            .agents
+            .get(&session.agent_id)
+            .await
+            .map(|a| a.llm_config.context_window as usize)
+            .unwrap_or(128_000);
+        self.calculate_pressure(&session.messages, limit)
     }
 }
 

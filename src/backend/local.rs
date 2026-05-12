@@ -42,12 +42,12 @@ fn pressure_to_max_tokens(pressure: f32, output_limit: u32) -> Option<u32> {
 
 /// Mirror of `ConsciousnessEngine::calculate_pressure` for the in-loop
 /// BifrostMessage shape, so we can recompute pressure as tool results
-/// accumulate inside a single turn. The 128k limit matches the existing
-/// hardcode in consciousness_engine.rs; per-model context_limit lives in
-/// Constitution V.3 and is still a TODO.
-fn bifrost_pressure(counter: &TokenCounter, messages: &[BifrostMessage]) -> f32 {
+/// accumulate inside a single turn. `context_limit` comes from the
+/// agent's `llm_config.context_window` (Constitution V.3 — per-model
+/// physics, no hardcoded 128K).
+fn bifrost_pressure(counter: &TokenCounter, messages: &[BifrostMessage], context_limit: usize) -> f32 {
     let tokens: usize = messages.iter().map(|m| counter.count(&m.content)).sum();
-    let limit = 128_000;
+    let limit = context_limit.max(1);
     (tokens as f32 / limit as f32).min(1.0)
 }
 
@@ -580,6 +580,7 @@ async fn run_turn(
     let model = agent.llm_config.model.clone();
     let temperature = agent.llm_config.temperature;
     let inter_round_delay = Duration::from_millis(agent.llm_config.inter_round_delay_ms);
+    let context_limit = agent.llm_config.context_window as usize;
 
     // Resolve the model's configured output limit for pressure scaling
     let output_limit = {
@@ -627,7 +628,7 @@ async fn run_turn(
     let counter = TokenCounter::new();
 
     loop {
-        let pressure = bifrost_pressure(&counter, &messages);
+        let pressure = bifrost_pressure(&counter, &messages, context_limit);
         let max_tokens = pressure_to_max_tokens(pressure, output_limit);
         let _ = tx.send(Ok(BackendEvent::ContextPressure(pressure))).await;
 
@@ -831,7 +832,7 @@ async fn run_turn(
     if let Some(mut session) = server.sessions.get_mut(&conversation_id) {
         let pressure = server
             .consciousness
-            .calculate_pressure(&session.messages);
+            .calculate_pressure(&session.messages, context_limit);
         session.context_pressure = pressure;
     }
 
