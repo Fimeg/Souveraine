@@ -34,6 +34,8 @@
 //! - `c` collar cyan accent
 //! - ` ` (space) skin (V-neck opening)
 
+use std::path::Path;
+
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -41,6 +43,51 @@ use ratatui::{
 };
 
 use crate::ui::presence::{Eye, Posture, Presence};
+
+// ── Loaded per-agent portrait (Tier 2 source) ───────────────────
+
+/// Pixel-grid portrait loaded from a PNG/JPEG on disk and downsampled to
+/// `PORTRAIT_W × PORTRAIT_H` colors. When attached to a [`Presence`], the
+/// renderer pulls non-overlay pixels from here instead of the hand-coded
+/// palette grid, while still painting eye/mouth/brow rows from the
+/// state-aware overlays so the seven animation states keep working.
+#[derive(Debug, Clone)]
+pub struct PortraitSource {
+    pub pixels: Vec<Color>, // PORTRAIT_W * PORTRAIT_H, row-major
+}
+
+impl PortraitSource {
+    /// Sample the pixel at `(x, y)` from the source grid. Returns `None` if
+    /// the indices are out of range (caller falls back to the palette grid).
+    pub fn at(&self, x: usize, y: usize) -> Option<Color> {
+        let idx = y * PORTRAIT_W as usize + x;
+        self.pixels.get(idx).copied()
+    }
+
+    /// Decode an image file (PNG or JPEG), resize to portrait grid dims,
+    /// and produce a colored pixel array. Returns `None` on any I/O or
+    /// decode error — the caller falls back to the hand-crafted Annie.
+    pub fn from_path(path: &Path) -> Option<Self> {
+        let img = image::open(path).ok()?;
+        let resized = img.resize_exact(
+            PORTRAIT_W as u32,
+            PORTRAIT_H as u32,
+            image::imageops::FilterType::Lanczos3,
+        );
+        let rgb = resized.to_rgb8();
+        let pixels = rgb
+            .pixels()
+            .map(|p| Color::Rgb(p[0], p[1], p[2]))
+            .collect();
+        Some(Self { pixels })
+    }
+}
+
+/// Rows reserved for state-aware overlays. Pixels in these rows always come
+/// from the hand-crafted palette grid (and color_for) so that blinking, gaze
+/// shifts, mouth changes, and brow furrows keep working regardless of which
+/// portrait source the user loaded.
+const OVERLAY_ROWS: &[usize] = &[6, 7, 10, 11];
 
 pub const PORTRAIT_W: u16 = 18;
 pub const PORTRAIT_H: u16 = 18;
@@ -196,6 +243,23 @@ fn color_for(key: char, posture: Posture, breath: f32) -> Option<Color> {
 
 // ── Render ──────────────────────────────────────────────────────
 
+/// Resolve a single pixel's color, preferring the PortraitSource (if any)
+/// for non-overlay rows and falling back to the palette grid elsewhere.
+fn pixel_color(px: usize, py: usize, p: &Presence, breath: f32) -> Option<Color> {
+    let overlay = OVERLAY_ROWS.contains(&py);
+    // Posture overlays still come from BASE for the affected rows even when a
+    // PortraitSource is loaded — that's how blink / yawn / strain stay visible.
+    if !overlay {
+        if let Some(source) = p.portrait_source.as_ref() {
+            if let Some(c) = source.at(px, py) {
+                return Some(c);
+            }
+        }
+    }
+    let key = pixel_at(px, py, p);
+    color_for(key, p.posture, breath)
+}
+
 /// Render the portrait scaled-up by `scale` (1 = native half-block density).
 /// Each grid pixel becomes a `scale × scale` square. Use this for the
 /// presence-mode fullscreen view. Cells outside `area` are skipped.
@@ -217,8 +281,7 @@ pub fn render_scaled(buf: &mut Buffer, area: Rect, p: &Presence, scale: u16) {
 
     for py in 0..PORTRAIT_H {
         for px in 0..PORTRAIT_W {
-            let key = pixel_at(px as usize, py as usize, p);
-            let col = color_for(key, p.posture, breath);
+            let col = pixel_color(px as usize, py as usize, p, breath);
             if col.is_none() { continue; }
             let col = col.unwrap();
 
@@ -257,11 +320,8 @@ pub fn render(buf: &mut Buffer, area: Rect, p: &Presence) {
             let py_top = (cy * 2) as usize;
             let py_bot = py_top + 1;
 
-            let top_key = pixel_at(px, py_top, p);
-            let bot_key = pixel_at(px, py_bot, p);
-
-            let top_col = color_for(top_key, p.posture, breath);
-            let bot_col = color_for(bot_key, p.posture, breath);
+            let top_col = pixel_color(px, py_top, p, breath);
+            let bot_col = pixel_color(px, py_bot, p, breath);
 
             if top_col.is_none() && bot_col.is_none() {
                 continue;

@@ -58,9 +58,11 @@ use ratatui::{
     Frame,
 };
 
+use std::path::{Path, PathBuf};
+
 use crate::ui::animation::{Animator, colors};
 use crate::ui::component::TuiEvent;
-use crate::ui::portrait;
+use crate::ui::portrait::{self, PortraitSource};
 
 // ── State ───────────────────────────────────────────────────────
 
@@ -137,6 +139,10 @@ pub struct Presence {
     pub position: Position,
     pub visible: bool,
     pub animator: Animator,
+    /// Optional per-agent portrait loaded from `assets/portrait.{png,jpg}`
+    /// in the agent's memfs. When `None`, the renderer falls back to the
+    /// hand-crafted Annie palette grid (Tier 1).
+    pub portrait_source: Option<PortraitSource>,
     /// Most recent tick observed. Drives blink/breath timing.
     tick: u64,
     /// Tick at which the next blink should begin.
@@ -159,9 +165,33 @@ impl Presence {
             position: Position::TopRight,
             visible: true,
             animator: Animator::new(),
+            portrait_source: None,
             tick: 0,
             next_blink_at: 180, // ~3 s at 60 Hz
             blink_until: 0,
+        }
+    }
+
+    /// Try to load a portrait from a path. Silently no-ops on failure.
+    pub fn load_portrait<P: AsRef<Path>>(&mut self, path: P) {
+        if let Some(src) = PortraitSource::from_path(path.as_ref()) {
+            self.portrait_source = Some(src);
+        }
+    }
+
+    /// Attempt to load a portrait from an agent's memfs root. Looks at:
+    /// `<memfs_root>/assets/portrait.png` then `assets/portrait.jpg`.
+    ///
+    /// Crucially, `assets/` is OUTSIDE `system/` — it does NOT get pinned
+    /// into the agent's context window by `core::prompt::build`. See
+    /// `memory/feedback_system_folder_pinned.md`.
+    pub fn load_portrait_from_memfs<P: AsRef<Path>>(&mut self, memfs_root: P) {
+        for stem in &["portrait.png", "portrait.jpg", "portrait.jpeg"] {
+            let candidate: PathBuf = memfs_root.as_ref().join("assets").join(stem);
+            if candidate.exists() {
+                self.load_portrait(&candidate);
+                return;
+            }
         }
     }
 

@@ -771,6 +771,10 @@ impl App {
             }
             // Walk the git log for the recent-activity list.
             self.agent_status.recent_activity = recent_commits(&repo, 8).unwrap_or_default();
+            // Try to load a per-agent portrait from {memfs_root}/assets/.
+            // No-op if the file is absent — Presence falls back to the
+            // hand-crafted Annie grid.
+            self.presence.load_portrait_from_memfs(repo.root());
         } else {
             self.agent_status.recent_activity = vec![
                 format!("[{}] connected via {}", short_now(), mode),
