@@ -173,27 +173,60 @@ impl Presence {
         }
     }
 
-    /// Try to load a portrait from a path. Silently no-ops on failure.
+    /// Try to load a portrait from a path. Logs a warning on failure so we
+    /// can see _why_ a PNG didn't take (decode error, unsupported format,
+    /// path not readable) instead of silently falling back to the silhouette.
     pub fn load_portrait<P: AsRef<Path>>(&mut self, path: P) {
-        if let Some(src) = PortraitSource::from_path(path.as_ref()) {
-            self.portrait_source = Some(src);
+        let path = path.as_ref();
+        match PortraitSource::from_path(path) {
+            Some(src) => {
+                tracing::info!(path = %path.display(), "portrait loaded");
+                self.portrait_source = Some(src);
+            }
+            None => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "portrait failed to load — leaving silhouette in place"
+                );
+            }
         }
     }
 
     /// Attempt to load a portrait from an agent's memfs root. Looks at:
-    /// `<memfs_root>/assets/portrait.png` then `assets/portrait.jpg`.
+    /// `<memfs_root>/assets/portrait.{png,jpg,jpeg}`, then a sibling
+    /// `<memfs_root>/../memory.git/assets/...` because agents created via
+    /// the server inventory live under `memory.git/` rather than `memory/`.
     ///
     /// Crucially, `assets/` is OUTSIDE `system/` — it does NOT get pinned
     /// into the agent's context window by `core::prompt::build`. See
     /// `memory/feedback_system_folder_pinned.md`.
     pub fn load_portrait_from_memfs<P: AsRef<Path>>(&mut self, memfs_root: P) {
-        for stem in &["portrait.png", "portrait.jpg", "portrait.jpeg"] {
-            let candidate: PathBuf = memfs_root.as_ref().join("assets").join(stem);
+        let memfs_root = memfs_root.as_ref();
+        let stems = ["portrait.png", "portrait.jpg", "portrait.jpeg"];
+
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        for stem in &stems {
+            candidates.push(memfs_root.join("assets").join(stem));
+        }
+        // Server-layout fallback: agent root sibling at `memory.git/`.
+        if let Some(parent) = memfs_root.parent() {
+            for stem in &stems {
+                candidates.push(parent.join("memory.git").join("assets").join(stem));
+                candidates.push(parent.join("memory").join("assets").join(stem));
+            }
+        }
+
+        for candidate in &candidates {
             if candidate.exists() {
-                self.load_portrait(&candidate);
+                self.load_portrait(candidate);
                 return;
             }
         }
+        tracing::debug!(
+            memfs_root = %memfs_root.display(),
+            tried = candidates.len(),
+            "no per-agent portrait found in assets/ — using silhouette"
+        );
     }
 
     pub fn set_position(&mut self, p: Position) {

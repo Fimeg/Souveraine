@@ -37,6 +37,9 @@ const USER_BLUE: Color = Color::Rgb(120, 170, 240);
 const ANI_ORANGE: Color = Color::Rgb(255, 140, 66);
 const ANI_DIM: Color = Color::Rgb(180, 120, 80);
 const STATUS_GRAY: Color = Color::Rgb(140, 140, 140);
+const TOOL_CYAN: Color = Color::Rgb(120, 200, 220);
+const TOOL_DIM: Color = Color::Rgb(80, 140, 150);
+const TOOL_ERR: Color = Color::Rgb(220, 110, 110);
 const REFLECTION_LAVENDER: Color = Color::Rgb(180, 160, 220);
 const ARCHIVIST_TEAL: Color = Color::Rgb(120, 190, 180);
 const COMPACTION_AMBER: Color = Color::Rgb(240, 180, 60);
@@ -124,6 +127,24 @@ pub enum ChatMessage {
     Assistant { text: String, ts: Instant, streaming: bool },
     Surfacing { source: String, content: String, priority: String, ts: Instant },
     System { text: String, ts: Instant },
+    /// Tool invocation card — name, arguments, round, plus an attached result
+    /// once it streams back. `expanded` is reserved for click-to-expand (UI
+    /// interactivity lands as part of message-click work).
+    Tool {
+        id: String,
+        name: String,
+        arguments: String,
+        round: u32,
+        result: Option<ToolResultBlock>,
+        ts: Instant,
+        expanded: bool,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolResultBlock {
+    pub output: String,
+    pub is_error: bool,
 }
 
 pub struct ChatState {
@@ -722,6 +743,48 @@ Use Tab to toggle the cockpit pane.";
                         });
                     }
                 }
+                BackendEvent::ToolCall { id, name, arguments, round } => {
+                    // If a streaming assistant block is open, finalize it
+                    // first so the card lands beneath the just-said text.
+                    self.finalize_streaming();
+                    self.cockpit_log.push(CockpitEntry {
+                        kind: CockpitKind::Reflection,
+                        text: format!("→ {} (round {})", name, round),
+                    });
+                    self.messages.push(ChatMessage::Tool {
+                        id,
+                        name,
+                        arguments,
+                        round,
+                        result: None,
+                        ts: Instant::now(),
+                        expanded: false,
+                    });
+                }
+                BackendEvent::ToolResult { id, name: _, output, is_error } => {
+                    // Attach to the matching tool card by id. If we don't
+                    // find one (unusual), append a System line so it's not lost.
+                    let mut bound = false;
+                    for msg in self.messages.iter_mut().rev() {
+                        if let ChatMessage::Tool { id: tid, result, .. } = msg {
+                            if tid == &id && result.is_none() {
+                                *result = Some(ToolResultBlock {
+                                    output: output.clone(),
+                                    is_error,
+                                });
+                                bound = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !bound {
+                        let prefix = if is_error { "[tool error] " } else { "[tool] " };
+                        self.messages.push(ChatMessage::System {
+                            text: format!("{}{}", prefix, output),
+                            ts: Instant::now(),
+                        });
+                    }
+                }
                 BackendEvent::Done => {
                     self.finalize_streaming();
                     self.busy = false;
@@ -939,6 +1002,17 @@ fn draw_messages(f: &mut Frame, state: &ChatState, area: Rect) {
                 )));
                 lines.push(Line::from(""));
             }
+            ChatMessage::Tool { name, arguments, round, result, .. } => {
+                lines.extend(render_tool_card(
+                    name,
+                    arguments,
+                    *round,
+                    result.as_ref(),
+                    max_bubble,
+                    area.width,
+                ));
+                lines.push(Line::from(""));
+            }
         }
     }
 
@@ -1083,6 +1157,95 @@ fn bubble_rendered(
     lines.push(Line::from(Span::styled(bottom, border)));
 
     lines
+}
+
+/// Render a tool invocation card. Header shows `▶ name (round N)`, then
+/// the arguments (truncated/wrapped), then — once a result has streamed
+/// back — a `└─ result` section rendered as markdown so output reads like
+/// code or prose, not a single jammed line. Errors paint the border red.
+fn render_tool_card(
+    name: &str,
+    arguments: &str,
+    round: u32,
+    result: Option<&ToolResultBlock>,
+    max_width: usize,
+    container_width: u16,
+) -> Vec<Line<'static>> {
+    let is_err = result.map(|r| r.is_error).unwrap_or(false);
+    let border_color = if is_err { TOOL_ERR } else { TOOL_CYAN };
+    let dim_color = if is_err { TOOL_ERR } else { TOOL_DIM };
+    let border = Style::default().fg(border_color);
+
+    // Header marker + status glyph: pending=⟳, ok=✓, err=⚠
+    let glyph = match result {
+        None => '⟳',
+        Some(r) if r.is_error => '⚠',
+        Some(_) => '✓',
+    };
+    let title = format!("{} {}  ·  round {}", glyph, name, round);
+
+    // Body: arguments (compact one-line summary), then result if present.
+    let mut body_lines: Vec<Line<'static>> = Vec::new();
+
+    let args_summary = summarize_tool_args(arguments);
+    body_lines.push(Line::from(vec![Span::styled(
+        args_summary,
+        Style::default().fg(dim_color),
+    )]));
+
+    if let Some(r) = result {
+        body_lines.push(Line::from(""));
+        let preview = preview_output(&r.output, 12);
+        let rendered = markdown::render(&preview, if r.is_error { TOOL_ERR } else { ANI_ORANGE });
+        body_lines.extend(rendered);
+        if r.output.lines().count() > 12 {
+            body_lines.push(Line::from(Span::styled(
+                format!("  … ({} more lines)", r.output.lines().count() - 12),
+                Style::default().fg(dim_color).add_modifier(Modifier::ITALIC),
+            )));
+        }
+    }
+
+    bubble_rendered(&title, &body_lines, max_width, border, BubbleAlign::Left, container_width)
+}
+
+/// Compact one-line summary of tool arguments. Keys are kept, long string
+/// values are clipped to 60 chars with an ellipsis. Falls back to the raw
+/// string if parsing fails.
+fn summarize_tool_args(arguments: &str) -> String {
+    let parsed: Result<serde_json::Value, _> = serde_json::from_str(arguments);
+    match parsed {
+        Ok(serde_json::Value::Object(map)) => {
+            let parts: Vec<String> = map
+                .iter()
+                .map(|(k, v)| {
+                    let s = match v {
+                        serde_json::Value::String(s) => clip(s, 60),
+                        other => clip(&other.to_string(), 60),
+                    };
+                    format!("{}: {}", k, s)
+                })
+                .collect();
+            parts.join("  ·  ")
+        }
+        Ok(other) => clip(&other.to_string(), 120),
+        Err(_) => clip(arguments, 120),
+    }
+}
+
+fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// Take the first `n` lines verbatim for in-card preview.
+fn preview_output(s: &str, n: usize) -> String {
+    let lines: Vec<&str> = s.lines().take(n).collect();
+    lines.join("\n")
 }
 
 fn wrap_words(text: &str, width: usize) -> Vec<String> {

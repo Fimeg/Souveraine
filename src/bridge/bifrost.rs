@@ -24,11 +24,97 @@ pub struct BifrostClient {
     retry_policy: RetryPolicy,
 }
 
-/// A message in OpenAI chat format
+/// A message in OpenAI chat format.
+///
+/// For plain user/assistant/system turns, only `role` and `content` are set
+/// and the wire shape matches `{role, content}`. For tool-calling turns the
+/// optional fields engage:
+///
+/// - assistant calling tools: `tool_calls = Some(...)`, `content` usually `""`
+/// - tool result: `role = "tool"`, `tool_call_id = Some(id)`, `name = Some(fn)`
+///
+/// Skipping the empty optionals on the wire keeps unrelated providers happy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: String,
     pub content: String,
+    /// Tool calls emitted by the assistant (OpenAI tool-use schema).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tool_calls: Option<Vec<MessageToolCall>>,
+    /// Links a `role: "tool"` message back to the assistant's call id.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tool_call_id: Option<String>,
+    /// Function name for `role: "tool"` messages (some providers require it).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub name: Option<String>,
+}
+
+impl Message {
+    /// Plain text message — system / user / assistant without tool use.
+    pub fn text(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: content.into(),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    /// Assistant message that called tools. `content` may be empty.
+    pub fn assistant_tool_calls(content: impl Into<String>, calls: Vec<MessageToolCall>) -> Self {
+        Self {
+            role: "assistant".to_string(),
+            content: content.into(),
+            tool_calls: Some(calls),
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    /// Tool-result message bound to a prior assistant tool_call by id.
+    pub fn tool_result(
+        tool_call_id: impl Into<String>,
+        name: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
+        Self {
+            role: "tool".to_string(),
+            content: content.into(),
+            tool_calls: None,
+            tool_call_id: Some(tool_call_id.into()),
+            name: Some(name.into()),
+        }
+    }
+}
+
+/// Tool call emitted by the assistant — serializable in OpenAI shape:
+/// `{id, type: "function", function: {name, arguments: "<json-string>"}}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub tool_type: String,
+    pub function: MessageToolCallFunction,
+}
+
+impl MessageToolCall {
+    pub fn function(id: impl Into<String>, name: impl Into<String>, arguments: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            tool_type: "function".to_string(),
+            function: MessageToolCallFunction {
+                name: name.into(),
+                arguments: arguments.into(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageToolCallFunction {
+    pub name: String,
+    pub arguments: String,
 }
 
 /// A tool definition in OpenAI format
@@ -511,7 +597,7 @@ mod tests {
         let req = ChatCompletionRequest {
             model: "openai/deepseek-v4-pro".to_string(),
             messages: vec![
-                Message { role: "user".to_string(), content: "Hello".to_string() },
+                Message::text("user", "Hello"),
             ],
             stream: None,
             max_tokens: None,

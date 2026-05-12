@@ -66,9 +66,20 @@ impl PortraitSource {
 
     /// Decode an image file (PNG or JPEG), resize to portrait grid dims,
     /// and produce a colored pixel array. Returns `None` on any I/O or
-    /// decode error — the caller falls back to the hand-crafted Annie.
+    /// decode error — but now logs the reason so we can see why a PNG
+    /// didn't take instead of silently falling back to the silhouette.
     pub fn from_path(path: &Path) -> Option<Self> {
-        let img = image::open(path).ok()?;
+        let img = match image::open(path) {
+            Ok(img) => img,
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "portrait decode failed"
+                );
+                return None;
+            }
+        };
         let resized = img.resize_exact(
             PORTRAIT_W as u32,
             PORTRAIT_H as u32,

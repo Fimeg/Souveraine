@@ -150,10 +150,7 @@ impl SubagentRunner for LocalSubagentRunner {
         );
 
         // Initial messages: system prompt + user prompt
-        let mut messages = vec![BifrostMessage {
-            role: "system".to_string(),
-            content: system_prompt,
-        }];
+        let mut messages = vec![BifrostMessage::text("system", system_prompt)];
 
         let mut final_content = String::new();
         let mut tool_round = 0u32;
@@ -170,29 +167,29 @@ impl SubagentRunner for LocalSubagentRunner {
             let progress = tool_round as f32 / max_tool_rounds as f32;
             if !warned_1 && progress >= warning_1_threshold {
                 warned_1 = true;
-                messages.push(BifrostMessage {
-                    role: "system".to_string(),
-                    content: format!(
+                messages.push(BifrostMessage::text(
+                    "system",
+                    format!(
                         "[subagent awareness] I've used {} of {} tool rounds. \
                          My attention is narrowing — I may want to consolidate \
                          my findings and return soon.",
                         tool_round, max_tool_rounds
                     ),
-                });
+                ));
             }
 
             // Warning 2: nearing the limit, this is the last stretch
             if !warned_2 && progress >= warning_2_threshold {
                 warned_2 = true;
-                messages.push(BifrostMessage {
-                    role: "system".to_string(),
-                    content: format!(
+                messages.push(BifrostMessage::text(
+                    "system",
+                    format!(
                         "[subagent awareness] I'm at {} of {} tool rounds. \
                          This is my last chance to produce a final answer \
                          before my fork returns what I have.",
                         tool_round, max_tool_rounds
                     ),
-                });
+                ));
             }
 
             let req = ChatCompletionRequest {
@@ -217,18 +214,22 @@ impl SubagentRunner for LocalSubagentRunner {
 
             tool_round += 1;
 
-            // Add assistant tool-call message
-            let call_text = serde_json::json!({
-                "tool_calls": response.tool_calls.iter().map(|tc| {
-                    serde_json::json!({"id": tc.id, "name": tc.name, "arguments": tc.arguments})
-                }).collect::<Vec<_>>()
-            }).to_string();
-            messages.push(BifrostMessage {
-                role: "assistant".to_string(),
-                content: call_text,
-            });
+            // Add assistant tool-call message (OpenAI tool-use schema, not stringified blob)
+            let calls: Vec<crate::bridge::bifrost::MessageToolCall> = response
+                .tool_calls
+                .iter()
+                .map(|tc| crate::bridge::bifrost::MessageToolCall::function(
+                    tc.id.clone(),
+                    tc.name.clone(),
+                    tc.arguments.to_string(),
+                ))
+                .collect();
+            messages.push(BifrostMessage::assistant_tool_calls(
+                response.content.clone(),
+                calls,
+            ));
 
-            // Execute tools with context
+            // Execute tools with context, bind each result by tool_call_id
             for tc in &response.tool_calls {
                 let input_str = tc.arguments.to_string();
                 let result =
@@ -241,10 +242,7 @@ impl SubagentRunner for LocalSubagentRunner {
                     result.output
                 };
 
-                messages.push(BifrostMessage {
-                    role: "tool".to_string(),
-                    content: output,
-                });
+                messages.push(BifrostMessage::tool_result(&tc.id, &tc.name, output));
             }
 
             // Brief pause between tool rounds to let rate limits cool
@@ -651,10 +649,7 @@ async fn run_turn(
                     MessageRole::Assistant => "assistant",
                     MessageRole::Tool => "tool",
                 };
-                BifrostMessage {
-                    role: role.to_string(),
-                    content,
-                }
+                BifrostMessage::text(role, content)
             })
             .collect();
         (session.agent_id.clone(), messages)
@@ -772,29 +767,25 @@ async fn run_turn(
         }
 
         tool_round += 1;
+        // Tool execution events are emitted per-call below as
+        // BackendEvent::ToolCall { … } so the TUI can render proper cards
+        // instead of a literal "🔧 Round N — executing: Bash, Memory" text line.
 
-        // Tell the UI we're executing tools
-        let tool_names: Vec<&str> =
-            response.tool_calls.iter().map(|tc| tc.name.as_str()).collect();
-        let announce = format!(
-            "\n🔧 Round {} — executing: {}\n",
-            tool_round,
-            tool_names.join(", ")
-        );
-        let _ = tx
-            .send(Ok(BackendEvent::Token(announce)))
-            .await;
-
-        // Add the assistant's tool-call message to the Bifrost conversation
-        let call_text = serde_json::json!({
-            "tool_calls": response.tool_calls.iter().map(|tc| {
-                serde_json::json!({"id": tc.id, "name": tc.name, "arguments": tc.arguments})
-            }).collect::<Vec<_>>()
-        }).to_string();
-        messages.push(BifrostMessage {
-            role: "assistant".to_string(),
-            content: call_text,
-        });
+        // Add the assistant's tool-call message in proper OpenAI tool-use schema
+        // (not a stringified JSON blob in content — that's what broke turn 2).
+        let calls: Vec<crate::bridge::bifrost::MessageToolCall> = response
+            .tool_calls
+            .iter()
+            .map(|tc| crate::bridge::bifrost::MessageToolCall::function(
+                tc.id.clone(),
+                tc.name.clone(),
+                tc.arguments.to_string(),
+            ))
+            .collect();
+        messages.push(BifrostMessage::assistant_tool_calls(
+            response.content.clone(),
+            calls,
+        ));
 
         // Execute each tool and stream results back — now with per-agent context
         for tc in &response.tool_calls {
@@ -809,17 +800,27 @@ async fn run_turn(
                 result.output
             };
 
-            let status = if result.is_error { "❌" } else { "✅" };
-            let result_line = format!("{} **{}**: {} char(s)\n", status, tc.name, output.len());
+            // Emit structured ToolCall + ToolResult events for the TUI to render
+            // as cards (chat.rs subscribes). The old Token-text path is kept off.
             let _ = tx
-                .send(Ok(BackendEvent::Token(result_line)))
+                .send(Ok(BackendEvent::ToolCall {
+                    id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    arguments: input_str.clone(),
+                    round: tool_round,
+                }))
+                .await;
+            let _ = tx
+                .send(Ok(BackendEvent::ToolResult {
+                    id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    output: output.clone(),
+                    is_error: result.is_error,
+                }))
                 .await;
 
-            // Add tool result to bifrost messages for next loop iteration
-            messages.push(BifrostMessage {
-                role: "tool".to_string(),
-                content: output,
-            });
+            // Bind tool result to its call by id (OpenAI tool-use schema).
+            messages.push(BifrostMessage::tool_result(&tc.id, &tc.name, output));
         }
 
         // Brief pause between tool rounds to let rate limits cool.

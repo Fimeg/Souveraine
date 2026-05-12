@@ -209,10 +209,7 @@ async fn handle_conversation_stream(
             crate::core::session::MessageRole::Tool => "tool",
         };
         
-        crate::bridge::bifrost::Message {
-            role: role.to_string(),
-            content,
-        }
+        crate::bridge::bifrost::Message::text(role, content)
     }).collect();
     drop(session);
 

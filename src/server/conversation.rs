@@ -45,10 +45,7 @@ impl ServerConversation {
                 ContentBlock::Text { text } => Some(text.as_str()),
                 _ => None,
             }).collect::<Vec<_>>().join("\n");
-            BifrostMessage {
-                role: role.to_string(),
-                content,
-            }
+            BifrostMessage::text(role, content)
         }).collect();
 
         // Call Bifrost

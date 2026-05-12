@@ -840,9 +840,10 @@ impl App {
             _ => self.draw_placeholder(frame),
         }
 
-        // Presence overlay on Welcome and Dashboard only — in Chat mode,
-        // the cockpit panel shows agent state in its own register (words).
-        if matches!(self.current_screen, Screen::Welcome | Screen::Dashboard) {
+        // Presence overlay (corner portrait card) on Dashboard only — Welcome
+        // already draws its own centered, scaled portrait inline; doubling it
+        // up just creates a phantom in the corner.
+        if matches!(self.current_screen, Screen::Dashboard) {
             draw_presence_overlay(frame, &self.presence, area);
         }
     }
@@ -990,10 +991,16 @@ impl App {
         frame.render_widget(bg, area);
 
         // Avatar card occupies its own row in the welcome stack — centered,
-        // framed, modest. It IS the "your agent is loaded" indicator. The
-        // menu beneath then reads as actions on that agent.
-        let avatar_card_w: u16 = portrait::RENDER_W + 2;
-        let avatar_card_h: u16 = portrait::RENDER_H + 3;
+        // framed, larger than the corner overlay so Annie reads as the focal
+        // point of the landing screen. The render path uses `render_scaled`
+        // with `WELCOME_SCALE`; cell_w = scale, cell_h = max(scale/2, 1).
+        const WELCOME_SCALE: u16 = 2;
+        let cell_w: u16 = WELCOME_SCALE;
+        let cell_h: u16 = (WELCOME_SCALE / 2).max(1);
+        let portrait_w_cells: u16 = portrait::PORTRAIT_W * cell_w;
+        let portrait_h_cells: u16 = (portrait::PORTRAIT_H / 2) * cell_h;
+        let avatar_card_w: u16 = portrait_w_cells + 2;
+        let avatar_card_h: u16 = portrait_h_cells + 3;
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -1050,14 +1057,19 @@ impl App {
             let portrait_area = Rect {
                 x: card_area.x + 1,
                 y: card_area.y + 1,
-                width: portrait::RENDER_W,
-                height: portrait::RENDER_H,
+                width: portrait_w_cells,
+                height: portrait_h_cells,
             };
-            portrait::render(frame.buffer_mut(), portrait_area, &self.presence);
+            portrait::render_scaled(
+                frame.buffer_mut(),
+                portrait_area,
+                &self.presence,
+                WELCOME_SCALE,
+            );
 
             let name_area = Rect {
                 x: card_area.x + 1,
-                y: card_area.y + 1 + portrait::RENDER_H,
+                y: card_area.y + 1 + portrait_h_cells,
                 width: card_area.width.saturating_sub(2),
                 height: 1,
             };

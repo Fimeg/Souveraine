@@ -64,6 +64,20 @@ pub enum BackendEvent {
     ScheduleActive { name: String },
     /// A scheduled event completed.
     ScheduleComplete { name: String, silent: bool },
+    /// Assistant invoked a tool — UI renders a card with name + args.
+    ToolCall {
+        id: String,
+        name: String,
+        arguments: String,
+        round: u32,
+    },
+    /// Tool execution result — UI attaches it under the matching call card.
+    ToolResult {
+        id: String,
+        name: String,
+        output: String,
+        is_error: bool,
+    },
     /// Stream ended cleanly.
     Done,
 }

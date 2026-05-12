@@ -60,14 +60,8 @@ async fn bifrost_complete(
     let request = ChatCompletionRequest {
         model: model.to_string(),
         messages: vec![
-            Message {
-                role: "system".to_string(),
-                content: system.to_string(),
-            },
-            Message {
-                role: "user".to_string(),
-                content: prompt.to_string(),
-            },
+            Message::text("system", system.to_string()),
+            Message::text("user", prompt.to_string()),
         ],
         temperature: Some(0.3),
         max_tokens: Some(max_tokens),

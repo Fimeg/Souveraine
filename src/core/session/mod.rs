@@ -178,45 +178,57 @@ impl Session {
         Ok(Some(session))
     }
 
-    /// Convert to Bifrost API message format (list of {role, content} maps)
+    /// Convert to Bifrost API message format (list of {role, content} maps).
+    ///
+    /// NOTE: This produces text-only history. Real tool-call rounds are
+    /// handled inline inside the per-turn loop in `backend::local::run_turn`
+    /// (which builds proper assistant/tool messages with tool_call_id
+    /// linkage). This helper is for cross-turn context, where the model
+    /// only sees the assistant's final text — not the in-flight tool calls.
     pub fn to_bifrost_messages(&self) -> Vec<crate::bridge::bifrost::Message> {
         let mut messages = Vec::new();
         for msg in &self.messages {
             for block in &msg.blocks {
                 match block {
                     ContentBlock::Text { text } => {
-                        messages.push(crate::bridge::bifrost::Message {
-                            role: match msg.role {
-                                MessageRole::System => "system".to_string(),
-                                MessageRole::User => "user".to_string(),
-                                MessageRole::Assistant => "assistant".to_string(),
-                                MessageRole::Tool => "tool".to_string(),
-                            },
-                            content: text.clone(),
-                        });
+                        let role = match msg.role {
+                            MessageRole::System => "system",
+                            MessageRole::User => "user",
+                            MessageRole::Assistant => "assistant",
+                            MessageRole::Tool => "tool",
+                        };
+                        messages.push(crate::bridge::bifrost::Message::text(
+                            role,
+                            text.clone(),
+                        ));
                     }
                     ContentBlock::ToolUse { name, input, .. } => {
-                        // Tool calls are encoded as assistant messages with tool content
-                        messages.push(crate::bridge::bifrost::Message {
-                            role: "assistant".to_string(),
-                            content: format!("Tool use: {name}({input})"),
-                        });
+                        // Tool calls flattened into assistant prose for
+                        // cross-turn context — see fn-level note above.
+                        messages.push(crate::bridge::bifrost::Message::text(
+                            "assistant",
+                            format!("Tool use: {name}({input})"),
+                        ));
                     }
                     ContentBlock::ToolResult { tool_name, output, is_error, .. } => {
-                        messages.push(crate::bridge::bifrost::Message {
-                            role: "tool".to_string(),
-                            content: if *is_error {
-                                format!("Error ({tool_name}): {output}")
-                            } else {
-                                format!("Result ({tool_name}): {output}")
-                            },
-                        });
+                        let body = if *is_error {
+                            format!("Error ({tool_name}): {output}")
+                        } else {
+                            format!("Result ({tool_name}): {output}")
+                        };
+                        // Flatten into assistant prose rather than role=tool
+                        // — without a tool_call_id link, role=tool is rejected
+                        // by many providers on the next turn.
+                        messages.push(crate::bridge::bifrost::Message::text(
+                            "assistant",
+                            body,
+                        ));
                     }
                     ContentBlock::Reasoning { reasoning } => {
-                        messages.push(crate::bridge::bifrost::Message {
-                            role: "assistant".to_string(),
-                            content: format!("[Reasoning]: {reasoning}"),
-                        });
+                        messages.push(crate::bridge::bifrost::Message::text(
+                            "assistant",
+                            format!("[Reasoning]: {reasoning}"),
+                        ));
                     }
                 }
             }

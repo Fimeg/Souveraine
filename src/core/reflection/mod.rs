@@ -173,14 +173,8 @@ impl ReflectionEngine {
         );
 
         let mut chat_messages = vec![
-            Message {
-                role: "system".to_string(),
-                content: system_prompt,
-            },
-            Message {
-                role: "user".to_string(),
-                content: user_content,
-            },
+            Message::text("system", system_prompt),
+            Message::text("user", user_content),
         ];
 
         for _round in 0..REFLECTION_MAX_TOOL_ROUNDS {
@@ -227,16 +221,19 @@ impl ReflectionEngine {
                 });
             }
 
-            let call_text = serde_json::json!({
-                "tool_calls": response.tool_calls.iter().map(|tc| {
-                    serde_json::json!({"id": tc.id, "name": tc.name, "arguments": tc.arguments})
-                }).collect::<Vec<_>>()
-            })
-            .to_string();
-            chat_messages.push(Message {
-                role: "assistant".to_string(),
-                content: call_text,
-            });
+            let calls: Vec<crate::bridge::bifrost::MessageToolCall> = response
+                .tool_calls
+                .iter()
+                .map(|tc| crate::bridge::bifrost::MessageToolCall::function(
+                    tc.id.clone(),
+                    tc.name.clone(),
+                    tc.arguments.to_string(),
+                ))
+                .collect();
+            chat_messages.push(Message::assistant_tool_calls(
+                response.content.clone(),
+                calls,
+            ));
 
             for tc in &response.tool_calls {
                 let input_str = tc.arguments.to_string();
@@ -249,10 +246,7 @@ impl ReflectionEngine {
                 } else {
                     result.output
                 };
-                chat_messages.push(Message {
-                    role: "tool".to_string(),
-                    content: output,
-                });
+                chat_messages.push(Message::tool_result(&tc.id, &tc.name, output));
             }
 
             let delay_ms = self

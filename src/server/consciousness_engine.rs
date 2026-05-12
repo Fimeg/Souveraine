@@ -423,14 +423,8 @@ Resolve entries: `[YYYY-MM-DD HH:MM] RESOLVED — note`"#;
 
         // ── Tool loop ─────────────────────────────────────────────────
         let mut messages = vec![
-            Message {
-                role: "system".to_string(),
-                content: system_prompt.to_string(),
-            },
-            Message {
-                role: "user".to_string(),
-                content: user_content,
-            },
+            Message::text("system", system_prompt.to_string()),
+            Message::text("user", user_content),
         ];
 
         for _round in 0..ASTER_MAX_TOOL_ROUNDS {
@@ -468,18 +462,22 @@ Resolve entries: `[YYYY-MM-DD HH:MM] RESOLVED — note`"#;
                 return Ok(parse_observations(&content));
             }
 
-            // Add assistant message with tool calls
-            let call_text = serde_json::json!({
-                "tool_calls": response.tool_calls.iter().map(|tc| {
-                    serde_json::json!({"id": tc.id, "name": tc.name, "arguments": tc.arguments})
-                }).collect::<Vec<_>>()
-            }).to_string();
-            messages.push(Message {
-                role: "assistant".to_string(),
-                content: call_text,
-            });
+            // Add assistant message with tool calls (OpenAI tool-use schema)
+            let calls: Vec<crate::bridge::bifrost::MessageToolCall> = response
+                .tool_calls
+                .iter()
+                .map(|tc| crate::bridge::bifrost::MessageToolCall::function(
+                    tc.id.clone(),
+                    tc.name.clone(),
+                    tc.arguments.to_string(),
+                ))
+                .collect();
+            messages.push(Message::assistant_tool_calls(
+                response.content.clone(),
+                calls,
+            ));
 
-            // Execute each tool call
+            // Execute each tool call and bind the result by tool_call_id
             for tc in &response.tool_calls {
                 let input_str = tc.arguments.to_string();
                 let result = crate::core::tools::execute_tool_with_context(
@@ -492,10 +490,7 @@ Resolve entries: `[YYYY-MM-DD HH:MM] RESOLVED — note`"#;
                     result.output
                 };
 
-                messages.push(Message {
-                    role: "tool".to_string(),
-                    content: output,
-                });
+                messages.push(Message::tool_result(&tc.id, &tc.name, output));
             }
 
             // Brief pause between Aster's tool rounds — use the adaptive delay
