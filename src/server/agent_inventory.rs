@@ -7,7 +7,13 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 pub struct AgentInventory {
+    /// Server-managed dir for `agent.json` + `conversations/`.
+    /// Layout: `~/.souveraine/server/agents/{id}/`.
     agents_dir: PathBuf,
+    /// Canonical user-side memfs root. Layout: `~/.souveraine/agents/{id}/memory/`.
+    /// This is the single source of truth for primary-agent memory; the
+    /// previous `{agents_dir}/{id}/memory.git/` duplicate has been retired.
+    memfs_dir: PathBuf,
     subconscious_dir: PathBuf,
     db: SqlitePool,
     cache: DashMap<String, AgentState>,
@@ -16,27 +22,29 @@ pub struct AgentInventory {
 impl AgentInventory {
     pub async fn new(data_dir: PathBuf, db: SqlitePool) -> anyhow::Result<Self> {
         tokio::fs::create_dir_all(&data_dir).await?;
-        // subconscious-agents is a sibling of the server/agents directory:
-        // ~/.souveraine/subconscious-agents/
+        // ~/.souveraine/ — common ancestor of server/, agents/, subconscious-agents/.
         let souveraine_root = data_dir.parent().and_then(|p| p.parent()).map(|p| p.to_path_buf()).unwrap_or_else(|| {
             let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
             home.join(".souveraine")
         });
+        let memfs_dir = souveraine_root.join("agents");
         let subconscious_dir = souveraine_root.join("subconscious-agents");
+        tokio::fs::create_dir_all(&memfs_dir).await?;
         tokio::fs::create_dir_all(&subconscious_dir).await?;
         Ok(Self {
             agents_dir: data_dir,
+            memfs_dir,
             subconscious_dir,
             db,
             cache: DashMap::new(),
         })
     }
 
-    /// Return a [`MemoryRepo`] rooted at the primary agent's existing memory dir
-    /// (`{agents_dir}/{agent_id}/memory.git/`). Used by the consciousness engine
-    /// to write to the same repo that [`Self::create`] initialized.
+    /// Return a [`MemoryRepo`] rooted at the primary agent's canonical user-side
+    /// memfs (`{memfs_dir}/{agent_id}/memory/`). Used by the consciousness
+    /// engine to write to the same repo CLI tools see.
     pub fn memory_repo(&self, agent_id: &str) -> crate::core::memory::MemoryRepo {
-        let root = self.agents_dir.join(agent_id).join("memory.git");
+        let root = self.memfs_dir.join(agent_id).join("memory");
         crate::core::memory::MemoryRepo::open(agent_id, root)
     }
 
@@ -51,7 +59,7 @@ impl AgentInventory {
     /// Return the filesystem path to a primary agent's memory directory.
     /// Used by tool context construction for memory boundary enforcement.
     pub fn memory_root(&self, agent_id: &str) -> PathBuf {
-        self.agents_dir.join(agent_id).join("memory.git")
+        self.memfs_dir.join(agent_id).join("memory")
     }
 
     /// Return the filesystem path to a subconscious agent's memory directory.
@@ -92,17 +100,21 @@ impl AgentInventory {
     pub async fn create(&self, request: CreateAgentRequest) -> anyhow::Result<AgentState> {
         let uuid = Uuid::new_v4().to_string();
         let agent_dir = self.agents_dir.join(&uuid);
+        let memfs = self.memfs_dir.join(&uuid).join("memory");
 
+        // Server-side: agent.json + conversations/ live under agents_dir/{uuid}/.
         tokio::fs::create_dir_all(&agent_dir).await?;
-        tokio::fs::create_dir_all(agent_dir.join("memory.git")).await?;
-        tokio::fs::create_dir_all(agent_dir.join("memory.git").join("system")).await?;
-        tokio::fs::create_dir_all(agent_dir.join("memory.git").join("subconscious")).await?;
-        tokio::fs::create_dir_all(agent_dir.join("memory.git").join("journal")).await?;
-        tokio::fs::create_dir_all(agent_dir.join("memory.git").join("skills")).await?;
-        tokio::fs::create_dir_all(agent_dir.join("memory.git").join("archive")).await?;
         tokio::fs::create_dir_all(agent_dir.join("conversations")).await?;
 
-        let repo = git2::Repository::init(agent_dir.join("memory.git"))?;
+        // User-side: memfs lives under memfs_dir/{uuid}/memory/ (single canonical path).
+        tokio::fs::create_dir_all(&memfs).await?;
+        tokio::fs::create_dir_all(memfs.join("system")).await?;
+        tokio::fs::create_dir_all(memfs.join("subconscious")).await?;
+        tokio::fs::create_dir_all(memfs.join("journal")).await?;
+        tokio::fs::create_dir_all(memfs.join("skills")).await?;
+        tokio::fs::create_dir_all(memfs.join("archive")).await?;
+
+        let repo = git2::Repository::init(&memfs)?;
         drop(repo);
 
         let mut blocks = request.memory_blocks;
@@ -115,7 +127,7 @@ impl AgentInventory {
         }
 
         for block in &blocks {
-            let path = agent_dir.join("memory.git").join("system").join(format!("{}.md", block.label));
+            let path = memfs.join("system").join(format!("{}.md", block.label));
             tokio::fs::write(&path, &block.value).await?;
         }
 
@@ -240,9 +252,9 @@ impl AgentInventory {
         }
         if let Some(blocks) = updates.memory_blocks {
             for block in blocks {
-                let path = self.agents_dir
+                let path = self.memfs_dir
                     .join(agent_id)
-                    .join("memory.git")
+                    .join("memory")
                     .join("system")
                     .join(format!("{}.md", block.label));
                 tokio::fs::write(&path, &block.value).await?;
@@ -275,7 +287,9 @@ impl AgentInventory {
 
     pub async fn delete(&self, agent_id: &str) -> anyhow::Result<()> {
         let agent_dir = self.agents_dir.join(agent_id);
+        let memfs_root = self.memfs_dir.join(agent_id);
         tokio::fs::remove_dir_all(&agent_dir).await.ok();
+        tokio::fs::remove_dir_all(&memfs_root).await.ok();
 
         sqlx::query("DELETE FROM agents WHERE id = ?1")
             .bind(agent_id)
@@ -287,7 +301,7 @@ impl AgentInventory {
     }
 
     async fn commit(&self, agent_id: &str, message: &str) -> anyhow::Result<()> {
-        let repo_path = self.agents_dir.join(agent_id).join("memory.git").clone();
+        let repo_path = self.memfs_dir.join(agent_id).join("memory").clone();
         let msg = message.to_string();
 
         tokio::task::spawn_blocking(move || {
@@ -323,7 +337,7 @@ impl AgentInventory {
     }
 
     async fn load_memory_blocks(&self, agent_id: &str) -> anyhow::Result<Vec<MemoryBlock>> {
-        let system_dir = self.agents_dir.join(agent_id).join("memory.git").join("system");
+        let system_dir = self.memfs_dir.join(agent_id).join("memory").join("system");
         let mut blocks = Vec::new();
 
         let mut entries = tokio::fs::read_dir(&system_dir).await?;

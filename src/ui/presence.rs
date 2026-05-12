@@ -192,29 +192,20 @@ impl Presence {
         }
     }
 
-    /// Attempt to load a portrait from an agent's memfs root. Looks at:
-    /// `<memfs_root>/assets/portrait.{png,jpg,jpeg}`, then a sibling
-    /// `<memfs_root>/../memory.git/assets/...` because agents created via
-    /// the server inventory live under `memory.git/` rather than `memory/`.
+    /// Attempt to load a portrait from an agent's memfs root. Looks at
+    /// `<memfs_root>/assets/portrait.{png,jpg,jpeg}`.
     ///
-    /// Crucially, `assets/` is OUTSIDE `system/` — it does NOT get pinned
-    /// into the agent's context window by `core::prompt::build`. See
+    /// `assets/` is OUTSIDE `system/` so it does NOT get pinned into the
+    /// agent's context window by `core::prompt::build`. See
     /// `memory/feedback_system_folder_pinned.md`.
     pub fn load_portrait_from_memfs<P: AsRef<Path>>(&mut self, memfs_root: P) {
         let memfs_root = memfs_root.as_ref();
         let stems = ["portrait.png", "portrait.jpg", "portrait.jpeg"];
 
-        let mut candidates: Vec<PathBuf> = Vec::new();
-        for stem in &stems {
-            candidates.push(memfs_root.join("assets").join(stem));
-        }
-        // Server-layout fallback: agent root sibling at `memory.git/`.
-        if let Some(parent) = memfs_root.parent() {
-            for stem in &stems {
-                candidates.push(parent.join("memory.git").join("assets").join(stem));
-                candidates.push(parent.join("memory").join("assets").join(stem));
-            }
-        }
+        let candidates: Vec<PathBuf> = stems
+            .iter()
+            .map(|stem| memfs_root.join("assets").join(stem))
+            .collect();
 
         for candidate in &candidates {
             if candidate.exists() {
