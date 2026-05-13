@@ -461,6 +461,11 @@ impl Backend for LocalBackend {
         Ok(conv_id)
     }
 
+    async fn fork_conversation(&self, _agent_id: &str, source_conversation_id: &str) -> Result<String> {
+        let forked_id = self.server.sessions.fork(source_conversation_id)?;
+        Ok(forked_id)
+    }
+
     async fn list_conversations(&self, agent_id: &str) -> Result<Vec<ConversationInfo>> {
         let store = match self.server.sessions.conversation_store_for(agent_id) {
             Some(s) => s,
@@ -843,6 +848,26 @@ async fn run_turn(
                 let _ = tx.send(Ok(BackendEvent::Token(note.to_string()))).await;
             }
 
+            // Drain any interjections that arrived during this LLM call.
+            // If there are any, commit them as user messages and continue
+            // the loop so the agent responds in the same turn.
+            let interjected: Vec<String> = interject
+                .lock()
+                .ok()
+                .map(|mut q| q.drain(..).collect())
+                .unwrap_or_default();
+
+            if !interjected.is_empty() {
+                for text in &interjected {
+                    let stamp = chrono::Local::now().format("%H:%M");
+                    let note = format!("[interjected at {} — {}]", stamp, text.trim());
+                    messages.push(BifrostMessage::text("user", note));
+                }
+                // Continue the loop — agent sees the interjection as a
+                // user message and will respond in the next LLM round.
+                continue;
+            }
+
             // Stream the final content in chunks, watching the cancel token.
             // If Esc fires mid-stream, the agent's partial text is preserved
             // (the chunks already sent are in the user's history) and an
@@ -948,7 +973,6 @@ async fn run_turn(
         // Continue loop — model will see tool results and respond
     }
 
-    // ── Post-turn processing ───────────────────────────────────
     // If the user pressed Esc, commit the partial text with a marker the
     // agent will read on her next turn. The interrupt is a signal in her
     // own context — same shape as a pressure warning, not a hidden harness

@@ -1,10 +1,12 @@
 pub mod animation;
 pub mod app;
+pub mod atmosphere;
 pub mod chat;
 pub mod cockpit_panel;
 pub mod color_support;
 pub mod component;
 pub mod markdown;
+pub mod expressions;
 pub mod portrait;
 pub mod presence;
 pub mod schedules;

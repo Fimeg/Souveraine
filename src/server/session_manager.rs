@@ -225,4 +225,51 @@ impl SessionManager {
     pub fn conversation_store_for(&self, agent_id: &str) -> Option<ConversationStore> {
         self.store.as_ref().map(|h| h.store_for(agent_id))
     }
+
+    /// Fork an existing conversation — clone all messages into a new session
+    /// with a fresh conversation_id. Returns the new conversation_id.
+    /// Used by `/btw` to spin off a side-quest conversation in parallel.
+    pub fn fork(&self, conversation_id: &str) -> anyhow::Result<String> {
+        let source = self
+            .sessions
+            .get(conversation_id)
+            .ok_or_else(|| anyhow::anyhow!("Session not found: {}", conversation_id))?;
+
+        let agent_id = source.agent_id.clone();
+        let mut messages = source.messages.clone();
+        drop(source); // release the DashMap ref
+
+        let forked_id = Uuid::new_v4().to_string();
+        let (sender, _receiver) = broadcast::channel(100);
+
+        let session = Session {
+            conversation_id: forked_id.clone(),
+            agent_id: agent_id.clone(),
+            messages,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            turn_count: 0,
+            last_n25: Utc::now(),
+            context_pressure: 0.0,
+            event_sender: sender,
+        };
+
+        self.sessions.insert(forked_id.clone(), session);
+        self.agent_conversations
+            .entry(agent_id.clone())
+            .or_insert_with(Vec::new)
+            .push(forked_id.clone());
+
+        if let Some(handle) = &self.store {
+            let record = ConversationRecord::new(forked_id.clone(), agent_id.clone());
+            let store = handle.store_for(&agent_id);
+            tokio::spawn(async move {
+                if let Err(e) = store.save_metadata(&record).await {
+                    tracing::warn!("Failed to persist forked conversation metadata: {}", e);
+                }
+            });
+        }
+
+        Ok(forked_id)
+    }
 }

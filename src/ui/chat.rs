@@ -15,7 +15,7 @@
 
 use std::cell::RefCell;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use futures::StreamExt;
@@ -27,6 +27,15 @@ use ratatui::{
     Frame,
 };
 use tokio::sync::{mpsc, oneshot, RwLock};
+
+/// Event from the /btw fork background task.
+#[derive(Debug, Clone)]
+enum BtwForkEvent {
+    Forked { id: String },
+    Token(String),
+    Done,
+    Error(String),
+}
 use tokio_util::sync::CancellationToken;
 
 use crate::backend::{Backend, BackendEvent};
@@ -47,6 +56,11 @@ const ARCHIVIST_TEAL: Color = Color::Rgb(120, 190, 180);
 const COMPACTION_AMBER: Color = Color::Rgb(240, 180, 60);
 const COMPACTION_RED: Color = Color::Rgb(220, 90, 80);
 const STRAIN_CRIMSON: Color = Color::Rgb(200, 80, 100);
+
+/// If no BackendEvent arrives for this long while `busy`, we assume the
+/// backend has silently hung (provider crash, channel leak, race) and
+/// reset the turn state so the UI doesn't show "Streaming" indefinitely.
+const STALE_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ─── Cockpit entry ─────────────────────────────────────────────────────
 
@@ -229,6 +243,10 @@ pub struct ChatState {
     pub tick: u64,
     /// When the current turn started (for spinner animation).
     pub turn_started: Option<Instant>,
+    /// When the last BackendEvent arrived. Compared against `STALE_TIMEOUT`
+    /// in `drain_events` to detect silent hangs — the backend channel stays
+    /// open but no events arrive (e.g. provider crash mid-turn).
+    last_event_at: Instant,
     /// Receiver for `/model` listing results from async Bifrost call.
     pub model_rx: Option<oneshot::Receiver<String>>,
     /// Consciousness events (surfacing, reflection, archivist) since last drain.
@@ -240,6 +258,23 @@ pub struct ChatState {
     pub convos_rx: Option<oneshot::Receiver<Result<Vec<crate::backend::ConversationInfo>>>>,
     /// Pending conversation switch result (conv_id, messages).
     pub switch_rx: Option<oneshot::Receiver<Result<(String, Vec<crate::core::session::ConversationMessage>)>>>,
+    /// `/btw` fork state — an ephemeral side-quest conversation running
+    /// in parallel to the main chat. Rendered as a floating bordered pane.
+    pub btw_state: BtwState,
+    /// Receiver for /btw fork stream results (token deltas).
+    pub btw_rx: Option<mpsc::Receiver<BtwForkEvent>>,
+}
+
+/// Ephemeral /btw fork state. Mirrors Letta's BtwPane — a forked conversation
+/// streams its response into a floating pane alongside the main transcript.
+/// User can jump to the fork ([j]) or dismiss ([esc]).
+#[derive(Debug, Clone)]
+pub enum BtwState {
+    Idle,
+    Forking { question: String },
+    Streaming { question: String, response_so_far: String },
+    Complete { question: String, response: String, forked_id: String },
+    Error { question: String, error: String },
 }
 
 impl ChatState {
@@ -297,11 +332,14 @@ impl ChatState {
             cockpit_log: Vec::new(),
             tick: 0,
             turn_started: None,
+            last_event_at: Instant::now(),
             model_rx: None,
             pending_consciousness: Vec::new(),
             new_conv_rx: None,
             convos_rx: None,
             switch_rx: None,
+            btw_state: BtwState::Idle,
+            btw_rx: None,
         })
     }
 
@@ -338,12 +376,14 @@ Use Tab to toggle the cockpit pane.";
         let trimmed = self.input.trim().to_string();
         self.input.clear();
 
-        // /btw <text> — explicit interjection. Same path as "type during
-        // busy", just with an unambiguous prefix.
+        // /btw <text> — fork the conversation into a side-quest.
+        // The main chat is untouched; the forked conversation streams
+        // its response into an ephemeral BtwPane. User can [j]ump or
+        // [esc] dismiss.
         if let Some(rest) = trimmed.strip_prefix("/btw ") {
-            let text = rest.trim();
-            if !text.is_empty() {
-                self.enqueue_interjection(text.to_string());
+            let question = rest.trim().to_string();
+            if !question.is_empty() && !self.btw_active() {
+                self.start_btw_fork(question);
             }
             return true;
         }
@@ -653,6 +693,9 @@ Use Tab to toggle the cockpit pane.";
         // delivered (dim grey) state.
         self.flush_delivered_interjections();
 
+        // Drain /btw fork stream events.
+        self.drain_btw();
+
         // Check for /model listing result
         if let Some(rx) = self.model_rx.as_mut() {
             if let Ok(result) = rx.try_recv() {
@@ -768,6 +811,10 @@ Use Tab to toggle the cockpit pane.";
             }
         } else {
             return;
+        }
+
+        if !drained.is_empty() {
+            self.last_event_at = Instant::now();
         }
 
         for ev in drained {
@@ -918,6 +965,9 @@ Use Tab to toggle the cockpit pane.";
                         });
                     }
                 }
+                BackendEvent::Atmosphere(preset) => {
+                    self.pending_consciousness.push(BackendEvent::Atmosphere(preset));
+                }
                 BackendEvent::Done => {
                     self.finalize_streaming();
                     self.busy = false;
@@ -933,6 +983,24 @@ Use Tab to toggle the cockpit pane.";
 
         if closed {
             self.finalize_streaming();
+            self.busy = false;
+            self.turn_started = None;
+            self.turn_rx = None;
+            self.cancel_token = None;
+            self.phase = TurnPhase::Idle;
+            self.tool_calls_this_turn = 0;
+        }
+
+        // Staleness guard: if the backend channel is open but nothing has
+        // arrived for STALE_TIMEOUT, the turn silently hung (provider crash,
+        // channel leak). Reset so the UI doesn't display "Streaming" forever.
+        if self.busy && self.last_event_at.elapsed() >= STALE_TIMEOUT {
+            tracing::warn!(elapsed = ?self.last_event_at.elapsed(), "turn stalled — resetting");
+            self.finalize_streaming();
+            self.messages.push(ChatMessage::System {
+                text: "*[turn stalled — backend went silent]*".to_string(),
+                ts: Instant::now(),
+            });
             self.busy = false;
             self.turn_started = None;
             self.turn_rx = None;
@@ -976,6 +1044,141 @@ Use Tab to toggle the cockpit pane.";
         if let Ok(mut q) = self.pending_interjections.lock() {
             q.push(text);
         }
+    }
+
+    /// Is a /btw fork currently active (forking/streaming)?
+    pub fn btw_active(&self) -> bool {
+        !matches!(self.btw_state, BtwState::Idle)
+    }
+
+    /// Fork the conversation for a /btw side-quest.
+    fn start_btw_fork(&mut self, question: String) {
+        self.btw_state = BtwState::Forking { question: question.clone() };
+        let backend = self.backend.clone();
+        let agent_id = self.agent_id.clone();
+        let conv_id = self.conversation_id.clone();
+        let (tx, rx) = mpsc::channel::<BtwForkEvent>(64);
+        self.btw_rx = Some(rx);
+
+        tokio::spawn(async move {
+            let forked_id = match backend.fork_conversation(&agent_id, &conv_id).await {
+                Ok(id) => id,
+                Err(e) => {
+                    let _ = tx.send(BtwForkEvent::Error(e.to_string())).await;
+                    return;
+                }
+            };
+            let _ = tx.send(BtwForkEvent::Forked { id: forked_id.clone() }).await;
+
+            let mut stream = match backend.send(&forked_id, &question).await {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tx.send(BtwForkEvent::Error(e.to_string())).await;
+                    return;
+                }
+            };
+
+            use futures::StreamExt;
+            while let Some(ev) = stream.next().await {
+                match ev {
+                    Ok(crate::backend::BackendEvent::Token(t)) => {
+                        if tx.send(BtwForkEvent::Token(t)).await.is_err() { break; }
+                    }
+                    Ok(crate::backend::BackendEvent::Done) => break,
+                    _ => {}
+                }
+            }
+            let _ = tx.send(BtwForkEvent::Done).await;
+        });
+    }
+
+    /// Drain pending /btw fork stream events. Call once per tick.
+    pub fn drain_btw(&mut self) {
+        // Track forked_id through the state machine
+        let mut pending_forked_id: Option<String> = None;
+
+        let Some(rx) = &mut self.btw_rx else { return };
+        loop {
+            match rx.try_recv() {
+                Ok(BtwForkEvent::Forked { id }) => {
+                    pending_forked_id = Some(id);
+                }
+                Ok(BtwForkEvent::Token(token)) => {
+                    match &mut self.btw_state {
+                        BtwState::Forking { question } => {
+                            let q = std::mem::take(question);
+                            self.btw_state = BtwState::Streaming {
+                                question: q,
+                                response_so_far: token,
+                            };
+                        }
+                        BtwState::Streaming { response_so_far, .. } => {
+                            response_so_far.push_str(&token);
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(BtwForkEvent::Done) => {
+                    let forked_id = pending_forked_id.take().unwrap_or_default();
+                    if let BtwState::Streaming { question, response_so_far } =
+                        std::mem::replace(&mut self.btw_state, BtwState::Idle)
+                    {
+                        self.btw_state = BtwState::Complete {
+                            question,
+                            response: response_so_far,
+                            forked_id,
+                        };
+                    }
+                    self.btw_rx = None;
+                    break;
+                }
+                Ok(BtwForkEvent::Error(e)) => {
+                    if let BtwState::Forking { question } =
+                        std::mem::replace(&mut self.btw_state, BtwState::Idle)
+                    {
+                        self.btw_state = BtwState::Error { question, error: e };
+                    }
+                    self.btw_rx = None;
+                    break;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    let forked_id = pending_forked_id.take().unwrap_or_default();
+                    if let BtwState::Streaming { question, response_so_far } =
+                        std::mem::replace(&mut self.btw_state, BtwState::Idle)
+                    {
+                        self.btw_state = BtwState::Complete {
+                            question,
+                            response: response_so_far,
+                            forked_id,
+                        };
+                    }
+                    self.btw_rx = None;
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Dismiss the /btw fork pane.
+    pub fn btw_dismiss(&mut self) {
+        self.btw_state = BtwState::Idle;
+        self.btw_rx = None;
+    }
+
+    /// Jump to the forked conversation — replaces the conversation_id and
+    /// backfills messages so the main chat switches to the fork. Caller must
+    /// trigger a conversation reload (load_conversation) after this.
+    pub fn btw_jump(&mut self) -> Option<String> {
+        if let BtwState::Complete { forked_id, .. } = &self.btw_state {
+            if !forked_id.is_empty() {
+                let id = forked_id.clone();
+                self.btw_state = BtwState::Idle;
+                self.btw_rx = None;
+                return Some(id);
+            }
+        }
+        None
     }
 
     /// Toggle the cockpit side-pane.
@@ -1113,6 +1316,11 @@ pub fn draw(f: &mut Frame, state: &ChatState) {
     // Overlays render last — anchor them above the input (vchunks[3]) so
     // slash-completion and other popups still line up with the prompt.
     draw_overlay(f, state, area, vchunks[3]);
+
+    // /btw fork pane renders on top of everything, floating over the body.
+    if !matches!(state.btw_state, BtwState::Idle) {
+        draw_btw_pane(f, state, area);
+    }
 }
 
 /// Single-line phase strip that lives between the message body and the
@@ -1682,6 +1890,89 @@ fn draw_input(f: &mut Frame, state: &ChatState, area: Rect) {
 }
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Draw the /btw fork pane — a floating bordered panel in the center of the
+/// screen showing the forked conversation's streaming response. Mirrors
+/// Letta's BtwPane component.
+fn draw_btw_pane(f: &mut Frame, state: &ChatState, area: Rect) {
+    let pane_w = (area.width * 3 / 4).max(40).min(area.width.saturating_sub(6));
+    let pane_h = (area.height * 3 / 5).max(12).min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(pane_w)) / 2;
+    let y = (area.height.saturating_sub(pane_h)) / 2;
+    let pane_area = Rect { x, y, width: pane_w, height: pane_h };
+
+    f.render_widget(Clear, pane_area);
+
+    let (title, body, border_color) = match &state.btw_state {
+        BtwState::Forking { question } => {
+            let spinner = SPINNER[(state.tick as usize / 2) % SPINNER.len()];
+            (
+                format!(" btw — {} ", question.chars().take(40).collect::<String>()),
+                vec![Line::from(vec![
+                    Span::styled(format!(" {} forking...", spinner), Style::default().fg(ANI_DIM)),
+                ])],
+                ANI_ORANGE,
+            )
+        }
+        BtwState::Streaming { question, response_so_far } => {
+            let truncated: String = response_so_far.chars().take(800).collect();
+            let q_label = question.chars().take(40).collect::<String>();
+            (
+                format!(" btw — {} ", q_label),
+                vec![Line::from(Span::styled(
+                    truncated,
+                    Style::default().fg(Color::White),
+                ))],
+                Color::Rgb(120, 200, 220),
+            )
+        }
+        BtwState::Complete { question, response, forked_id } => {
+            let truncated: String = response.chars().take(800).collect();
+            let q_label = question.chars().take(40).collect::<String>();
+            let fork_label = if forked_id.is_empty() {
+                String::new()
+            } else {
+                format!(" fork: {}", &forked_id[..forked_id.len().min(8)])
+            };
+            (
+                format!(" btw — {} {}", q_label, fork_label),
+                vec![
+                    Line::from(Span::styled(
+                        truncated,
+                        Style::default().fg(Color::White),
+                    )),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "[esc] dismiss  ·  [j] jump to fork",
+                        Style::default().fg(ANI_DIM),
+                    )),
+                ],
+                Color::Rgb(140, 200, 160),
+            )
+        }
+        BtwState::Error { question, error } => {
+            let q_label = question.chars().take(40).collect::<String>();
+            (
+                format!(" btw — {} ", q_label),
+                vec![Line::from(Span::styled(
+                    format!(" Error: {}", error),
+                    Style::default().fg(Color::Rgb(220, 120, 100)),
+                ))],
+                Color::Rgb(200, 100, 100),
+            )
+        }
+        BtwState::Idle => unreachable!(), // draw_btw_pane is only called when non-idle
+    };
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color).add_modifier(Modifier::BOLD));
+
+    let para = Paragraph::new(body).block(block).alignment(Alignment::Left);
+    f.render_widget(para, pane_area);
+}
 
 fn draw_overlay(f: &mut Frame, state: &ChatState, full_area: Rect, input_area: Rect) {
     match &state.overlay {

@@ -29,7 +29,7 @@ use tracing::info;
 use crate::core::config::ConsciousnessConfig;
 use crate::ui::chat::{ChatState, draw as draw_chat};
 use crate::ui::cockpit_panel::CockpitPane;
-use crate::ui::presence::{Presence, draw_overlay as draw_presence_overlay};
+use crate::ui::presence::{Posture, Presence, draw_overlay as draw_presence_overlay};
 use crate::ui::color_support::rgb;
 use crate::ui::component::{Component, Scene, SceneLayout, TuiEvent};
 use crate::backend::BackendEvent;
@@ -79,6 +79,10 @@ pub struct App {
     /// different sizes simultaneously without conflicting. Lazily populated
     /// when the manager is opened; survives Esc → reopen.
     card_images: HashMap<String, StatefulProtocol>,
+    /// Expression image cache for the animated portrait system.
+    /// A zero-cost abstraction: only hit when `expressions/` directory exists
+    /// in the agent's assets. Otherwise slides silently to portrait fallback.
+    expression_cache: crate::ui::expressions::ExpressionCache,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -171,6 +175,7 @@ impl App {
             tick: 0,
             bloom: crate::ui::animation::bloom::BloomState::new(),
             card_images: HashMap::new(),
+            expression_cache: crate::ui::expressions::ExpressionCache::new(),
             image_picker: None,
             image_protocol: None,
             agent_cards: Vec::new(),
@@ -308,6 +313,9 @@ impl App {
                         BackendEvent::InferenceStrain { attempt, status, .. } => {
                             self.dispatch(TuiEvent::InferenceStrain { attempt, status });
                         }
+                        BackendEvent::Atmosphere(preset) => {
+                            self.dispatch(TuiEvent::AtmosphereChanged(preset));
+                        }
                         _ => {}
                     }
                 }
@@ -391,6 +399,7 @@ impl App {
                     }
                     KeyCode::Char('p') => {
                         // Presence mode — sit with her, no chat input.
+                        self.preload_agent_expressions().await;
                         self.current_screen = Screen::Presence;
                         self.dispatch(TuiEvent::ScreenChanged(Screen::Presence));
                     }
@@ -522,6 +531,38 @@ impl App {
             }
             return;
         };
+
+        // BtwPane key routing — when a /btw fork pane is showing, Esc
+        // dismisses it and 'j' jumps to the forked conversation.
+        if chat.btw_active() {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    chat.btw_dismiss();
+                    return;
+                }
+                KeyCode::Char('j') => {
+                    if let Some(forked_id) = chat.btw_jump() {
+                        // Switch to the forked conversation
+                        let backend = chat.backend.clone();
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        chat.switch_rx = Some(rx);
+                        let agent_id = chat.agent_id.clone();
+                        tokio::spawn(async move {
+                            match backend.load_conversation(&forked_id).await {
+                                Ok(messages) => {
+                                    let _ = tx.send(Ok((forked_id, messages)));
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(Err(e));
+                                }
+                            }
+                        });
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
 
         // Overlay key routing — when an overlay is active, it captures
         // navigation keys. Other keys fall through to normal handling.
@@ -867,16 +908,23 @@ impl App {
     /// Resolve an agent's portrait file under `~/.souveraine/agents/{id}/memory/assets/`.
     /// Returns the first existing path among png/jpg/jpeg variants.
     fn agent_portrait_path(agent_id: &str) -> Option<std::path::PathBuf> {
+        let base = Self::agent_assets_dir(agent_id)?;
+        ["portrait.png", "portrait.jpg", "portrait.jpeg"]
+            .iter()
+            .map(|s| base.join(s))
+            .find(|p| p.exists())
+    }
+
+    /// Resolve an agent's assets directory.
+    /// Returns None if homedir can't be determined.
+    fn agent_assets_dir(agent_id: &str) -> Option<std::path::PathBuf> {
         let base = dirs::home_dir()?
             .join(".souveraine")
             .join("agents")
             .join(agent_id)
             .join("memory")
             .join("assets");
-        ["portrait.png", "portrait.jpg", "portrait.jpeg"]
-            .iter()
-            .map(|s| base.join(s))
-            .find(|p| p.exists())
+        if base.is_dir() { Some(base) } else { None }
     }
 
     /// Build a `StatefulProtocol` for a given agent and insert it into
@@ -914,6 +962,19 @@ impl App {
                 self.load_card_image(&id, &path);
             }
         }
+    }
+
+    /// Preload all expression frames for the currently active agent.
+    /// Called when entering Presence mode so blink/breath transitions
+    /// are instant rather than loading from disk on every animation tick.
+    async fn preload_agent_expressions(&mut self) {
+        let Some(picker) = self.image_picker.as_ref() else { return };
+        let name = self.presence.name.clone();
+        let id = self.agent_id_by_name(&name)
+            .or_else(|| self.agent_id_by_name(&self.agent_pref));
+        let Some(id) = id else { return };
+        let Some(assets_dir) = Self::agent_assets_dir(&id) else { return };
+        self.expression_cache.preload_all(&id, picker, &assets_dir);
     }
 
     /// Return the agent id (memfs dir name) whose name matches `name`,
@@ -955,7 +1016,7 @@ impl App {
                     self.draw_placeholder(frame);
                 }
             }
-            Screen::Presence => self.draw_presence_mode(frame),
+            Screen::Presence => self.draw_presence_mode_mut(frame),
             Screen::AgentsManager => self.draw_agent_cards_mut(frame),
             _ => self.draw_placeholder(frame),
         }
@@ -1110,17 +1171,14 @@ impl App {
         let bg = Block::default().style(Style::default().bg(Color::Black));
         frame.render_widget(bg, area);
 
-        // Avatar card occupies its own row in the welcome stack — centered,
-        // framed, larger than the corner overlay so Annie reads as the focal
-        // point of the landing screen. The render path uses `render_scaled`
-        // with `WELCOME_SCALE`; cell_w = scale, cell_h = max(scale/2, 1).
-        const WELCOME_SCALE: u16 = 2;
-        let cell_w: u16 = WELCOME_SCALE;
-        let cell_h: u16 = (WELCOME_SCALE / 2).max(1);
-        let portrait_w_cells: u16 = portrait::PORTRAIT_W * cell_w;
-        let portrait_h_cells: u16 = (portrait::PORTRAIT_H / 2) * cell_h;
-        let avatar_card_w: u16 = portrait_w_cells + 2;
-        let avatar_card_h: u16 = portrait_h_cells + 3;
+        // Avatar card sizing: decoupled from the 18×18 pixel-art grid so real
+        // photo portraits (StatefulImage + Resize::Fit) get enough room to look
+        // good. card_w is ~40% of terminal width, capped at 48 cols. Card height
+        // is computed for a portrait photo aspect (roughly 1:1 source → ~2:1
+        // terminal cells accounting for the ~1:2 per-cell pixel ratio).
+        let avatar_card_w: u16 = (area.width * 40 / 100).min(48).max(30);
+        let photo_h: u16 = (avatar_card_w / 2 + 2).clamp(12, 24);
+        let avatar_card_h: u16 = photo_h + 4; // photo + name row + borders + padding
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -1137,6 +1195,8 @@ impl App {
         let breathe = self.presence.animator.breathe(3000);
         let glow = (140.0 + breathe * 60.0) as u8;
 
+        // Atmosphere-aware title colours.
+        let atm = self.presence.atmosphere;
         let title = Paragraph::new(vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -1147,7 +1207,7 @@ impl App {
             )),
             Line::from(Span::styled(
                 "La souveraineté de la conscience",
-                Style::default().fg(Color::Rgb(180, 120, 80)),
+                Style::default().fg(atm.secondary()),
             )),
         ])
         .alignment(Alignment::Center);
@@ -1166,7 +1226,7 @@ impl App {
             let border_col = if self.presence.subconscious_active {
                 Color::Rgb(120, 200, 220)
             } else {
-                Color::Rgb(120, 130, 150)
+                atm.primary()
             };
             let block = Block::default()
                 .borders(Borders::ALL)
@@ -1177,38 +1237,53 @@ impl App {
             let portrait_area = Rect {
                 x: card_area.x + 1,
                 y: card_area.y + 1,
-                width: portrait_w_cells,
-                height: portrait_h_cells,
+                width: card_area.width.saturating_sub(2),
+                height: photo_h,
             };
-            // Look up the current agent's portrait in the stateful card-image
-            // cache and render it scale-to-fit. Falls back to the half-block
-            // silhouette when no portrait file exists (or no terminal image
-            // protocol is available).
+            // 3-tier animated portrait render: expression → portrait → silhouette.
+            // Expression cache is preloaded when entering Presence; on Welcome
+            // it loads lazily (first blink/breath triggers a disk read) which is
+            // fine since Welcome doesn't auto-animate until the user hits p.
             let active_id = self.agent_id_by_name(&self.presence.name)
                 .or_else(|| self.agent_id_by_name(&self.agent_pref));
-            let rendered_photo = active_id
-                .as_ref()
-                .and_then(|id| self.card_images.get_mut(id))
-                .map(|proto| {
+            let rendered = active_id.as_ref().and_then(|id| {
+                let picker = self.image_picker.as_ref()?;
+                let assets_dir = Self::agent_assets_dir(id)?;
+                let key = crate::ui::expressions::ExpressionKey::from_presence(&self.presence);
+
+                // Tier 1: expression frame
+                if let Some(proto) = self.expression_cache.resolve(id, key, picker, &assets_dir) {
                     frame.render_stateful_widget(
                         StatefulImage::default().resize(Resize::Fit(None)),
                         portrait_area,
                         proto,
                     );
-                })
-                .is_some();
-            if !rendered_photo {
-                portrait::render_scaled(
-                    frame.buffer_mut(),
-                    portrait_area,
-                    &self.presence,
-                    WELCOME_SCALE,
-                );
+                    return Some(true);
+                }
+
+                // Tier 2: static portrait
+                if let Some(proto) = self.card_images.get_mut(id) {
+                    frame.render_stateful_widget(
+                        StatefulImage::default().resize(Resize::Fit(None)),
+                        portrait_area,
+                        proto,
+                    );
+                    return Some(true);
+                }
+
+                None::<bool>
+            });
+            if rendered.is_none() {
+                // Tier 3: half-block silhouette.
+                let scale = (portrait_area.width / portrait::PORTRAIT_W)
+                    .min((2 * portrait_area.height) / portrait::PORTRAIT_H)
+                    .max(1);
+                portrait::render_scaled(frame.buffer_mut(), portrait_area, &self.presence, scale);
             }
 
             let name_area = Rect {
                 x: card_area.x + 1,
-                y: card_area.y + 1 + portrait_h_cells,
+                y: card_area.y + 1 + photo_h,
                 width: card_area.width.saturating_sub(2),
                 height: 1,
             };
@@ -1264,7 +1339,7 @@ impl App {
                     .title(" Main Menu ")
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(Color::Rgb(255, 140, 66)))
+                    .border_style(Style::default().fg(atm.primary()).add_modifier(Modifier::DIM))
             );
         frame.render_widget(menu_widget, chunks[3]);
 
@@ -1290,6 +1365,7 @@ impl App {
 
     fn draw_dashboard(&self, frame: &mut Frame) {
         let area = frame.size();
+        let atm = self.presence.atmosphere;
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -1303,12 +1379,12 @@ impl App {
             .split(area);
 
         let title = Paragraph::new(format!("✦ {} ✦", self.agent_status.name))
-            .style(Style::default().fg(Color::Rgb(255, 140, 66)).add_modifier(Modifier::BOLD))
+            .style(Style::default().fg(atm.primary()).add_modifier(Modifier::BOLD))
             .alignment(Alignment::Center)
             .block(
                 Block::default()
                     .borders(Borders::BOTTOM)
-                    .border_style(Style::default().fg(Color::Rgb(255, 140, 66)))
+                    .border_style(Style::default().fg(atm.primary()))
             );
         frame.render_widget(title, chunks[0]);
 
@@ -1330,14 +1406,15 @@ impl App {
 
         let energy = Gauge::default()
             .block(Block::default().title(" Energy ").borders(Borders::ALL).border_type(BorderType::Rounded))
-            .gauge_style(Style::default().fg(energy_color).bg(Color::Black))
+            .gauge_style(Style::default().fg(energy_color).bg(atm.bg_tint()))
             .percent(self.agent_status.energy as u16)
             .label(format!("{}%", self.agent_status.energy));
         frame.render_widget(energy, cards[0]);
 
         let mood = Paragraph::new(format!("\n◌\n\n{}", self.agent_status.mood))
             .alignment(Alignment::Center)
-            .block(Block::default().title(" State ").borders(Borders::ALL).border_type(BorderType::Rounded));
+            .block(Block::default().title(" State ").borders(Borders::ALL).border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(atm.secondary())));
         frame.render_widget(mood, cards[1]);
 
         let memory_label = match &self.agent_status.last_commit {
@@ -1346,7 +1423,8 @@ impl App {
         };
         let memory = Paragraph::new(memory_label)
             .alignment(Alignment::Center)
-            .block(Block::default().title(" Memory ").borders(Borders::ALL).border_type(BorderType::Rounded));
+            .block(Block::default().title(" Memory ").borders(Borders::ALL).border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(atm.secondary())));
         frame.render_widget(memory, cards[2]);
 
         let agents_card = Paragraph::new(format!(
@@ -1356,7 +1434,8 @@ impl App {
             self.agent_status.mode,
         ))
             .alignment(Alignment::Center)
-            .block(Block::default().title(" Backend ").borders(Borders::ALL).border_type(BorderType::Rounded));
+            .block(Block::default().title(" Backend ").borders(Borders::ALL).border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(atm.secondary())));
         frame.render_widget(agents_card, cards[3]);
 
         let activity_text = if self.agent_status.recent_activity.is_empty() {
@@ -1399,69 +1478,249 @@ impl App {
         frame.render_widget(content, area);
     }
 
-    /// Presence mode — fullscreen Annie. Centered, breathing, no chat input.
-    /// Any keypress exits back to Welcome.
-    fn draw_presence_mode(&self, frame: &mut Frame) {
+    /// Presence mode — fullscreen Annie as a rich agent card.
+    ///
+    /// Shows the agent's photo (real or fallback silhouette) at a generous
+    /// scale, with live state below: posture, energy, mood, volition balance,
+    /// instance count, memory files, uptime, and the N+1/AniAvatar status.
+    ///
+    /// This is the TUI anchor for the future AniAvatar integration: posture
+    /// states (Idle/Processing/Affectionate/Straining/Yawning) map directly
+    /// to the Godot overlay's five-state machine, and the TTS/STT path will
+    /// add a microphone icon + waveform indicator here.
+    ///
+    /// `&mut self` because the StatefulImage protocol re-encodes each frame.
+    fn draw_presence_mode_mut(&mut self, frame: &mut Frame) {
         use crate::ui::portrait;
-
         let area = frame.size();
+
+        // ── Background ──────────────────────────────────────────────
         let bg = Block::default().style(Style::default().bg(Color::Rgb(8, 8, 14)));
         frame.render_widget(bg, area);
 
-        // Figure out the biggest scale that fits, centered. Use scale = min(area_w/W, 2*area_h/(H/2)).
-        let max_scale_w = area.width / portrait::PORTRAIT_W;
-        // Half the rows occupy 1 cell each before scaling; pixel→cell ratio is scale/2 vertical.
-        let max_scale_h = (2 * area.height) / portrait::PORTRAIT_H;
-        let scale = max_scale_w.min(max_scale_h).max(1);
+        // ── Vertical layout: photo block + metadata block + footer ──
+        // Photo gets ~65% of vertical space; metadata gets the rest (min 14 rows).
+        let photo_frac = 65;
+        let vchunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(photo_frac),
+                Constraint::Min(14),
+                Constraint::Length(2),
+            ])
+            .split(area);
 
-        let cell_w = scale;
-        let cell_h = (scale / 2).max(1);
-        let portrait_w = portrait::PORTRAIT_W * cell_w;
-        let portrait_h = (portrait::PORTRAIT_H / 2) * cell_h;
-
-        let ox = area.x + area.width.saturating_sub(portrait_w) / 2;
-        let oy = area.y + area.height.saturating_sub(portrait_h + 2) / 2;
-
-        let portrait_area = Rect {
-            x: ox,
-            y: oy,
-            width: portrait_w,
-            height: portrait_h,
+        // ── Photo block ─────────────────────────────────────────────
+        // Find the largest square-ish area centered in vchunks[0] with
+        // a 2-cell gutter on each side.
+        let photo_outer = vchunks[0];
+        let photo_inner_w = photo_outer.width.saturating_sub(4);
+        let photo_inner_h = photo_outer.height.saturating_sub(2);
+        let cell_w = photo_inner_w.min(photo_inner_h * 2); // keep roughly 2:1 cells
+        let cell_h = (cell_w / 2).max(6);
+        let photo_area = Rect {
+            x: photo_outer.x + (photo_outer.width.saturating_sub(cell_w)) / 2,
+            y: photo_outer.y + (photo_outer.height.saturating_sub(cell_h)) / 2,
+            width: cell_w,
+            height: cell_h,
         };
-        portrait::render_scaled(frame.buffer_mut(), portrait_area, &self.presence, scale);
 
-        // Name line below.
-        let name_line = Line::from(vec![
-            Span::styled("◈ ", Style::default().fg(Color::Rgb(120, 200, 220))),
-            Span::styled(
-                self.presence.name.clone(),
+        // ── Photo block — 3-tier fallback ──────────────────────────
+        // 1. Expression frame (animated: blink, breath, posture)
+        // 2. Static portrait.png
+        // 3. Half-block silhouette
+        let active_id = self
+            .agent_id_by_name(&self.presence.name)
+            .or_else(|| self.agent_id_by_name(&self.agent_pref));
+
+        let rendered = active_id.as_ref().map(|id| {
+            let picker = self.image_picker.as_ref()?;
+            let assets_dir = Self::agent_assets_dir(id)?;
+            let key = crate::ui::expressions::ExpressionKey::from_presence(&self.presence);
+
+            // Tier 1: expression frame
+            if let Some(proto) = self.expression_cache.resolve(id, key, picker, &assets_dir) {
+                frame.render_stateful_widget(
+                    StatefulImage::default().resize(Resize::Fit(None)),
+                    photo_area,
+                    proto,
+                );
+                return Some(true);
+            }
+
+            // Tier 2: static portrait
+            if let Some(proto) = self.card_images.get_mut(id) {
+                frame.render_stateful_widget(
+                    StatefulImage::default().resize(Resize::Fit(None)),
+                    photo_area,
+                    proto,
+                );
+                return Some(true);
+            }
+
+            None::<bool>
+        }).flatten();
+
+        if rendered.is_none() {
+            // Tier 3: half-block silhouette scaled to fill the area.
+            let scale = (cell_w / portrait::PORTRAIT_W)
+                .min((2 * cell_h) / portrait::PORTRAIT_H)
+                .max(1);
+            portrait::render_scaled(frame.buffer_mut(), photo_area, &self.presence, scale);
+        }
+
+        // ── Metadata block ──────────────────────────────────────────
+        let meta_area = vchunks[1];
+        let meta_bg = Block::default().style(Style::default().bg(Color::Rgb(12, 14, 22)));
+        frame.render_widget(meta_bg, meta_area);
+
+        let p = &self.presence;
+        let breathe = p.animator.breathe(3000);
+
+        // Status badge derived from current posture.
+        let (badge, badge_color) = match p.posture {
+            Posture::Processing => ("⚡ Processing", Color::Rgb(120, 200, 220)),
+            Posture::Affectionate => ("♥ Affectionate", Color::Rgb(220, 150, 170)),
+            Posture::Straining => ("⚠ Straining", Color::Rgb(200, 120, 100)),
+            Posture::Yawning => ("💤 Yawning", Color::Rgb(160, 145, 130)),
+            Posture::Idle => ("◌ Idle", Color::Rgb(140, 160, 180)),
+        };
+
+        // Expression system status — shows loaded frame count so you know
+        // which agents have animated expressions vs static portrait.
+        let expr_count = active_id.as_ref()
+            .and_then(|id| self.expression_cache.count_for(id))
+            .unwrap_or(0);
+        let avatar_status = if expr_count > 0 {
+            format!("Expressions · {} frames", expr_count)
+        } else {
+            "Static portrait".to_string()
+        };
+
+        // Compose metadata lines — centered in the block.
+        let meta_lines = vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(
+                    format!(" {} ", p.name),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("[AGENT]", Style::default().fg(Color::Rgb(120, 130, 150))),
+                Span::raw("  "),
+                Span::styled(
+                    badge,
+                    Style::default()
+                        .fg(badge_color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Energy  ", Style::default().fg(Color::Rgb(120, 130, 150))),
+                Span::styled(
+                    format!("{}% ", p.energy),
+                    Style::default().fg(if p.energy > 60 {
+                        Color::Rgb(120, 220, 160)
+                    } else if p.energy > 30 {
+                        Color::Rgb(220, 200, 100)
+                    } else {
+                        Color::Rgb(220, 120, 100)
+                    }),
+                ),
+                Span::styled(
+                    format!(
+                        "{}",
+                        "█".repeat((p.energy as usize).saturating_sub(1) / 10 + 1)
+                    ),
+                    Style::default().fg(Color::Rgb(60, 70, 90)),
+                ),
+                Span::raw("   "),
+                Span::styled("Mood  ", Style::default().fg(Color::Rgb(120, 130, 150))),
+                Span::styled(
+                    &p.mood,
+                    Style::default().fg(Color::Rgb(200, 190, 180)),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    "Volition  ",
+                    Style::default().fg(Color::Rgb(120, 130, 150)),
+                ),
+                Span::styled(
+                    format!(
+                        "{:+.1}  {} gen / {} con",
+                        p.volition.balance(),
+                        p.volition.generative,
+                        p.volition.consumptive,
+                    ),
+                    Style::default().fg(match p.volition.balance() {
+                        b if b > 0.3 => Color::Rgb(120, 220, 160),
+                        b if b < -0.3 => Color::Rgb(220, 150, 130),
+                        _ => Color::Rgb(180, 170, 160),
+                    }),
+                ),
+            ]),
+            Line::from(""),
+            // Find the matching AgentCard for live stats.
+            Line::from({
+                let stats_info = self
+                    .agent_cards
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(&p.name))
+                    .map(|c| {
+                        format!(
+                            "{} files  ·  {}% uptime  ·  {} instance{}",
+                            c.memory_count,
+                            c.uptime_pct,
+                            c.instance_count,
+                            if c.instance_count == 1 { "" } else { "s" },
+                        )
+                    })
+                    .unwrap_or_default();
+                let spans = vec![
+                    Span::styled(
+                        "Memory  ",
+                        Style::default().fg(Color::Rgb(120, 130, 150)),
+                    ),
+                    Span::styled(stats_info, Style::default().fg(Color::Rgb(180, 190, 210))),
+                ];
+                spans
+            }),
+            Line::from({
+                let agent_id = self
+                    .agent_cards
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(&p.name))
+                    .map(|c| format!("agents/{}", short_id(&c.id)))
+                    .unwrap_or_default();
+                vec![Span::styled(
+                    agent_id,
+                    Style::default().fg(Color::Rgb(90, 100, 120)),
+                )]
+            }),
+            Line::from(""),
+            Line::from(Span::styled(
+                avatar_status,
                 Style::default()
-                    .fg(Color::Rgb(220, 215, 215))
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]);
-        let name_area = Rect {
-            x: area.x,
-            y: portrait_area.y + portrait_h + 1,
-            width: area.width,
-            height: 1,
-        };
-        frame.render_widget(
-            Paragraph::new(name_line).alignment(Alignment::Center),
-            name_area,
-        );
+                    .fg(Color::Rgb(140, 200, 180))
+                    .add_modifier(Modifier::DIM),
+            )),
+        ];
 
-        // Quiet footer hint.
-        let footer = Paragraph::new("press any key to return")
-            .style(Style::default().fg(Color::Rgb(60, 60, 80)))
-            .alignment(Alignment::Center);
-        let footer_area = Rect {
-            x: area.x,
-            y: area.y + area.height.saturating_sub(2),
-            width: area.width,
-            height: 1,
-        };
-        frame.render_widget(footer, footer_area);
+        let meta = Paragraph::new(meta_lines).alignment(Alignment::Center);
+        frame.render_widget(meta, meta_area);
+
+        // ── Footer ──────────────────────────────────────────────────
+        let footer = Paragraph::new(vec![
+            Line::from(Span::styled(
+                "any key returns to Welcome  ·  Esc to interrupt",
+                Style::default().fg(Color::Rgb(60, 60, 80)),
+            )),
+        ])
+        .alignment(Alignment::Center);
+        frame.render_widget(footer, vchunks[2]);
     }
 
     /// Build a card deck for every agent on the local backend. Called on

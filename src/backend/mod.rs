@@ -90,6 +90,8 @@ pub enum BackendEvent {
         output: String,
         is_error: bool,
     },
+    /// Agent set an atmospheric preset for the UI chrome.
+    Atmosphere(String),
     /// Stream ended cleanly.
     Done,
 }
@@ -106,6 +108,14 @@ pub trait Backend: Send + Sync {
 
     /// Create a new conversation for this agent. Always creates fresh.
     async fn new_conversation(&self, agent_id: &str) -> Result<String>;
+
+    /// Fork an existing conversation — clone all messages into a new session
+    /// with a fresh conversation_id. Used by `/btw` to spin off a side-quest.
+    /// Default falls back to `new_conversation`; LocalBackend overrides with
+    /// a proper deep clone via session_manager.fork().
+    async fn fork_conversation(&self, agent_id: &str, _source_conversation_id: &str) -> Result<String> {
+        self.new_conversation(agent_id).await
+    }
 
     /// List persisted conversations for an agent (excludes archived).
     async fn list_conversations(&self, agent_id: &str) -> Result<Vec<ConversationInfo>>;

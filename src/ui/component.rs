@@ -70,6 +70,8 @@ pub enum TuiEvent {
     /// Inference strain — model is slow/hoarse, retry in flight.
     /// Presence reads this to drop into Posture::Straining.
     InferenceStrain { attempt: u32, status: u16 },
+    /// Agent set an atmospheric colour preset for the UI chrome.
+    AtmosphereChanged(String),
 
     // ── Animation tick ─────────────────────────────────────────
     /// Monotonic tick counter, increments every frame.

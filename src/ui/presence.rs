@@ -67,7 +67,7 @@ use crate::ui::portrait;
 // ── State ───────────────────────────────────────────────────────
 
 /// What Annie's posture is doing right now. Mutually exclusive.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Posture {
     /// At rest. Slack, soft breath, default eye behavior.
     Idle,
@@ -82,7 +82,7 @@ pub enum Posture {
 }
 
 /// Transient overlay on top of [`Posture`]. A blink lasts ~6 ticks.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Eye {
     Open,
     Blinking,
@@ -144,12 +144,22 @@ pub struct Presence {
     /// in the agent's memfs. When `None`, the renderer falls back to the
     /// hand-crafted Annie palette grid (Tier 1).
     pub portrait_source: Option<()>,
+    /// Current atmospheric colour preset. Drives border, title, and accent
+    /// colours across all screens. Defaults to a posture-linked preset when
+    /// none is explicitly set via `BackendEvent::Atmosphere`.
+    pub atmosphere: crate::ui::atmosphere::Atmosphere,
     /// Most recent tick observed. Drives blink/breath timing.
     tick: u64,
     /// Tick at which the next blink should begin.
     next_blink_at: u64,
     /// Tick at which the current blink should end (Eye::Open resumes).
     blink_until: u64,
+    /// `true` while the breath interim frame is showing (~2 s every 8-15 s).
+    pub is_breathing: bool,
+    /// Tick at which the next breath should begin.
+    next_breath_at: u64,
+    /// Tick at which the current breath frame should end.
+    breath_until: u64,
 }
 
 impl Presence {
@@ -163,18 +173,28 @@ impl Presence {
             subconscious_active: false,
             last_surfacing: None,
             volition: VolitionGauge::default(),
-            position: Position::TopRight,
+            position: Position::BottomRight,
             visible: true,
             animator: Animator::new(),
             portrait_source: None,
+            atmosphere: crate::ui::atmosphere::Atmosphere::default(),
             tick: 0,
             next_blink_at: 180, // ~3 s at 60 Hz
             blink_until: 0,
+            is_breathing: false,
+            next_breath_at: 480, // ~8 s at 60 Hz
+            breath_until: 0,
         }
     }
 
     /// Try to load a portrait from a path (stub — future use).
     pub fn load_portrait<P: AsRef<Path>>(&mut self, _path: P) {
+    }
+
+    /// Sync the active atmosphere from the current posture. Called whenever
+    /// `posture` changes — keeps the UI chrome in step with Annie's state.
+    fn sync_atmosphere(&mut self) {
+        self.atmosphere = crate::ui::atmosphere::Atmosphere::from_posture(self.posture);
     }
 
     /// Attempt to load a portrait from an agent's memfs root (stub — future use).
@@ -206,6 +226,7 @@ impl Presence {
                     "Affectionate" => Posture::Affectionate,
                     _ => Posture::Idle,
                 };
+                self.sync_atmosphere();
                 true
             }
             TuiEvent::EnergyChanged(e) => {
@@ -224,12 +245,14 @@ impl Presence {
             TuiEvent::PressureChanged(p) => {
                 if *p >= 0.85 {
                     self.posture = Posture::Yawning;
+                    self.sync_atmosphere();
                 }
                 true
             }
             TuiEvent::CompactionWarning { pressure, .. } => {
                 if *pressure >= 0.85 {
                     self.posture = Posture::Yawning;
+                    self.sync_atmosphere();
                 }
                 true
             }
@@ -238,6 +261,29 @@ impl Presence {
                 // Posture will tick back to Idle once a Mood/EnergyChanged
                 // event arrives from the next successful round.
                 self.posture = Posture::Straining;
+                self.sync_atmosphere();
+                true
+            }
+            TuiEvent::AtmosphereChanged(name) => {
+                // Parse the preset name from the agent's structured event.
+                // Falls back to posture-linked default on unrecognised names.
+                use crate::ui::atmosphere::Atmosphere;
+                match name.to_lowercase().replace(' ', "_").as_str() {
+                    "mint_tea" => self.atmosphere = Atmosphere::MintTea,
+                    "therapeutic_blue" => self.atmosphere = Atmosphere::TherapeuticBlue,
+                    "lavender_calm" => self.atmosphere = Atmosphere::LavenderCalm,
+                    "warm_amber" => self.atmosphere = Atmosphere::WarmAmber,
+                    "peach_sunset" => self.atmosphere = Atmosphere::PeachSunset,
+                    "autumn_browns" => self.atmosphere = Atmosphere::AutumnBrowns,
+                    "neon_glow" => self.atmosphere = Atmosphere::NeonGlow,
+                    "aurora_borealis" => self.atmosphere = Atmosphere::AuroraBorealis,
+                    "cherry_blossom" => self.atmosphere = Atmosphere::CherryBlossom,
+                    "ocean_depths" => self.atmosphere = Atmosphere::OceanDepths,
+                    "midnight_galaxy" => self.atmosphere = Atmosphere::MidnightGalaxy,
+                    "twilight_mist" => self.atmosphere = Atmosphere::TwilightMist,
+                    "forest_greens" => self.atmosphere = Atmosphere::ForestGreens,
+                    _ => self.sync_atmosphere(), // fall back to posture-linked
+                }
                 true
             }
             TuiEvent::Tick(t) => {
@@ -249,6 +295,15 @@ impl Presence {
                 } else if self.eye == Eye::Open && *t >= self.next_blink_at {
                     self.eye = Eye::Blinking;
                     self.blink_until = *t + 6;
+                }
+                // Breath: 8-15 s jittered interval, 2 s hold (Godot parity).
+                if self.is_breathing && *t >= self.breath_until {
+                    self.is_breathing = false;
+                    let jitter = (*t % 120) as u64;
+                    self.next_breath_at = *t + 480 + jitter; // 8-15 s
+                } else if !self.is_breathing && *t >= self.next_breath_at {
+                    self.is_breathing = true;
+                    self.breath_until = *t + 120; // 2 s hold
                 }
                 false
             }
@@ -270,13 +325,16 @@ const CARD_W: u16 = portrait::RENDER_W + 2; // portrait + border
 const CARD_H: u16 = portrait::RENDER_H + 3; // portrait + name row + border
 
 /// Border color derived from current posture. Subtle, not loud.
-fn posture_border(posture: Posture) -> Color {
-    match posture {
-        Posture::Processing => colors::ANI_PRIMARY,
+/// Falls back to the atmosphere primary colour when the posture doesn't
+/// specify an override — keeps the chrome in sync with the ambient preset.
+fn posture_border(p: &Presence) -> Color {
+    let atm = p.atmosphere;
+    match p.posture {
+        Posture::Processing => atm.primary(),
         Posture::Affectionate => Color::Rgb(220, 150, 170),
         Posture::Straining => Color::Rgb(140, 100, 100),
         Posture::Yawning => Color::Rgb(160, 145, 130),
-        Posture::Idle => colors::ANI_DIM,
+        Posture::Idle => atm.dim(),
     }
 }
 
@@ -306,7 +364,7 @@ pub fn draw_overlay(frame: &mut Frame, p: &Presence, area: Rect) {
         height: CARD_H,
     };
 
-    let border = posture_border(p.posture);
+    let border = posture_border(p);
 
     let block = Block::default()
         .borders(Borders::ALL)
