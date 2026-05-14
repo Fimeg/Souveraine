@@ -3,7 +3,7 @@
 //!
 //! ## N+1 (Aster)
 //! The subconscious pass runs immediately after every response. It takes the
-//! last exchange (user message + Ani's response) and sends it to a Bifrost
+//! last exchange (user message + primary's response) and sends it to a Bifrost
 //! model (defaulting to `glm-5.1`, configurable) with a "subconscious mode"
 //! system prompt. Aster has full tool access — Read, Write, Edit, Glob, Grep,
 //! ListDir, and Memory — so she can read ledgers, check commitments, and write
@@ -328,7 +328,7 @@ impl ConsciousnessEngine {
     async fn subconscious_tool_loop(
         &self,
         user_message: &str,
-        ani_response: &str,
+        primary_response: &str,
         primary_id: &str,
         sub_id: &str,
     ) -> anyhow::Result<Vec<InboxItem>> {
@@ -381,15 +381,19 @@ Resolve entries: `[YYYY-MM-DD HH:MM] RESOLVED — note`"#;
             format!("{}{}", aster_from_files, observation_format)
         };
 
+        let primary_name = self.agents.get(primary_id).await
+            .map(|a| a.name)
+            .unwrap_or_else(|_| "the primary".to_string());
+
         let user_content = if user_message.is_empty() {
             format!(
-                "The primary responded:\n\n{}",
-                ani_response
+                "{} responded:\n\n{}",
+                primary_name, primary_response
             )
         } else {
             format!(
-                "User said:\n{}\n\nAni responded:\n{}",
-                user_message, ani_response
+                "User said:\n{}\n\n{} responded:\n{}",
+                user_message, primary_name, primary_response
             )
         };
 

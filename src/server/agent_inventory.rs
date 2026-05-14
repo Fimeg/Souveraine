@@ -112,34 +112,30 @@ impl AgentInventory {
         crate::core::identity::SeedId::load_or_generate(&self.seed_dir(agent_id))
     }
 
-    /// Register an instance row for every known agent on this process.
-    /// Idempotent: re-running with the same `instance_id` overwrites the
-    /// last_seen_at. Stale rows (>5 min since last_seen) are pruned first
-    /// so the manager view doesn't surface dead processes.
-    pub async fn register_instance(&self, instance_id: &str) -> anyhow::Result<()> {
+    /// Register an instance row for a specific agent on this process.
+    /// Idempotent: re-running with the same `(agent_id, instance_id)` pair
+    /// bumps `last_seen_at`. Stale rows (>5 min) are pruned first so the
+    /// manager view doesn't surface dead processes.
+    pub async fn register_instance(&self, agent_id: &str, instance_id: &str) -> anyhow::Result<()> {
         let pid = std::process::id() as i64;
         let hostname = hostname_or_unknown();
-        // Prune dead instances first.
         sqlx::query("DELETE FROM agent_instances WHERE last_seen_at < datetime('now', '-5 minutes')")
             .execute(&self.db)
             .await?;
-        let agents = self.list(None).await?;
-        for a in agents {
-            sqlx::query(
-                "INSERT INTO agent_instances (agent_id, instance_id, pid, hostname, started_at, last_seen_at)
-                 VALUES (?1, ?2, ?3, ?4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                 ON CONFLICT(agent_id, instance_id) DO UPDATE SET
-                   last_seen_at = CURRENT_TIMESTAMP,
-                   pid = excluded.pid,
-                   hostname = excluded.hostname"
-            )
-            .bind(&a.id)
-            .bind(instance_id)
-            .bind(pid)
-            .bind(&hostname)
-            .execute(&self.db)
-            .await?;
-        }
+        sqlx::query(
+            "INSERT INTO agent_instances (agent_id, instance_id, pid, hostname, started_at, last_seen_at)
+             VALUES (?1, ?2, ?3, ?4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+             ON CONFLICT(agent_id, instance_id) DO UPDATE SET
+               last_seen_at = CURRENT_TIMESTAMP,
+               pid = excluded.pid,
+               hostname = excluded.hostname"
+        )
+        .bind(agent_id)
+        .bind(instance_id)
+        .bind(pid)
+        .bind(&hostname)
+        .execute(&self.db)
+        .await?;
         Ok(())
     }
 

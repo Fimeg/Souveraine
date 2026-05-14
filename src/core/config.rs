@@ -638,9 +638,9 @@ fn default_pulse_interval() -> u64 { 600 }
 /// tune the interface layer only.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TuiConfig {
-    /// Seconds without a backend event before the turn is declared stalled and
-    /// reset. Increase if your model needs longer for inference (e.g. after
-    /// reading many large files). Default: 90.
+    /// Deprecated — the auto-reset stall guard has been removed. The TUI
+    /// now trusts the backend stream and shows a liveness label instead.
+    /// Kept for config backwards compatibility.
     #[serde(default = "default_stale_timeout_secs")]
     pub stale_timeout_secs: u64,
 }

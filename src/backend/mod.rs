@@ -101,6 +101,10 @@ pub enum BackendEvent {
     /// Agent changed her outfit. The string is the outfit name (a subdirectory
     /// under `expressions/`). Empty string clears to default expressions.
     Outfit(String),
+    /// The backend is alive but producing no content (waiting on provider,
+    /// between tool rounds, processing). The TUI resets `last_event_at`
+    /// on this the same way it does for `Token` — it's a liveness signal.
+    Keepalive,
     /// Stream ended cleanly.
     Done,
 }

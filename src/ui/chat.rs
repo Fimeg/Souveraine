@@ -363,13 +363,9 @@ pub struct ChatState {
     pub tick: u64,
     /// When the current turn started (for spinner animation).
     pub turn_started: Option<Instant>,
-    /// When the last BackendEvent arrived. Compared against `stale_timeout`
-    /// in `drain_events` to detect silent hangs — the backend channel stays
-    /// open but no events arrive (e.g. provider crash mid-turn).
-    last_event_at: Instant,
-    /// How long to wait before declaring a turn stalled. Reads from
-    /// `[tui] stale_timeout_secs` in config; defaults to 90s.
-    stale_timeout: Duration,
+    /// When the last BackendEvent arrived. Used by the liveness label
+    /// to show how long the backend has been quiet during a turn.
+    pub last_event_at: Instant,
     /// Receiver for `/model` listing results from async Bifrost call.
     pub model_rx: Option<oneshot::Receiver<String>>,
     /// Consciousness events (surfacing, reflection, archivist) since last drain.
@@ -420,7 +416,6 @@ impl ChatState {
         // `main::resolve_backend` but adapted for the TUI (no quiet/json flags).
         let cfg = config.read().await;
         let url = cfg.server.effective_url();
-        let stale_timeout = Duration::from_secs(cfg.tui.stale_timeout_secs);
         drop(cfg);
 
         let remote = crate::backend::RemoteBackend::new(&url);
@@ -475,7 +470,6 @@ impl ChatState {
             tick: 0,
             turn_started: None,
             last_event_at: Instant::now(),
-            stale_timeout,
             model_rx: None,
             pending_consciousness: Vec::new(),
             new_conv_rx: None,
@@ -504,7 +498,7 @@ impl ChatState {
   !<command>         Run a shell command (Linux/macOS)
 
 Esc during a turn interrupts (signal, not kill — she sees *[interrupted]*).
-You can also just keep typing while she works — Enter queues an interjection.
+You can also type while she works — Enter raises your hand (she sees it next round).
 Tab toggles the cockpit pane. `t` (on empty input) toggles tool expansion.";
 
     /// Submit the current input. Returns `true` if the input was handled
@@ -869,8 +863,8 @@ Tab toggles the cockpit pane. `t` (on empty input) toggles tool expansion.";
     /// Call once per UI tick.
     /// Walk the message list and mark any interjections as `delivered`
     /// once the shared queue has been drained by the backend. Called at
-    /// the top of `drain_events` so the UI flips from amber `⏳ /btw`
-    /// to grey `↳ /btw` as soon as the agent has read the interruption.
+    /// the top of `drain_events` so the UI flips from `✋ hand raised`
+    /// to `✋ noticed` as soon as the agent has read the interruption.
     fn flush_delivered_interjections(&mut self) {
         let queue_empty = self
             .pending_interjections
@@ -1178,6 +1172,10 @@ Tab toggles the cockpit pane. `t` (on empty input) toggles tool expansion.";
                 BackendEvent::Outfit(name) => {
                     self.pending_consciousness.push(BackendEvent::Outfit(name));
                 }
+                BackendEvent::Keepalive => {
+                    // Liveness signal — no visual change, just resets the
+                    // event timer so the liveness label stays calm.
+                }
                 BackendEvent::Done => {
                     self.finalize_streaming();
                     self.busy = false;
@@ -1201,34 +1199,6 @@ Tab toggles the cockpit pane. `t` (on empty input) toggles tool expansion.";
             self.tool_calls_this_turn = 0;
         }
 
-        // Staleness guard: if the backend channel is open but nothing has
-        // arrived for `stale_timeout`, the turn silently hung (provider crash,
-        // channel leak). Reset so the UI doesn't display "Streaming" forever.
-        if self.busy && self.last_event_at.elapsed() >= self.stale_timeout {
-            let secs = self.stale_timeout.as_secs();
-            tracing::warn!(
-                elapsed = ?self.last_event_at.elapsed(),
-                phase = ?self.phase,
-                tool_calls = self.tool_calls_this_turn,
-                "turn stalled — resetting"
-            );
-            self.finalize_streaming();
-            self.messages.push(ChatMessage::System {
-                text: format!(
-                    "*[turn stalled — backend went silent after {}s (phase: {:?}, tools: {}). \
-                    Your last message may not have been processed. Send it again to retry, or Esc → reconnect. \
-                    See souveraine.log for details.]*",
-                    secs, self.phase, self.tool_calls_this_turn
-                ),
-                ts: Instant::now(),
-            });
-            self.busy = false;
-            self.turn_started = None;
-            self.turn_rx = None;
-            self.cancel_token = None;
-            self.phase = TurnPhase::Idle;
-            self.tool_calls_this_turn = 0;
-        }
     }
 
     /// User pressed Esc during a turn. Fire the cancel token — the backend
@@ -1578,14 +1548,29 @@ fn draw_phase(f: &mut Frame, state: &ChatState, area: Rect) {
         .map(|q| q.len())
         .unwrap_or(0);
 
+    let quiet_secs = state.last_event_at.elapsed().as_secs();
+    let liveness = if quiet_secs >= 120 {
+        Some(format!("still waiting {}s...", quiet_secs))
+    } else if quiet_secs >= 5 {
+        Some(format!("waiting {}s...", quiet_secs))
+    } else {
+        None
+    };
+
     let mut spans: Vec<Span<'static>> = vec![
         Span::styled(format!(" {} ", glyph), Style::default().fg(color).add_modifier(Modifier::BOLD)),
         Span::styled(format!("{}", label), Style::default().fg(color)),
         Span::styled(format!("  ·  {}s", elapsed), Style::default().fg(state.palette.agent_dim)),
     ];
+    if let Some(liveness_label) = liveness {
+        spans.push(Span::styled(
+            format!("  ·  {}", liveness_label),
+            Style::default().fg(state.palette.surfacing).add_modifier(Modifier::ITALIC),
+        ));
+    }
     if queued > 0 {
         spans.push(Span::styled(
-            format!("  ·  /btw queued: {}", queued),
+            format!("  ·  {} queued", queued),
             Style::default().fg(state.palette.surfacing).add_modifier(Modifier::ITALIC),
         ));
     }
@@ -1725,18 +1710,13 @@ fn draw_messages(f: &mut Frame, state: &ChatState, area: Rect) {
                 }
             }
             ChatMessage::Interjection { text, delivered, .. } => {
-                // User spoke while the agent was working. Rendered as a
-                // compact single-line note so it's visible in the stream
-                // without competing with normal user bubbles. Dims after
-                // the backend has delivered it on the next LLM round.
-                let glyph = if *delivered { "↳" } else { "⏳" };
-                let color = if *delivered {
-                    state.palette.agent_dim
+                let (glyph, label, color) = if *delivered {
+                    ("✋", "noticed", state.palette.agent_dim)
                 } else {
-                    state.palette.surfacing
+                    ("✋", "hand raised", state.palette.surfacing)
                 };
                 lines.push(Line::from(vec![
-                    Span::styled(format!("  {} /btw  ", glyph),
+                    Span::styled(format!("  {} {}  ", glyph, label),
                         Style::default().fg(color).add_modifier(Modifier::BOLD)),
                     Span::styled(text.clone(), Style::default().fg(color).add_modifier(Modifier::ITALIC)),
                 ]));

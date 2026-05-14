@@ -38,6 +38,9 @@ pub struct SouveraineServer {
     /// Adaptive inter-round delay — starts at 500ms, bumps +200ms on 429.
     /// Shared across primary loop and Aster so both respect the same ceiling.
     pub rate_delay: Arc<AtomicU64>,
+    /// Stable identifier for this process — used to register/heartbeat
+    /// agent instances so the manager card shows running counts.
+    pub instance_id: String,
 }
 
 pub struct ServerConfig {
@@ -72,14 +75,10 @@ impl SouveraineServer {
             }
         }
 
-        // Instance registry: one row per (agent, process), heartbeated every
-        // 30s. Stale rows (>5min) pruned on registration. The instance_id is
-        // a fresh UUID this process keeps for its entire lifetime, so the
-        // heartbeat hits the right rows on every tick.
+        // Instance registry: rows are registered per-agent when a session
+        // starts (not blanket for all agents). The heartbeat loop keeps
+        // registered rows alive and accumulates lifetime_active_seconds.
         let instance_id = uuid::Uuid::new_v4().to_string();
-        if let Err(e) = agents.register_instance(&instance_id).await {
-            tracing::warn!("Instance registration failed (continuing): {}", e);
-        }
         {
             const TICK_SECONDS: i64 = 30;
             let agents_for_tick = agents.clone();
@@ -88,9 +87,6 @@ impl SouveraineServer {
                 let mut interval = tokio::time::interval(
                     std::time::Duration::from_secs(TICK_SECONDS as u64),
                 );
-                // Skip the immediate first tick so we wait a full interval
-                // before bumping lifetime_active_seconds (already registered
-                // at started_at).
                 interval.tick().await;
                 loop {
                     interval.tick().await;
@@ -201,6 +197,7 @@ impl SouveraineServer {
             memory,
             app_config: Arc::new(RwLock::new(config)),
             rate_delay,
+            instance_id,
         })
     }
 

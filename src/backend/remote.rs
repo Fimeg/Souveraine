@@ -271,7 +271,7 @@ fn map_event(event_type: &str, v: &Value) -> Option<BackendEvent> {
             synthesis: s("synthesis").unwrap_or_default(),
             pressure: v.get("pressure").and_then(|x| x.as_f64()).unwrap_or(0.0) as f32,
         },
-        "ping" => return None,
+        "ping" => BackendEvent::Keepalive,
         _ => return None,
     })
 }

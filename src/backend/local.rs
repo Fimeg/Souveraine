@@ -448,6 +448,10 @@ impl Backend for LocalBackend {
         let _ = self.server.agents.get(agent_id).await?;
         let conv_id = self.server.sessions.create(agent_id);
 
+        if let Err(e) = self.server.agents.register_instance(agent_id, &self.server.instance_id).await {
+            tracing::warn!(agent = %agent_id, "instance registration failed: {}", e);
+        }
+
         let memory_root = self.server.agents.memory_root(agent_id);
         let subconscious_root = self.server.agents.subconscious_memory_root(agent_id);
         let (bundled, user, agent_memfs, project) =
@@ -905,6 +909,8 @@ async fn run_turn(
     let mut final_content: String = String::new();
     let mut interrupted = false;
     let counter = TokenCounter::new();
+    let mut last_keepalive = Instant::now();
+    const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
     loop {
         // Cancellation is a signal, not enforcement — we check it on round
@@ -913,6 +919,11 @@ async fn run_turn(
         if cancel.is_cancelled() {
             interrupted = true;
             break;
+        }
+
+        if last_keepalive.elapsed() >= KEEPALIVE_INTERVAL {
+            let _ = tx.send(Ok(BackendEvent::Keepalive)).await;
+            last_keepalive = Instant::now();
         }
 
         // Drain any queued interjections from the user. The user typed these
@@ -1153,6 +1164,9 @@ async fn run_turn(
         if effective > Duration::ZERO {
             tokio::time::sleep(effective).await;
         }
+
+        let _ = tx.send(Ok(BackendEvent::Keepalive)).await;
+        last_keepalive = Instant::now();
 
         // Continue loop — model will see tool results and respond
     }
