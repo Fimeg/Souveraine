@@ -18,6 +18,7 @@ use ratatui::{
 };
 
 use crate::core::nervous::cron::{parse_schedule_file, ScheduleEntry, ScheduleKind};
+use crate::ui::chat::ChatPalette;
 
 pub enum Mode {
     Browse,
@@ -84,6 +85,10 @@ pub struct SchedulesView {
     pub entries: Vec<ScheduleEntry>,
     pub selected: usize,
     pub mode: Mode,
+
+    /// Atmosphere-derived colour palette. Updated when the agent changes mood
+    /// or the user triggers an AtmospherePreview from settings.
+    pub palette: ChatPalette,
 }
 
 impl SchedulesView {
@@ -94,6 +99,7 @@ impl SchedulesView {
             entries: Vec::new(),
             selected: 0,
             mode: Mode::Browse,
+            palette: ChatPalette::default(),
         };
         s.reload();
         s
@@ -275,37 +281,38 @@ pub fn draw(frame: &mut Frame, view: &SchedulesView) {
         .split(area);
 
     let header = Paragraph::new(format!(" Schedules — {} ", view.agent_label))
-        .style(Style::default().fg(Color::Rgb(255, 140, 66)).add_modifier(Modifier::BOLD))
+        .style(Style::default().fg(view.palette.agent_primary).add_modifier(Modifier::BOLD))
         .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded));
     frame.render_widget(header, chunks[0]);
 
     match &view.mode {
-        Mode::Create(form) => draw_create_form(frame, chunks[1], form),
+        Mode::Create(form) => draw_create_form(frame, chunks[1], form, &view.palette),
         Mode::ConfirmDelete => draw_confirm_delete(frame, chunks[1], view),
         _ => draw_list(frame, chunks[1], view),
     }
 
     let footer = footer_for(&view.mode);
     let footer = Paragraph::new(footer)
-        .style(Style::default().fg(Color::DarkGray))
+        .style(Style::default().fg(view.palette.agent_dim))
         .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded));
     frame.render_widget(footer, chunks[2]);
 }
 
 fn draw_list(frame: &mut Frame, area: Rect, view: &SchedulesView) {
+    let p = &view.palette;
     let mut lines: Vec<Line> = Vec::new();
 
     if view.entries.is_empty() {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "  No schedules yet. Press `c` to create one.",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(p.agent_dim),
         )));
     } else {
         for (idx, entry) in view.entries.iter().enumerate() {
             let selected = idx == view.selected;
             let marker = if selected { ">" } else { " " };
-            let status_color = if entry.enabled { Color::Rgb(120, 200, 120) } else { Color::DarkGray };
+            let status_color = if entry.enabled { Color::Rgb(120, 200, 120) } else { p.agent_dim };
             let status_label = if entry.enabled { "●" } else { "○" };
             let kind = match entry.kind {
                 ScheduleKind::Once => "once",
@@ -313,7 +320,7 @@ fn draw_list(frame: &mut Frame, area: Rect, view: &SchedulesView) {
                 ScheduleKind::Cron => "cron",
             };
             let style = if selected {
-                Style::default().fg(Color::Rgb(255, 200, 130)).add_modifier(Modifier::BOLD)
+                Style::default().fg(p.agent_primary).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
             };
@@ -322,15 +329,15 @@ fn draw_list(frame: &mut Frame, area: Rect, view: &SchedulesView) {
                 Span::styled(status_label.to_string(), Style::default().fg(status_color)),
                 Span::raw("  "),
                 Span::styled(format!("{:<20}", entry.name), style),
-                Span::styled(format!("{:<10}", kind), Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("{:<24}", entry.schedule), Style::default().fg(Color::Rgb(180, 180, 220))),
-                Span::styled(format!("urg {:.1}", entry.urgency), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{:<10}", kind), Style::default().fg(p.agent_dim)),
+                Span::styled(format!("{:<24}", entry.schedule), Style::default().fg(p.agent_primary)),
+                Span::styled(format!("urg {:.1}", entry.urgency), Style::default().fg(p.agent_dim)),
             ]));
             if selected {
                 let prompt_preview: String = entry.prompt.chars().take(120).collect();
                 lines.push(Line::from(vec![
                     Span::raw("    "),
-                    Span::styled(prompt_preview, Style::default().fg(Color::Rgb(160, 160, 180)).add_modifier(Modifier::ITALIC)),
+                    Span::styled(prompt_preview, Style::default().fg(p.agent_dim).add_modifier(Modifier::ITALIC)),
                 ]));
             }
         }
@@ -351,17 +358,18 @@ fn draw_list(frame: &mut Frame, area: Rect, view: &SchedulesView) {
 }
 
 fn draw_confirm_delete(frame: &mut Frame, area: Rect, view: &SchedulesView) {
+    let p = &view.palette;
     let name = view.current().map(|e| e.name.as_str()).unwrap_or("?");
     let lines = vec![
         Line::from(""),
         Line::from(Span::styled(
             format!("  Delete '{name}'?"),
-            Style::default().fg(Color::Rgb(255, 180, 80)).add_modifier(Modifier::BOLD),
+            Style::default().fg(p.agent_primary).add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(Span::styled(
             "  y — yes, delete    n / Esc — cancel",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(p.agent_dim),
         )),
     ];
     let body = Paragraph::new(lines)
@@ -369,7 +377,7 @@ fn draw_confirm_delete(frame: &mut Frame, area: Rect, view: &SchedulesView) {
     frame.render_widget(body, area);
 }
 
-fn draw_create_form(frame: &mut Frame, area: Rect, form: &CreateForm) {
+fn draw_create_form(frame: &mut Frame, area: Rect, form: &CreateForm, palette: &ChatPalette) {
     let kind_str = match form.kind {
         ScheduleKind::Once => "once",
         ScheduleKind::Interval => "interval",
@@ -381,7 +389,7 @@ fn draw_create_form(frame: &mut Frame, area: Rect, form: &CreateForm) {
     let cursor = |f: CreateField| if is_field(f) { "▌" } else { " " };
     let field_style = |f: CreateField| {
         if is_field(f) {
-            Style::default().fg(Color::Rgb(255, 200, 130)).add_modifier(Modifier::BOLD)
+            Style::default().fg(palette.agent_primary).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::White)
         }
@@ -390,30 +398,30 @@ fn draw_create_form(frame: &mut Frame, area: Rect, form: &CreateForm) {
     let mut lines = Vec::new();
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        Span::styled("  name:      ", Style::default().fg(Color::DarkGray)),
+        Span::styled("  name:      ", Style::default().fg(palette.agent_dim)),
         Span::styled(form.name.clone(), field_style(CreateField::Name)),
         Span::raw(cursor(CreateField::Name)),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("  kind:      ", Style::default().fg(Color::DarkGray)),
+        Span::styled("  kind:      ", Style::default().fg(palette.agent_dim)),
         Span::styled(kind_str.to_string(), field_style(CreateField::Kind)),
-        Span::styled("   (←/→ to cycle: interval, cron, once)", Style::default().fg(Color::DarkGray)),
+        Span::styled("   (←/→ to cycle: interval, cron, once)", Style::default().fg(palette.agent_dim)),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("  schedule:  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("  schedule:  ", Style::default().fg(palette.agent_dim)),
         Span::styled(form.schedule.clone(), field_style(CreateField::Schedule)),
         Span::raw(cursor(CreateField::Schedule)),
-        Span::styled("    (seconds for interval, cron expr for cron)", Style::default().fg(Color::DarkGray)),
+        Span::styled("    (seconds for interval, cron expr for cron)", Style::default().fg(palette.agent_dim)),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("  prompt:    ", Style::default().fg(Color::DarkGray)),
+        Span::styled("  prompt:    ", Style::default().fg(palette.agent_dim)),
         Span::styled(form.prompt.clone(), field_style(CreateField::Prompt)),
         Span::raw(cursor(CreateField::Prompt)),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("  urgency:   ", Style::default().fg(Color::DarkGray)),
+        Span::styled("  urgency:   ", Style::default().fg(palette.agent_dim)),
         Span::styled(format!("{:.1}", form.urgency), field_style(CreateField::Urgency)),
-        Span::styled("    (←/→ to adjust, 0.0–1.0)", Style::default().fg(Color::DarkGray)),
+        Span::styled("    (←/→ to adjust, 0.0–1.0)", Style::default().fg(palette.agent_dim)),
     ]));
 
     let body = Paragraph::new(lines)
@@ -423,7 +431,7 @@ fn draw_create_form(frame: &mut Frame, area: Rect, form: &CreateForm) {
                 .title(" New schedule ")
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::Rgb(255, 200, 130))),
+                .border_style(Style::default().fg(palette.agent_primary)),
         );
     frame.render_widget(body, area);
 }

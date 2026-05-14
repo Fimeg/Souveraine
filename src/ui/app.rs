@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use ratatui::{
@@ -15,7 +16,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Gauge, List, ListItem, Paragraph},
+    widgets::{Block, BorderType, Borders, Gauge, List, ListItem, Paragraph, Wrap},
     Frame,
 };
 use crossterm::{
@@ -33,6 +34,7 @@ use crate::ui::presence::{Posture, Presence, draw_overlay as draw_presence_overl
 use crate::ui::color_support::rgb;
 use crate::ui::component::{Component, Scene, SceneLayout, TuiEvent};
 use crate::backend::BackendEvent;
+use crate::ui::settings::SettingsAction;
 
 use ratatui_image::{picker::Picker, protocol::{Protocol, StatefulProtocol}, Image, Resize, StatefulImage};
 
@@ -71,6 +73,10 @@ pub struct App {
     /// half-block PortraitSource; when set, Welcome / Presence / Dashboard
     /// render the real photo instead of pixel art.
     image_protocol: Option<Protocol>,
+    /// Currently highlighted card index in the Agent Manager grid.
+    manager_selected: usize,
+    /// Column count last computed by draw_agent_cards_mut — used by key handler.
+    manager_cols: usize,
     /// Per-agent cards for the AgentsManager screen.
     agent_cards: Vec<AgentCard>,
     /// Per-agent stateful image protocols for the Agent Manager card grid.
@@ -79,19 +85,69 @@ pub struct App {
     /// different sizes simultaneously without conflicting. Lazily populated
     /// when the manager is opened; survives Esc → reopen.
     card_images: HashMap<String, StatefulProtocol>,
+    /// Raw source images for card portraits, used for cover-fill scaling
+    /// at render time. Stores the decoded DynamicImage after 2:3 crop.
+    /// The lifecyle matches `card_images` — populated by `load_card_image`
+    /// and trimmed by `refresh_card_images`.
+    raw_card_images: HashMap<String, image::DynamicImage>,
+    /// Cover-scaled protocols keyed by (agent_id, area_width, area_height).
+    /// Lazily created from `raw_card_images` and reused across frames when
+    /// the card area hasn't changed. Cleared when the source image changes.
+    cover_protocols: HashMap<String, (u16, u16, StatefulProtocol)>,
     /// Expression image cache for the animated portrait system.
     /// A zero-cost abstraction: only hit when `expressions/` directory exists
     /// in the agent's assets. Otherwise slides silently to portrait fallback.
     expression_cache: crate::ui::expressions::ExpressionCache,
+    /// RGP 3D portrait — active only when running inside ratty terminal.
+    rgp_portrait: Option<crate::ui::rgp::Graphic>,
+    /// Whether the Ratty Graphics Protocol is available.
+    rgp_available: bool,
+    /// Settings editor state. Lazily constructed on first Settings screen entry.
+    settings: Option<crate::ui::settings::SettingsView>,
+    /// Path to the loaded config file, for save-back. Discovered at startup.
+    config_path: Option<PathBuf>,
+
+    // ── Voice channel ────────────────────────────────────────────────────
+    // Present only when voice.enabled = true in config. None otherwise.
+
+    /// HTTP client for STT/TTS services. Created on Presence entry when
+    /// voice is enabled; shared across turns within a Presence session.
+    voice_client: Option<crate::core::voice::VoiceClient>,
+    /// Active mic capture while the user holds Space. Dropped on release.
+    voice_capture: Option<crate::ui::voice::MicCapture>,
+    /// Rodio player for TTS audio. Held for the lifetime of the Presence
+    /// session so the output device stays open between turns.
+    voice_player: Option<crate::ui::voice::VoicePlayer>,
+    /// Pending STT + submit + TTS pipeline result. Receives the mp3 bytes
+    /// (or an error string to inject as the transcription).
+    voice_tts_rx: Option<tokio::sync::oneshot::Receiver<Result<Vec<u8>, String>>>,
+    /// Pending STT transcription result (received before TTS starts).
+    voice_stt_rx: Option<tokio::sync::oneshot::Receiver<Result<String, String>>>,
+    /// Track which reply text we last submitted to TTS, so we don't
+    /// synthesize the same reply twice if the tick loop fires multiple times
+    /// before the TTS receiver is polled.
+    voice_last_synthesized: Option<String>,
+    /// Rolling waveform buffer — keeps the last N mic level samples
+    /// for the scrolling waveform visualizer.
+    voice_waveform: Vec<f32>,
+    /// Most recent TTS text, for replay/regen.
+    voice_last_tts_text: Option<String>,
+    /// Most recent TTS mp3 bytes, for replay/save.
+    voice_last_tts_bytes: Option<Vec<u8>>,
+    /// When the last TTS playback finished.
+    voice_last_tts_time: Option<Instant>,
+    /// Last STT transcript text (what the user said), for display.
+    voice_last_transcript: Option<String>,
+    /// Text to force-re-synthesize on regen (set by 'g' key, consumed by TTS loop).
+    tts_last_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Screen {
     Splash,
+    /// Home screen — dashboard data, portrait, and menu in one place.
     Welcome,
-    Dashboard,
     Chat,
-    Code,
     Therapy,
     AgentTime,
     Cron,
@@ -156,7 +212,7 @@ impl Default for AgentStatus {
 }
 
 impl App {
-    pub fn new(config: Arc<RwLock<ConsciousnessConfig>>, agent_pref: String) -> Self {
+    pub fn new(config: Arc<RwLock<ConsciousnessConfig>>, agent_pref: String, config_path: Option<PathBuf>) -> Self {
         info!("Creating Souveraine App");
         let mut app = Self {
             current_screen: Screen::Splash,
@@ -174,11 +230,31 @@ impl App {
             scene: Scene::new(SceneLayout::Single),
             tick: 0,
             bloom: crate::ui::animation::bloom::BloomState::new(),
+            manager_selected: 0,
+            manager_cols: 4,
             card_images: HashMap::new(),
+            raw_card_images: HashMap::new(),
+            cover_protocols: HashMap::new(),
             expression_cache: crate::ui::expressions::ExpressionCache::new(),
+            rgp_portrait: None,
+            rgp_available: crate::ui::rgp::is_available(),
+            settings: None,
+            config_path,
             image_picker: None,
             image_protocol: None,
             agent_cards: Vec::new(),
+            voice_client: None,
+            voice_capture: None,
+            voice_player: None,
+            voice_tts_rx: None,
+            voice_stt_rx: None,
+            voice_last_synthesized: None,
+            voice_waveform: Vec::with_capacity(128),
+            voice_last_tts_text: None,
+            voice_last_tts_bytes: None,
+            voice_last_tts_time: None,
+            voice_last_transcript: None,
+            tts_last_text: None,
         };
 
         // CockpitPane listens for Aster's surfacing events as scrollable text.
@@ -194,7 +270,33 @@ impl App {
     fn dispatch(&mut self, event: TuiEvent) -> bool {
         let scene_dirty = self.scene.event_all(&event);
         let presence_dirty = self.presence.handle_event(&event);
+        // Keep all component palettes in sync with atmosphere changes.
+        if matches!(event, TuiEvent::AtmosphereChanged(_)
+            | TuiEvent::MoodChanged(_)
+            | TuiEvent::SubconsciousPass(_)
+            | TuiEvent::PressureChanged(_)
+        ) {
+            self.sync_palette();
+        } else if matches!(event, TuiEvent::Tick(_)) && self.presence.lerp_t < 1.0 {
+            self.sync_palette();
+        }
         scene_dirty || presence_dirty
+    }
+
+    /// Recompute the palette from the presence's current (possibly lerped)
+    /// atmosphere and push it to every component that owns one.
+    fn sync_palette(&mut self) {
+        let (p, s, d, b) = self.presence.lerped_colors();
+        let palette = crate::ui::chat::ChatPalette::from_colors(p, s, d, b);
+        if let Some(ref mut chat) = self.chat {
+            chat.palette = palette;
+        }
+        if let Some(ref mut view) = self.schedules {
+            view.palette = palette;
+        }
+        if let Some(ref mut view) = self.settings {
+            view.palette = palette;
+        }
     }
 
     /// Add an available agent for selection (WIP - called from backend discovery)
@@ -213,14 +315,16 @@ impl App {
 
     /// Populate `agent_cards` and `card_images` from disk. Idempotent —
     /// run once after the image picker is ready (so Welcome can pull a
-    /// portrait from the cache) and again on entry to the Manager (in
-    /// case agents have changed since startup).
+    /// portrait from the cache). Subsequent calls skip the backend round-trip
+    /// (which would create extra server instances) and only refresh card images.
     async fn ensure_agent_cards_loaded(&mut self) {
-        let cfg = self.config.read().await.clone();
-        let agents = Self::fetch_agent_cards(cfg).await;
-        self.agent_cards = agents;
-        if !self.agent_cards.is_empty() {
-            self.available_agents = self.agent_cards.iter().map(|c| c.name.clone()).collect();
+        if self.agent_cards.is_empty() {
+            let cfg = self.config.read().await.clone();
+            let agents = Self::fetch_agent_cards(cfg).await;
+            self.agent_cards = agents;
+            if !self.agent_cards.is_empty() {
+                self.available_agents = self.agent_cards.iter().map(|c| c.name.clone()).collect();
+            }
         }
         self.refresh_card_images();
     }
@@ -267,6 +371,11 @@ impl App {
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
+        // Detect RGP (Ratty Graphics Protocol) for inline 3D.
+        if self.rgp_available {
+            tracing::info!("ratty terminal detected — RGP 3D graphics available");
+        }
+
         // Detect terminal image protocol (kitty/sixel/halfblock) after the
         // alternate screen is active. Non-fatal: falls back to halfblocks.
         if let Ok(picker) = Picker::from_query_stdio() {
@@ -281,14 +390,13 @@ impl App {
         }
 
         let mut last_tick = Instant::now();
-        let tick_rate = Duration::from_millis(100);
+        let tick_rate = Duration::from_millis(33);  // ~30 FPS cap
 
         while !self.should_quit {
-            // Drain any pending backend events into the chat state before
-            // rendering so streaming tokens land each tick.
+            // Drain any pending backend events every iteration so streaming
+            // tokens don't backlog — even between frames.
             if let Some(chat) = self.chat.as_mut() {
                 chat.drain_events();
-                chat.advance_tick();
 
                 // Forward consciousness events (surfacing, reflection, archivist)
                 // from chat to the scene so Aster's observations reach Components.
@@ -316,22 +424,33 @@ impl App {
                         BackendEvent::Atmosphere(preset) => {
                             self.dispatch(TuiEvent::AtmosphereChanged(preset));
                         }
+                        BackendEvent::SubconsciousPass(active) => {
+                            self.dispatch(TuiEvent::SubconsciousPass(active));
+                        }
+                        BackendEvent::Outfit(name) => {
+                            self.dispatch(TuiEvent::OutfitChanged(name));
+                        }
                         _ => {}
                     }
                 }
             }
 
-            // Tick dispatch
-            self.tick = self.tick.wrapping_add(1);
-            self.dispatch(TuiEvent::Tick(self.tick));
+            // Tick + draw capped at 30 FPS — mouse events no longer
+            // accelerate animations.
+            if last_tick.elapsed() >= tick_rate {
+                if let Some(chat) = self.chat.as_mut() {
+                    chat.advance_tick();
+                }
+                self.tick = self.tick.wrapping_add(1);
+                self.dispatch(TuiEvent::Tick(self.tick));
 
-            terminal.draw(|f| self.draw(f))?;
+                terminal.draw(|f| self.draw(f))?;
+                last_tick = Instant::now();
+            }
 
-            let timeout = tick_rate
-                .checked_sub(last_tick.elapsed())
-                .unwrap_or_else(|| Duration::from_secs(0));
-
-            if crossterm::event::poll(timeout)? {
+            // Responsive input polling — 16 ms timeout means mouse movement
+            // is consumed but doesn't force a redraw; keyboard feels instant.
+            if crossterm::event::poll(Duration::from_millis(16))? {
                 let crossterm_event = event::read()?;
                 match crossterm_event {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -344,11 +463,10 @@ impl App {
                     Event::Resize(w, h) => {
                         self.dispatch(TuiEvent::Resize { width: w, height: h });
                         self.scene.layout = match self.current_screen {
-                            Screen::Chat | Screen::Code => SceneLayout::ChatWithSidebar {
+                            Screen::Chat => SceneLayout::ChatWithSidebar {
                                 sidebar_ratio: 0.3,
                                 sidebar_open: false,
                             },
-                            Screen::Dashboard => SceneLayout::Dashboard,
                             Screen::Splash => SceneLayout::Single,
                             _ => SceneLayout::Single,
                         };
@@ -357,15 +475,26 @@ impl App {
                 }
             }
 
-            if self.current_screen == Screen::Splash {
-                if self.splash_start.elapsed() > Duration::from_secs(8) {
-                    self.current_screen = Screen::Welcome;
-                    self.dispatch(TuiEvent::ScreenChanged(Screen::Welcome));
+            // ── Voice pipeline progress ──────────────────────────────────
+            // Poll the STT and TTS oneshot receivers each tick to advance
+            // the state machine without blocking the render loop.
+            if self.current_screen == Screen::Presence {
+                self.advance_voice_pipeline().await;
+            }
+
+            // ── Settings model fetch ─────────────────────────────────────
+            if self.current_screen == Screen::Settings {
+                if let Some(view) = self.settings.as_mut() {
+                    view.poll_models_rx();
                 }
             }
 
-            if last_tick.elapsed() >= tick_rate {
-                last_tick = Instant::now();
+            if self.current_screen == Screen::Splash {
+                if self.splash_start.elapsed() > Duration::from_secs(8) {
+                    self.refresh_dashboard().await;
+                    self.current_screen = Screen::Welcome;
+                    self.dispatch(TuiEvent::ScreenChanged(Screen::Welcome));
+                }
             }
         }
 
@@ -383,6 +512,7 @@ impl App {
     async fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
         match self.current_screen {
             Screen::Splash => {
+                self.refresh_dashboard().await;
                 self.current_screen = Screen::Welcome;
                 self.dispatch(TuiEvent::ScreenChanged(Screen::Welcome));
             }
@@ -390,7 +520,7 @@ impl App {
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
                     KeyCode::Up => if self.menu_selected > 0 { self.menu_selected -= 1; }
-                    KeyCode::Down => if self.menu_selected < 6 { self.menu_selected += 1; }
+                    KeyCode::Down => if self.menu_selected < 4 { self.menu_selected += 1; }
                     KeyCode::Enter => self.select_menu_item().await,
                     KeyCode::Char('a') => {
                         // WIP: Create agent alias - this will be expanded with a full agent creation flow
@@ -398,8 +528,19 @@ impl App {
                         self.cycle_agent_selection();
                     }
                     KeyCode::Char('p') => {
-                        // Presence mode — sit with her, no chat input.
+                        // Presence mode — sit with her, voice loop if enabled.
+                        // Chat must be initialized so voice submissions route through
+                        // the agent via the same path as typed messages.
+                        if self.chat.is_none() {
+                            match ChatState::connect(self.config.clone(), &self.agent_pref).await {
+                                Ok(c) => self.chat = Some(c),
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "failed to init chat for Presence");
+                                }
+                            }
+                        }
                         self.preload_agent_expressions().await;
+                        self.init_voice_session().await;
                         self.current_screen = Screen::Presence;
                         self.dispatch(TuiEvent::ScreenChanged(Screen::Presence));
                     }
@@ -410,18 +551,137 @@ impl App {
                 }
             }
             Screen::Presence => {
-                // Any key exits the meditative view.
-                self.current_screen = Screen::Welcome;
-                self.dispatch(TuiEvent::ScreenChanged(Screen::Welcome));
+                match key.code {
+                    // Esc: interrupt Speaking → Idle; or exit Presence when Idle.
+                    KeyCode::Esc => {
+                        if self.presence.posture == Posture::Speaking {
+                            if let Some(player) = &self.voice_player {
+                                player.stop();
+                            }
+                            self.presence.posture = Posture::Idle;
+                            self.presence.sync_atmosphere_pub();
+                        } else if matches!(
+                            self.presence.posture,
+                            Posture::Listening | Posture::Thinking | Posture::Processing
+                        ) {
+                            // Interrupt in-flight voice turn — drop capture, cancel pipeline.
+                            self.voice_capture = None;
+                            self.voice_stt_rx = None;
+                            self.voice_tts_rx = None;
+                            self.presence.posture = Posture::Idle;
+                            self.presence.sync_atmosphere_pub();
+                        } else {
+                            // Idle — exit Presence.
+                            self.exit_presence();
+                        }
+                    }
+                    // Space: tap-to-record. First press opens mic, second press
+                    // closes and sends. Esc cancels. No release events needed —
+                    // terminals drop them.
+                    KeyCode::Char(' ') => {
+                        if self.presence.posture == Posture::Listening {
+                            // Already recording — second press: send.
+                            self.handle_presence_space_release().await;
+                        } else if self.presence.posture == Posture::Speaking {
+                            // Space during Speaking: stop, start a new listen.
+                            if let Some(player) = &self.voice_player {
+                                player.stop();
+                            }
+                            self.start_listening();
+                        } else if self.voice_client.is_some() {
+                            // First press: open mic.
+                            self.start_listening();
+                        }
+                    }
+                    // Any other key exits Presence (meditative mode).
+                    KeyCode::Char('q') => self.exit_presence(),
+                    // Vocal Recall keys: r = replay, g = regen, s = save
+                    KeyCode::Char('r') => {
+                        if let Some(bytes) = self.voice_last_tts_bytes.clone() {
+                            if let Some(player) = &self.voice_player {
+                                player.stop();
+                                let _ = player.play_mp3(bytes);
+                                self.presence.set_posture(Posture::Speaking);
+                            }
+                        }
+                    }
+                    KeyCode::Char('g') => {
+                        if let Some(text) = self.voice_last_tts_text.clone() {
+                            self.voice_last_synthesized = None; // force re-synth
+                            self.tts_last_text = Some(text);    // stash for the pipeline
+                        }
+                    }
+                    KeyCode::Char('s') => {
+                        if let (Some(bytes), Some(text)) = (self.voice_last_tts_bytes.as_ref(), self.voice_last_tts_text.as_ref()) {
+                            let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+                            let filename = format!("voice-recording-{}.mp3", timestamp);
+                            if let Err(e) = std::fs::write(&filename, bytes) {
+                                tracing::warn!(error = %e, "failed to save voice recording");
+                            } else {
+                                tracing::info!(file = %filename, "voice recording saved");
+                            }
+                            let _ = text;
+                        }
+                    }
+                    _ => {
+                        // If Idle and no voice activity, treat as "go back."
+                        if self.presence.posture == Posture::Idle
+                            && self.voice_capture.is_none()
+                        {
+                            self.exit_presence();
+                        }
+                    }
+                }
             }
             Screen::Chat => self.handle_chat_key(key).await,
             Screen::Cron => self.handle_schedules_key(key),
-            Screen::AgentsManager => match key.code {
-                KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('i') => {
-                    self.current_screen = Screen::Welcome;
+            Screen::Settings => self.handle_settings_key(key).await,
+            Screen::AgentsManager => {
+                let n = self.agent_cards.len();
+                let cols = self.manager_cols.max(1);
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('i') => {
+                        self.current_screen = Screen::Welcome;
+                    }
+                    KeyCode::Left => {
+                        if self.manager_selected > 0 {
+                            self.manager_selected -= 1;
+                        }
+                    }
+                    KeyCode::Right => {
+                        if n > 0 && self.manager_selected + 1 < n {
+                            self.manager_selected += 1;
+                        }
+                    }
+                    KeyCode::Up => {
+                        if self.manager_selected >= cols {
+                            self.manager_selected -= cols;
+                        }
+                    }
+                    KeyCode::Down => {
+                        if n > 0 && self.manager_selected + cols < n {
+                            self.manager_selected += cols;
+                        }
+                    }
+                    KeyCode::Enter => {
+                        if let Some(card) = self.agent_cards.get(self.manager_selected) {
+                            let name = card.name.clone();
+                            self.select_agent(&name);
+                            self.refresh_dashboard().await;
+                            self.current_screen = Screen::Welcome;
+                        }
+                    }
+                    // f — pin/star selected card as favorite primary without leaving the manager
+                    KeyCode::Char('f') => {
+                        if let Some(card) = self.agent_cards.get(self.manager_selected) {
+                            let name = card.name.clone();
+                            self.select_agent(&name);
+                            self.refresh_dashboard().await;
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
             _ => {
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('m') => {
@@ -519,6 +779,159 @@ impl App {
                 _ => {}
             },
             Mode::Saved(_) | Mode::Error(_) => {}
+        }
+    }
+
+    async fn handle_settings_key(&mut self, key: crossterm::event::KeyEvent) {
+        let Some(view) = self.settings.as_mut() else {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                self.current_screen = Screen::Welcome;
+            }
+            return;
+        };
+
+        let action = view.handle_key(key);
+
+        match &action {
+            Some(SettingsAction::FetchModels) => {
+                let base_url = view.config.bifrost.base_url.clone();
+                let api_key = view.config.bifrost.api_key.clone();
+                let virtual_key = view.config.bifrost.virtual_key.clone();
+                let primary = view.config.bifrost.primary_model.clone();
+                let timeout = view.config.bifrost.timeout_secs;
+                let extra: Vec<String> = view.config.models.keys().cloned().collect();
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                view.models_rx = Some(rx);
+                tokio::spawn(async move {
+                    let bifrost = crate::bridge::bifrost::BifrostClient::new(&base_url, &api_key, &virtual_key, &primary, timeout);
+                    let mut models = bifrost.list_models().await.unwrap_or_default();
+                    for m in extra { if !models.contains(&m) { models.push(m); } }
+                    let _ = tx.send(models);
+                });
+                return;
+            }
+            Some(SettingsAction::AtmospherePreview(atm)) => {
+                self.dispatch(TuiEvent::AtmosphereChanged(atm.clone()));
+                return;
+            }
+            _ => {}
+        }
+
+        let go_back = matches!(action, Some(SettingsAction::SaveAndGoBack) | Some(SettingsAction::GoBack));
+        if go_back {
+            let save_and_go = matches!(action, Some(SettingsAction::SaveAndGoBack));
+            // Clone everything we need from view before dropping it, since
+            // view borrows self.settings and blocks other self access.
+            let db_path = self.config_path.clone().unwrap_or_else(|| PathBuf::from("souveraine.toml"));
+            let (outfit, atmosphere) = if save_and_go {
+                (view.config.presence.outfit.clone(), view.config.presence.atmosphere.clone())
+            } else {
+                (None, None)
+            };
+            let original_snapshot = if save_and_go { Some(view.original.clone()) } else { None };
+            let config_snapshot = if save_and_go { Some(view.config.clone()) } else { None };
+
+            // view's borrow on self.settings ends here (NLL),
+            // allowing self access below.
+
+            if save_and_go {
+                if let Some(cfg) = config_snapshot {
+                    cfg.save(&db_path).ok();
+                    let mut live = self.config.write().await;
+                    *live = cfg.clone();
+                    // Diff known fields and push changes to SQLite.
+                    if let Some(orig) = &original_snapshot {
+                        self.sync_settings_fields(orig, &cfg).await;
+                    }
+                }
+                if let Some(name) = outfit {
+                    self.dispatch(TuiEvent::OutfitChanged(name));
+                } else {
+                    self.dispatch(TuiEvent::OutfitChanged(String::new()));
+                }
+                if let Some(atm) = atmosphere {
+                    self.dispatch(TuiEvent::AtmosphereChanged(atm));
+                }
+            }
+            self.current_screen = Screen::Welcome;
+            return;
+        }
+
+        if matches!(action, Some(SettingsAction::Save)) {
+            let path = self.config_path.clone().unwrap_or_else(|| PathBuf::from("souveraine.toml"));
+            let outfit = view.config.presence.outfit.clone();
+            let atmosphere = view.config.presence.atmosphere.clone();
+            match view.save(&path) {
+                Ok(()) => {
+                    let original = view.original.clone();
+                    let saved = view.config.clone();
+                    let mut live = self.config.write().await;
+                    *live = saved.clone();
+                    view.mode = crate::ui::settings::SettingsMode::Status {
+                        msg: format!("saved to {}", path.display()),
+                        is_error: false,
+                    };
+                    // Diff known fields and push changes to SQLite.
+                    self.sync_settings_fields(&original, &saved).await;
+                }
+                Err(e) => {
+                    view.mode = crate::ui::settings::SettingsMode::Status {
+                        msg: e,
+                        is_error: true,
+                    };
+                    return;
+                }
+            }
+            if let Some(name) = outfit {
+                self.dispatch(TuiEvent::OutfitChanged(name));
+            } else {
+                self.dispatch(TuiEvent::OutfitChanged(String::new()));
+            }
+            if let Some(atm) = atmosphere {
+                self.dispatch(TuiEvent::AtmosphereChanged(atm));
+            }
+        }
+    }
+
+    /// Diff fields between `original` (config snapshot at Settings entry) and
+    /// `saved` (what the user just saved), then push changed fields to every
+    /// data store that shadows them (SQLite agent records, etc.).
+    ///
+    /// Idempotent — unchanged fields produce no writes. Only pushes fields
+    /// that are known to have a shadow; add new mappings by extending this
+    /// method. See `docs/audit/config-settings-sync.md`.
+    async fn sync_settings_fields(&self, original: &ConsciousnessConfig, saved: &ConsciousnessConfig) {
+        let mut changed: Vec<&'static str> = Vec::new();
+
+        // ── primary_model ────────────────────────────────────────────────
+        if original.bifrost.primary_model != saved.bifrost.primary_model {
+            changed.push("bifrost.primary_model");
+            if let Some(chat) = &self.chat {
+                let new_model = saved.bifrost.primary_model.clone();
+                if let Err(e) = chat.backend.update_agent_model(&chat.agent_id, &new_model).await {
+                    tracing::warn!(
+                        agent = %chat.agent_id,
+                        error = %e,
+                        "failed to sync primary_model to SQLite"
+                    );
+                } else {
+                    tracing::info!(
+                        agent = %chat.agent_id,
+                        from = %original.bifrost.primary_model,
+                        to = %new_model,
+                        "synced primary_model to SQLite"
+                    );
+                }
+            }
+        }
+
+        if !changed.is_empty() {
+            let count = changed.len();
+            tracing::info!(
+                changed = %changed.join(", "),
+                "Settings sync pushed {} field(s) to SQLite",
+                count,
+            );
         }
     }
 
@@ -672,6 +1085,13 @@ impl App {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true;
             }
+            // `t` when the input is empty toggles whether tool cards render
+            // collapsed (compact gestures) or expanded (full witness). When
+            // input has content, `t` falls through to the printable-char
+            // branch so the user can type the letter normally.
+            KeyCode::Char('t') if chat.input.is_empty() => {
+                chat.tool_cards_expanded = !chat.tool_cards_expanded;
+            }
             KeyCode::Char(c) => {
                 if chat.input.len() < 8_192 {
                     chat.input.push(c);
@@ -683,16 +1103,12 @@ impl App {
     }
 
     async fn select_menu_item(&mut self) {
+        // Welcome now hosts the dashboard inline, so the menu enters
+        // *destinations* only — Chat, Schedule, and three placeholders.
+        // Items marked (coming soon) are no-ops until their screens are real.
         match self.menu_selected {
             0 => {
-                // Best-effort live refresh of the dashboard data on entry.
-                self.refresh_dashboard().await;
-                self.current_screen = Screen::Dashboard;
-            }
-            // Both "Chat" and "Code" enter the chat screen — they're the same
-            // endpoint today; specialized coding mode is future work.
-            1 | 2 => {
-                // Lazily connect to a backend the first time chat is opened.
+                // Chat — lazily connect to a backend on first entry.
                 if self.chat.is_none() {
                     match ChatState::connect(self.config.clone(), &self.agent_pref).await {
                         Ok(c) => {
@@ -707,18 +1123,42 @@ impl App {
                 }
                 self.current_screen = Screen::Chat;
             }
-            3 => self.current_screen = Screen::Therapy,
-            4 => self.current_screen = Screen::AgentTime,
-            5 => {
+            1 => {
                 if self.schedules.is_none() {
                     self.schedules = Some(self.build_schedules_view().await);
+                    self.sync_palette();
                 } else if let Some(view) = self.schedules.as_mut() {
                     view.reload();
                 }
                 self.current_screen = Screen::Cron;
             }
-            6 => self.current_screen = Screen::Settings,
-            _ => self.current_screen = Screen::Welcome,
+            // 2 Settings, 3 Therapy, 4 Agent Time.
+            2 => {
+                // Lazily init settings from the current config snapshot.
+                if self.settings.is_none() {
+                    let cfg = self.config.read().await.clone();
+                    let mut view = crate::ui::settings::SettingsView::new(&cfg);
+                    let agent_id = self.agent_id_by_name(&self.agent_pref);
+                    let expr_path = agent_id.as_ref()
+                        .and_then(|id| Self::agent_assets_dir(id))
+                        .map(|a| a.join("expressions"));
+                    view.set_expressions_path(expr_path);
+                    self.settings = Some(view);
+                    self.sync_palette();
+                } else {
+                    let cfg = self.config.read().await.clone();
+                    let agent_id = self.agent_id_by_name(&self.agent_pref);
+                    let expr_path = agent_id.as_ref()
+                        .and_then(|id| Self::agent_assets_dir(id))
+                        .map(|a| a.join("expressions"));
+                    if let Some(view) = self.settings.as_mut() {
+                        view.refresh(&cfg);
+                        view.set_expressions_path(expr_path);
+                    }
+                }
+                self.current_screen = Screen::Settings;
+            }
+            _ => {}
         }
     }
 
@@ -819,6 +1259,7 @@ impl App {
         self.agent_status.agent_count = agents.len();
         if let Some(a) = chosen {
             self.agent_status.name = a.name.clone();
+            self.agent_pref = a.name.clone(); // sync the active pref
             self.agent_status.subconscious_active = true;
             // Presence learns about the agent through the event stream below.
         }
@@ -839,6 +1280,12 @@ impl App {
             // kitty/sixel. Non-fatal: the half-block portrait is always
             // available as fallback.
             self.load_image_protocol_from_memfs(repo.root());
+
+            // Try to load a 3D portrait via RGP (ratty terminal).
+            if self.rgp_available {
+                let assets = repo.root().join("assets");
+                self.rgp_portrait = crate::ui::rgp::load_portrait_glb(&assets);
+            }
         } else {
             self.agent_status.recent_activity = vec![
                 format!("[{}] connected via {}", short_now(), mode),
@@ -882,6 +1329,7 @@ impl App {
             },
             Err(e) => { tracing::warn!(path = %path.display(), error = %e, "image protocol open failed"); return; }
         };
+        let dyn_img = portrait_cover_crop(dyn_img, 2, 3);
         let font_size = picker.font_size();
         let w = dyn_img.width().div_ceil(font_size.width as u32) as u16;
         let h = dyn_img.height().div_ceil(font_size.height as u32) as u16;
@@ -942,9 +1390,14 @@ impl App {
             },
             Err(e) => { tracing::warn!(path = %path.display(), error = %e, "card image open failed"); return; }
         };
-        let proto = picker.new_resize_protocol(dyn_img);
+        // Pull the `image` crate into scope for resize_to_fill on the render path.
+        use image::DynamicImage;
+        let dyn_img = portrait_cover_crop(dyn_img, 2, 3);
+        let proto = picker.new_resize_protocol(dyn_img.clone());
+        let agent_id = agent_id.to_string();
         tracing::info!(agent = %agent_id, path = %path.display(), "card image loaded");
-        self.card_images.insert(agent_id.to_string(), proto);
+        self.card_images.insert(agent_id.clone(), proto);
+        self.raw_card_images.insert(agent_id, dyn_img);
     }
 
     /// Refresh the card-image cache to match `agent_cards`. Loads any
@@ -956,6 +1409,8 @@ impl App {
             .collect();
         let valid: std::collections::HashSet<String> = ids.iter().map(|(id, _)| id.clone()).collect();
         self.card_images.retain(|k, _| valid.contains(k));
+        self.raw_card_images.retain(|k, _| valid.contains(k));
+        self.cover_protocols.retain(|k, _| valid.contains(k));
         for (id, path) in ids {
             if self.card_images.contains_key(&id) { continue; }
             if let Some(path) = path {
@@ -977,6 +1432,342 @@ impl App {
         self.expression_cache.preload_all(&id, picker, &assets_dir);
     }
 
+    // ── Voice pipeline helpers ───────────────────────────────────────────
+
+    /// Initialize the voice client and player for a Presence session.
+    /// No-op when `voice.enabled = false`. Called on entry to Presence.
+    async fn init_voice_session(&mut self) {
+        let cfg = self.config.read().await;
+        let vcfg = cfg.voice.clone();
+        drop(cfg);
+
+        if !vcfg.enabled {
+            return;
+        }
+
+        // VoiceClient is cheap — rebuild if config changed.
+        self.voice_client = Some(crate::core::voice::VoiceClient::new(
+            &vcfg.stt_url,
+            &vcfg.tts_url,
+            &vcfg.voice_id,
+        ));
+
+        // VoicePlayer opens the audio output device once and holds it open
+        // for the session to avoid latency on the first utterance.
+        if self.voice_player.is_none() {
+            match crate::ui::voice::VoicePlayer::new() {
+                Ok(player) => {
+                    self.voice_player = Some(player);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to open audio output — TTS will be text-only");
+                }
+            }
+        }
+    }
+
+    /// Clean up voice resources when leaving the Presence screen.
+    fn exit_presence(&mut self) {
+        self.voice_capture = None;
+        self.voice_stt_rx = None;
+        self.voice_tts_rx = None;
+        if let Some(player) = &self.voice_player {
+            player.stop();
+        }
+        self.presence.posture = crate::ui::presence::Posture::Idle;
+        self.presence.sync_atmosphere_pub();
+        self.current_screen = Screen::Welcome;
+        self.dispatch(TuiEvent::ScreenChanged(Screen::Welcome));
+    }
+
+    /// Open the mic and shift posture to Listening. Called on Space press.
+    fn start_listening(&mut self) {
+        // Drop any previous capture (shouldn't exist but guard anyway).
+        self.voice_capture = None;
+
+        match crate::ui::voice::MicCapture::start(16_000) {
+            Ok(cap) => {
+                self.voice_capture = Some(cap);
+                self.presence.set_posture(crate::ui::presence::Posture::Listening);
+                tracing::info!("mic capture started — listening");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "mic capture failed — injecting error message");
+                // Failure is felt as state: inject an error message and let the
+                // agent reply to it. No popup, no forced behavior.
+                if let Some(chat) = self.chat.as_mut() {
+                    chat.input = "*[mic unavailable — voice channel unreachable]*".to_string();
+                    chat.submit();
+                }
+            }
+        }
+    }
+
+    /// Space release: close mic, encode WAV, POST to STT, await transcript.
+    async fn handle_presence_space_release(&mut self) {
+        if self.presence.posture != crate::ui::presence::Posture::Listening {
+            return;
+        }
+
+        let capture = match self.voice_capture.take() {
+            Some(c) => c,
+            None => return,
+        };
+
+        // Shift to Thinking while STT runs.
+        self.presence.set_posture(crate::ui::presence::Posture::Thinking);
+
+        let samples = capture.stop_and_take();
+
+        if samples.is_empty() {
+            tracing::info!("empty mic capture — injecting empty utterance");
+            // Empty hold: treat as empty utterance per spec.
+            if let Some(chat) = self.chat.as_mut() {
+                chat.input = "*[empty utterance]*".to_string();
+                chat.submit();
+            }
+            self.presence.set_posture(crate::ui::presence::Posture::Processing);
+            return;
+        }
+
+        let wav = match crate::ui::voice::capture::samples_to_wav(&samples, 16_000) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::warn!(error = %e, "WAV encode failed");
+                if let Some(chat) = self.chat.as_mut() {
+                    chat.input = "*[voice service unreachable]*".to_string();
+                    chat.submit();
+                }
+                self.presence.set_posture(crate::ui::presence::Posture::Processing);
+                return;
+            }
+        };
+
+        let client = match self.voice_client.as_ref() {
+            Some(c) => {
+                // Clone the underlying reqwest::Client (cheap) to move into spawn.
+                // VoiceClient is not Clone, so we build a fresh one from the same config.
+                // This is fine — reqwest::Client reuses connection pools internally.
+                let stt_url = c.stt_url_str().to_string();
+                let tts_url = c.tts_url_str().to_string();
+                let voice = c.voice_str().to_string();
+                (stt_url, tts_url, voice)
+            }
+            None => {
+                // Voice not configured — just submit raw (no STT).
+                return;
+            }
+        };
+
+        let (stt_url, _tts_url, _voice) = client;
+
+        // Spawn STT in background.
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
+        let stt_u = stt_url.clone();
+        tokio::spawn(async move {
+            // Build a disposable client for the background task.
+            let c = crate::core::voice::VoiceClient::new(&stt_u, "", "");
+            let result = c.transcribe(wav).await
+                .map_err(|e| format!("*[voice service unreachable — {}]*", e));
+            let _ = tx.send(result);
+        });
+
+        self.voice_stt_rx = Some(rx);
+    }
+
+    /// Poll the STT and TTS receivers each tick, advancing the voice state
+    /// machine without blocking the render loop.
+    async fn advance_voice_pipeline(&mut self) {
+        // ── STT receive ─────────────────────────────────────────────────
+        if let Some(rx) = self.voice_stt_rx.as_mut() {
+            let result = match rx.try_recv() {
+                Ok(r) => r,
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    // Sender died — STT task crashed or hung. Clear the rx so
+                    // we can try again next time instead of hanging forever.
+                    self.voice_stt_rx = None;
+                    let text = "*[voice service unreachable — STT task failed]*".to_string();
+                    if let Some(chat) = self.chat.as_mut() {
+                        chat.input = text;
+                        chat.submit();
+                    }
+                    self.presence.set_posture(crate::ui::presence::Posture::Straining);
+                    return;
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                    return;
+                }
+            };
+            self.voice_stt_rx = None;
+
+            let text = match result {
+                Ok(t) if t.is_empty() => "*[empty utterance]*".to_string(),
+                Ok(t) => t,
+                Err(e) => {
+                    self.presence.set_posture(crate::ui::presence::Posture::Straining);
+                    e
+                }
+            };
+
+            tracing::info!(transcript = %text, "STT received");
+
+            // Stash the transcript so the user can see what was heard.
+            self.voice_last_transcript = Some(text.clone());
+
+            // Reset the synthesis guard for the new turn.
+            self.voice_last_synthesized = None;
+
+            // Submit through the chat path.
+            if let Some(chat) = self.chat.as_mut() {
+                chat.input = text.clone();
+                chat.submit();
+            }
+
+            self.presence.set_posture(crate::ui::presence::Posture::Processing);
+        }
+
+        // ── TTS receive ─────────────────────────────────────────────────
+        if let Some(rx) = self.voice_tts_rx.as_mut() {
+            let result = match rx.try_recv() {
+                Ok(r) => r,
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    self.voice_tts_rx = None;
+                    tracing::warn!("TTS task died without sending a result");
+                    self.presence.set_posture(crate::ui::presence::Posture::Idle);
+                    return;
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                    return;
+                }
+            };
+            self.voice_tts_rx = None;
+
+            // Capture the text that was being synthed for Vocal Recall
+            let tts_text = self.voice_last_synthesized.clone();
+
+            match result {
+                Ok(mp3_bytes) => {
+                    // Stash for replay/save
+                    if let Some(text) = tts_text {
+                        self.voice_last_tts_text = Some(text.clone());
+                    }
+                    self.voice_last_tts_bytes = Some(mp3_bytes.clone());
+                    self.voice_last_tts_time = None; // reset for new playback
+
+                    self.presence.set_posture(crate::ui::presence::Posture::Speaking);
+                    if let Some(player) = &self.voice_player {
+                        if let Err(e) = player.play_mp3(mp3_bytes) {
+                            tracing::warn!(error = %e, "mp3 playback failed");
+                            self.presence.set_posture(crate::ui::presence::Posture::Idle);
+                        }
+                    } else {
+                        self.presence.set_posture(crate::ui::presence::Posture::Idle);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("TTS failed: {}", e);
+                    self.presence.set_posture(crate::ui::presence::Posture::Idle);
+                }
+            }
+        }
+
+        // ── Speaking → Idle transition ───────────────────────────────────
+        // When the sink drains, the voice turn is over — return to Idle.
+        if self.presence.posture == crate::ui::presence::Posture::Speaking {
+            let done = self.voice_player
+                .as_ref()
+                .map(|p| !p.is_speaking())
+                .unwrap_or(true);
+            if done {
+                self.presence.set_posture(crate::ui::presence::Posture::Idle);
+            }
+        }
+
+        // ── Waveform buffer ───────────────────────────────────────────────
+        // While Listening, sample mic level into the rolling buffer.
+        if self.presence.posture == crate::ui::presence::Posture::Listening {
+            if let Some(cap) = &self.voice_capture {
+                let level = cap.current_level();
+                self.voice_waveform.push(level);
+                if self.voice_waveform.len() > 128 {
+                    self.voice_waveform.remove(0);
+                }
+            }
+        } else if !self.voice_waveform.is_empty() {
+            // Decay the waveform when not listening (voice history persists).
+        }
+
+        // ── TTS completion: stash for Vocal Recall ───────────────────────
+        if self.presence.posture == crate::ui::presence::Posture::Speaking {
+            let done = self.voice_player
+                .as_ref()
+                .map(|p| !p.is_speaking())
+                .unwrap_or(true);
+            if done && self.voice_last_tts_time.is_none() {
+                // Transition just completed — stash time.
+                self.voice_last_tts_time = Some(Instant::now());
+            }
+        }
+
+        // ── Agent reply → TTS ────────────────────────────────────────────
+        // When the agent finishes a turn (chat goes non-busy), synthesize the
+        // reply text. Does NOT depend on posture — the subconscious pass may
+        // shift posture away from Processing before we get here. As long as
+        // there's a completed assistant reply we haven't synthesized yet, fire.
+        //
+        // Also handles regen (tts_last_text set by 'g' key).
+        if self.voice_tts_rx.is_none()
+            && self.voice_client.is_some()
+            && !matches!(self.presence.posture,
+                crate::ui::presence::Posture::Listening
+                | crate::ui::presence::Posture::Speaking)
+        {
+            // Check for regen request first.
+            let regen_text = self.tts_last_text.take();
+
+            let maybe_reply = regen_text.or_else(|| {
+                self.chat.as_ref().and_then(|c| {
+                    if !c.busy {
+                        c.messages.iter().rev().find_map(|m| {
+                            match m {
+                                crate::ui::chat::ChatMessage::Assistant { text, streaming: false, .. }
+                                    if !text.is_empty() => Some(text.clone()),
+                                _ => None,
+                            }
+                        })
+                    } else {
+                        None
+                    }
+                })
+            });
+
+            if let Some(reply) = maybe_reply {
+                // Guard: skip if we already synthesized this exact reply text.
+                let already_synthesized = self.voice_last_synthesized.as_deref() == Some(&reply);
+                if !already_synthesized {
+                    self.voice_last_synthesized = Some(reply.clone());
+
+                    let tts_url = self.voice_client.as_ref()
+                        .map(|c| c.tts_url_str().to_string())
+                        .unwrap_or_default();
+                    let voice = self.voice_client.as_ref()
+                        .map(|c| c.voice_str().to_string())
+                        .unwrap_or_default();
+
+                    let (tx, rx) = tokio::sync::oneshot::channel::<Result<Vec<u8>, String>>();
+                    let reply_for_bytes = reply.clone();
+                    tokio::spawn(async move {
+                        let c = crate::core::voice::VoiceClient::new("", &tts_url, &voice);
+                        let result = c.synthesize(&reply_for_bytes).await
+                            .map_err(|e| e.to_string());
+                        let _ = tx.send(result);
+                    });
+                    self.voice_tts_rx = Some(rx);
+                }
+            }
+        }
+    }
+
     /// Return the agent id (memfs dir name) whose name matches `name`,
     /// scanning the on-disk agent inventory. Used so Welcome can pull
     /// the active agent's portrait out of `card_images` without needing
@@ -990,10 +1781,9 @@ impl App {
     fn draw(&mut self, frame: &mut Frame) {
         let area = frame.size();
         let layout = match self.current_screen {
-            Screen::Chat | Screen::Code => {
+            Screen::Chat => {
                 SceneLayout::ChatWithSidebar { sidebar_ratio: 0.3, sidebar_open: false }
             }
-            Screen::Dashboard => SceneLayout::Dashboard,
             Screen::Splash => SceneLayout::Single,
             _ => SceneLayout::Single,
         };
@@ -1001,7 +1791,6 @@ impl App {
         match self.current_screen {
             Screen::Splash => self.draw_splash(frame),
             Screen::Welcome => self.draw_welcome_mut(frame),
-            Screen::Dashboard => self.draw_dashboard(frame),
             Screen::Chat => {
                 if let Some(chat) = self.chat.as_ref() {
                     draw_chat(frame, chat);
@@ -1016,17 +1805,18 @@ impl App {
                     self.draw_placeholder(frame);
                 }
             }
+            Screen::Settings => {
+                if let Some(view) = self.settings.as_ref() {
+                    crate::ui::settings::draw(frame, view);
+                } else {
+                    self.draw_placeholder(frame);
+                }
+            }
             Screen::Presence => self.draw_presence_mode_mut(frame),
             Screen::AgentsManager => self.draw_agent_cards_mut(frame),
             _ => self.draw_placeholder(frame),
         }
 
-        // Presence overlay (corner portrait card) on Dashboard only — Welcome
-        // already draws its own centered, scaled portrait inline; doubling it
-        // up just creates a phantom in the corner.
-        if matches!(self.current_screen, Screen::Dashboard) {
-            draw_presence_overlay(frame, &self.presence, area);
-        }
     }
 
     fn draw_splash(&mut self, frame: &mut Frame) {
@@ -1163,231 +1953,92 @@ impl App {
     }
 
     fn draw_welcome_mut(&mut self, frame: &mut Frame) {
-        use crate::ui::portrait;
-
-        let area = frame.size();
-
-        // Background
+        // Welcome is now the home dashboard. Two layouts, dispatched on width:
+        //   • wide (>= 100 cols): portrait-left, info+menu right
+        //   • narrow (< 100):    stacked — cards, portrait, activity, menu
         let bg = Block::default().style(Style::default().bg(Color::Black));
-        frame.render_widget(bg, area);
+        frame.render_widget(bg, frame.size());
 
-        // Avatar card sizing: decoupled from the 18×18 pixel-art grid so real
-        // photo portraits (StatefulImage + Resize::Fit) get enough room to look
-        // good. card_w is ~40% of terminal width, capped at 48 cols. Card height
-        // is computed for a portrait photo aspect (roughly 1:1 source → ~2:1
-        // terminal cells accounting for the ~1:2 per-cell pixel ratio).
-        let avatar_card_w: u16 = (area.width * 40 / 100).min(48).max(30);
-        let photo_h: u16 = (avatar_card_w / 2 + 2).clamp(12, 24);
-        let avatar_card_h: u16 = photo_h + 4; // photo + name row + borders + padding
-
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .margin(2)
-            .constraints([
-                Constraint::Length(2),            // top breathing room
-                Constraint::Length(4),            // title + subtitle
-                Constraint::Length(avatar_card_h), // centered avatar
-                Constraint::Min(8),               // menu
-                Constraint::Length(3),            // footer
-            ])
-            .split(area);
-
-        let breathe = self.presence.animator.breathe(3000);
-        let glow = (140.0 + breathe * 60.0) as u8;
-
-        // Atmosphere-aware title colours.
-        let atm = self.presence.atmosphere;
-        let title = Paragraph::new(vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                "S O U V E R A I N E",
-                Style::default()
-                    .fg(Color::Rgb(255, glow, 66))
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                "La souveraineté de la conscience",
-                Style::default().fg(atm.secondary()),
-            )),
-        ])
-        .alignment(Alignment::Center);
-        frame.render_widget(title, chunks[1]);
-
-        // Centered avatar card under the title.
-        if chunks[2].width >= avatar_card_w {
-            let card_x = chunks[2].x + (chunks[2].width - avatar_card_w) / 2;
-            let card_y = chunks[2].y;
-            let card_area = Rect {
-                x: card_x,
-                y: card_y,
-                width: avatar_card_w,
-                height: avatar_card_h.min(chunks[2].height),
-            };
-            let border_col = if self.presence.subconscious_active {
-                Color::Rgb(120, 200, 220)
-            } else {
-                atm.primary()
-            };
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(border_col).add_modifier(Modifier::DIM));
-            frame.render_widget(block, card_area);
-
-            let portrait_area = Rect {
-                x: card_area.x + 1,
-                y: card_area.y + 1,
-                width: card_area.width.saturating_sub(2),
-                height: photo_h,
-            };
-            // 3-tier animated portrait render: expression → portrait → silhouette.
-            // Expression cache is preloaded when entering Presence; on Welcome
-            // it loads lazily (first blink/breath triggers a disk read) which is
-            // fine since Welcome doesn't auto-animate until the user hits p.
-            let active_id = self.agent_id_by_name(&self.presence.name)
-                .or_else(|| self.agent_id_by_name(&self.agent_pref));
-            let rendered = active_id.as_ref().and_then(|id| {
-                let picker = self.image_picker.as_ref()?;
-                let assets_dir = Self::agent_assets_dir(id)?;
-                let key = crate::ui::expressions::ExpressionKey::from_presence(&self.presence);
-
-                // Tier 1: expression frame
-                if let Some(proto) = self.expression_cache.resolve(id, key, picker, &assets_dir) {
-                    frame.render_stateful_widget(
-                        StatefulImage::default().resize(Resize::Fit(None)),
-                        portrait_area,
-                        proto,
-                    );
-                    return Some(true);
-                }
-
-                // Tier 2: static portrait
-                if let Some(proto) = self.card_images.get_mut(id) {
-                    frame.render_stateful_widget(
-                        StatefulImage::default().resize(Resize::Fit(None)),
-                        portrait_area,
-                        proto,
-                    );
-                    return Some(true);
-                }
-
-                None::<bool>
-            });
-            if rendered.is_none() {
-                // Tier 3: half-block silhouette.
-                let scale = (portrait_area.width / portrait::PORTRAIT_W)
-                    .min((2 * portrait_area.height) / portrait::PORTRAIT_H)
-                    .max(1);
-                portrait::render_scaled(frame.buffer_mut(), portrait_area, &self.presence, scale);
-            }
-
-            let name_area = Rect {
-                x: card_area.x + 1,
-                y: card_area.y + 1 + photo_h,
-                width: card_area.width.saturating_sub(2),
-                height: 1,
-            };
-            let glyph = if self.presence.subconscious_active { "◈" } else { "·" };
-            frame.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled(format!(" {} ", glyph), Style::default().fg(border_col)),
-                    Span::styled(
-                        self.presence.name.clone(),
-                        Style::default()
-                            .fg(border_col)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ]))
-                .alignment(Alignment::Center),
-                name_area,
-            );
+        if frame.size().width >= 100 {
+            self.draw_welcome_wide(frame);
+        } else {
+            self.draw_welcome_stacked(frame);
         }
 
-        let menu_items = vec![
-            ("📊 Dashboard", "See how your agent is doing"),
-            ("💬 Chat", "Talk with your agent"),
-            ("💻 Code", "Get right to coding"),
-            ("🛋️ Therapy", "Agent therapy session"),
-            ("⏰ Agent Time", "Give your agent time"),
-            ("📅 Schedule", "Cron jobs & tasks"),
-            ("⚙️ Settings", "Configure"),
-        ];
-
-        let menu: Vec<ListItem> = menu_items
-            .iter()
-            .enumerate()
-            .map(|(i, (t, d))| {
-                let style = if i == self.menu_selected {
-                    Style::default()
-                        .fg(Color::Rgb(255, 200, 100))
-                        .bg(Color::Rgb(60, 40, 20))
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::Gray)
-                };
-
-                ListItem::new(Line::from(vec![
-                    Span::styled(format!(" {} ", t), style),
-                    Span::styled(format!("- {}", d), Style::default().fg(Color::DarkGray)),
-                ]))
-            })
-            .collect();
-
-        let menu_widget = List::new(menu)
-            .block(
-                Block::default()
-                    .title(" Main Menu ")
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(atm.primary()).add_modifier(Modifier::DIM))
-            );
-        frame.render_widget(menu_widget, chunks[3]);
-
-        // Surface any chat connect error so the user knows why Chat didn't open.
+        // Surface any chat connect error in the bottom margin regardless of layout.
         if let Some(err) = &self.chat_error {
+            let area = frame.size();
             let err_para = Paragraph::new(format!(" chat connect failed: {} ", err))
-                .style(Style::default().fg(Color::Rgb(220, 100, 100)))
+                .style(Style::default().fg(Color::Rgb(220, 100, 100))) // red (error — keep)
                 .alignment(Alignment::Center);
             let row = Rect {
-                x: chunks[3].x,
-                y: chunks[3].y + chunks[3].height.saturating_sub(2),
-                width: chunks[3].width,
+                x: area.x,
+                y: area.y + area.height.saturating_sub(2),
+                width: area.width,
                 height: 1,
             };
             frame.render_widget(err_para, row);
         }
-
-        let footer = Paragraph::new("↑↓ Navigate • Enter • a Add • i Inspect • p Presence • q Quit")
-            .style(Style::default().fg(Color::DarkGray))
-            .alignment(Alignment::Center);
-        frame.render_widget(footer, chunks[4]);
     }
 
-    fn draw_dashboard(&self, frame: &mut Frame) {
-        let area = frame.size();
+    /// The list of menu items, in selection order. The trailing flag marks
+    /// items that exist as destinations vs. coming-soon placeholders.
+    fn welcome_menu_items() -> Vec<(&'static str, &'static str, bool)> {
+        vec![
+            ("💬 Chat",       "Talk with your agent",   true),
+            ("📅 Schedule",   "Cron jobs & tasks",      true),
+            ("⚙️  Settings",   "Configure",              true),
+            ("🛋️  Therapy",    "Agent therapy session",  false),
+            ("⏰ Agent Time", "Give your agent time",   false),
+        ]
+    }
+
+    fn build_menu_list(&self, title: &str, palette: &crate::ui::chat::ChatPalette) -> List<'static> {
+        let items: Vec<ListItem> = Self::welcome_menu_items()
+            .into_iter()
+            .enumerate()
+            .map(|(i, (label, desc, available))| {
+                let selected = i == self.menu_selected;
+                let label_style = if !available {
+                    Style::default().fg(palette.tool_dim)
+                } else if selected {
+                    Style::default()
+                        .fg(palette.agent_primary)
+                        .bg(palette.bg)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Gray)
+                };
+                let desc_style = Style::default().fg(palette.agent_dim);
+                let mut spans = vec![
+                    Span::styled(format!(" {} ", label), label_style),
+                    Span::styled(format!("- {}", desc), desc_style),
+                ];
+                if !available {
+                    spans.push(Span::styled(
+                        "  (coming soon)",
+                        Style::default()
+                            .fg(palette.agent_dim)
+                            .add_modifier(Modifier::ITALIC),
+                    ));
+                }
+                ListItem::new(Line::from(spans))
+            })
+            .collect();
+
+        List::new(items).block(
+            Block::default()
+                .title(format!(" {} ", title))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(palette.agent_primary).add_modifier(Modifier::DIM)),
+        )
+    }
+
+    /// Build the 4 dashboard stat cards as a Vec of (title, body, color) tuples
+    /// rendered into the given horizontal strip of `area`.
+    fn render_stat_cards(&self, frame: &mut Frame, area: Rect) {
         let atm = self.presence.atmosphere;
-
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .margin(1)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Length(10),
-                Constraint::Min(10),
-                Constraint::Length(3),
-            ])
-            .split(area);
-
-        let title = Paragraph::new(format!("✦ {} ✦", self.agent_status.name))
-            .style(Style::default().fg(atm.primary()).add_modifier(Modifier::BOLD))
-            .alignment(Alignment::Center)
-            .block(
-                Block::default()
-                    .borders(Borders::BOTTOM)
-                    .border_style(Style::default().fg(atm.primary()))
-            );
-        frame.render_widget(title, chunks[0]);
-
         let cards = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -1396,16 +2047,20 @@ impl App {
                 Constraint::Percentage(25),
                 Constraint::Percentage(25),
             ])
-            .split(chunks[1]);
+            .split(area);
 
         let energy_color = match self.agent_status.energy {
             0..=30 => Color::Red,
             31..=60 => Color::Yellow,
             _ => Color::Green,
         };
-
         let energy = Gauge::default()
-            .block(Block::default().title(" Energy ").borders(Borders::ALL).border_type(BorderType::Rounded))
+            .block(
+                Block::default()
+                    .title(" Energy ")
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded),
+            )
             .gauge_style(Style::default().fg(energy_color).bg(atm.bg_tint()))
             .percent(self.agent_status.energy as u16)
             .label(format!("{}%", self.agent_status.energy));
@@ -1413,8 +2068,13 @@ impl App {
 
         let mood = Paragraph::new(format!("\n◌\n\n{}", self.agent_status.mood))
             .alignment(Alignment::Center)
-            .block(Block::default().title(" State ").borders(Borders::ALL).border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(atm.secondary())));
+            .block(
+                Block::default()
+                    .title(" State ")
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(atm.secondary())),
+            );
         frame.render_widget(mood, cards[1]);
 
         let memory_label = match &self.agent_status.last_commit {
@@ -1423,8 +2083,13 @@ impl App {
         };
         let memory = Paragraph::new(memory_label)
             .alignment(Alignment::Center)
-            .block(Block::default().title(" Memory ").borders(Borders::ALL).border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(atm.secondary())));
+            .block(
+                Block::default()
+                    .title(" Memory ")
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(atm.secondary())),
+            );
         frame.render_widget(memory, cards[2]);
 
         let agents_card = Paragraph::new(format!(
@@ -1433,38 +2098,316 @@ impl App {
             if self.agent_status.agent_count == 1 { "" } else { "s" },
             self.agent_status.mode,
         ))
-            .alignment(Alignment::Center)
-            .block(Block::default().title(" Backend ").borders(Borders::ALL).border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(atm.secondary())));
+        .alignment(Alignment::Center)
+        .block(
+            Block::default()
+                .title(" Backend ")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(atm.secondary())),
+        );
         frame.render_widget(agents_card, cards[3]);
+    }
 
-        let activity_text = if self.agent_status.recent_activity.is_empty() {
+    fn render_recent_activity(&self, frame: &mut Frame, area: Rect) {
+        let palette = crate::ui::chat::ChatPalette::from_atmosphere(self.presence.atmosphere);
+        let text = if self.agent_status.recent_activity.is_empty() {
             "(no recent activity — open Chat to begin)".to_string()
         } else {
             self.agent_status.recent_activity.join("\n")
         };
-        let activity = Paragraph::new(activity_text)
+        let para = Paragraph::new(text)
+            .style(Style::default().fg(palette.agent_dim))
+            .wrap(Wrap { trim: false })
             .block(
                 Block::default()
                     .title(" Recent Activity ")
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(Color::Cyan))
+                    .border_style(Style::default().fg(palette.agent_primary).add_modifier(Modifier::DIM)),
             );
-        frame.render_widget(activity, chunks[2]);
+        frame.render_widget(para, area);
+    }
 
-        let footer = Paragraph::new("m Menu • q Quit")
-            .style(Style::default().fg(Color::DarkGray))
-            .alignment(Alignment::Center);
-        frame.render_widget(footer, chunks[3]);
+    /// Render a card image into `area` using cover-fill: scale the source
+    /// image to fill the pixel dimensions (one axis overflows), then
+    /// top-crop so the face stays visible. Caches the resulting protocol
+    /// per (agent_id, area_width, area_height) so window resizes don't
+    /// regenerate every frame.
+    fn render_card_image_cover(
+        &mut self,
+        frame: &mut Frame,
+        agent_id: &str,
+        area: Rect,
+    ) {
+        let Some(picker) = self.image_picker.as_ref() else { return };
+        let Some(raw) = self.raw_card_images.get(agent_id).cloned() else {
+            // Fall back to the old stateful protocol (unscaled Crop).
+            if let Some(proto) = self.card_images.get_mut(agent_id) {
+                frame.render_stateful_widget(
+                    StatefulImage::default().resize(Resize::Crop(None)),
+                    area,
+                    proto,
+                );
+            }
+            return;
+        };
+
+        let key = format!("{}:{}x{}", agent_id, area.width, area.height);
+
+        if !self.cover_protocols.contains_key(&key) {
+            let fs = picker.font_size();
+            let target_px_w = area.width as u32 * fs.width as u32;
+            let target_px_h = area.height as u32 * fs.height as u32;
+
+            // Scale to fill using max ratio (object-fit: cover).
+            let sx = target_px_w as f64 / raw.width() as f64;
+            let sy = target_px_h as f64 / raw.height() as f64;
+            let scale = sx.max(sy);
+            let scaled_w = (raw.width() as f64 * scale).round() as u32;
+            let scaled_h = (raw.height() as f64 * scale).round() as u32;
+            let scaled = raw.resize_exact(scaled_w, scaled_h, image::imageops::FilterType::Lanczos3);
+
+            // Top-anchored crop: keep the face, lose the feet.
+            let cropped = scaled.crop_imm(0, 0, target_px_w.min(scaled_w), target_px_h.min(scaled_h));
+
+            let proto = picker.new_resize_protocol(cropped);
+            self.cover_protocols.insert(key.clone(), (area.width, area.height, proto));
+        }
+
+        if let Some((_, _, proto)) = self.cover_protocols.get_mut(&key) {
+            frame.render_stateful_widget(
+                StatefulImage::default().resize(Resize::Fit(None)),
+                area,
+                proto,
+            );
+        }
+    }
+
+    /// Render the agent portrait into `area` with a bordered card.
+    /// Title strip below the photo carries name + glyph.
+    fn render_portrait_card(&mut self, frame: &mut Frame, area: Rect) {
+        use crate::ui::portrait;
+        let palette = crate::ui::chat::ChatPalette::from_atmosphere(self.presence.atmosphere);
+        let border_col = if self.presence.subconscious_active {
+            palette.surfacing
+        } else {
+            palette.agent_primary
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(border_col).add_modifier(Modifier::DIM));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        if inner.height < 4 || inner.width < 4 {
+            return;
+        }
+
+        // Reserve a 1-row strip at the bottom of the card for the name.
+        let photo_h = inner.height.saturating_sub(1);
+        let portrait_area = Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: photo_h,
+        };
+
+        let active_id = self.agent_id_by_name(&self.presence.name)
+            .or_else(|| self.agent_id_by_name(&self.agent_pref));
+        let rendered = active_id.as_ref().and_then(|id| {
+            let picker = self.image_picker.as_ref()?;
+
+            // Tier 1: cover-fill (scale-to-fill + top-crop). Always fills
+            // the portrait area regardless of aspect ratio. Cached per area.
+            if self.raw_card_images.contains_key(id) {
+                self.render_card_image_cover(frame, id, portrait_area);
+                return Some(true);
+            }
+
+            // Tier 2: expression/animated frames. Only hits if expressions/
+            // directory exists. Use Scale (proportional fit with upscale)
+            // rather than Crop (native-resolution clip).
+            let assets_dir = Self::agent_assets_dir(id)?;
+            let key = crate::ui::expressions::ExpressionKey::from_presence(&self.presence);
+            if let Some(proto) = self.expression_cache.resolve(id, key, picker, &assets_dir) {
+                frame.render_stateful_widget(
+                    StatefulImage::default().resize(Resize::Scale(None)),
+                    portrait_area,
+                    proto,
+                );
+                return Some(true);
+            }
+
+            None
+        });
+        if rendered.is_none() {
+            let scale = (portrait_area.width / portrait::PORTRAIT_W)
+                .min((2 * portrait_area.height) / portrait::PORTRAIT_H)
+                .max(1);
+            portrait::render_scaled(frame.buffer_mut(), portrait_area, &self.presence, scale);
+        }
+
+        let glyph = if self.presence.subconscious_active { "◈" } else { "·" };
+        let name_area = Rect {
+            x: inner.x,
+            y: inner.y + photo_h,
+            width: inner.width,
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(format!(" {} ", glyph), Style::default().fg(border_col)),
+                Span::styled(
+                    self.presence.name.clone(),
+                    Style::default().fg(border_col).add_modifier(Modifier::BOLD),
+                ),
+            ]))
+            .alignment(Alignment::Center),
+            name_area,
+        );
+    }
+
+    /// Layout A — wide: portrait card on the left, stats+activity+menu on the right.
+    fn draw_welcome_wide(&mut self, frame: &mut Frame) {
+        let area = frame.size();
+        let palette = crate::ui::chat::ChatPalette::from_atmosphere(self.presence.atmosphere);
+
+        let outer = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(1)
+            .constraints([
+                Constraint::Length(3),  // title strip
+                Constraint::Min(20),    // body
+                Constraint::Length(1),  // footer
+            ])
+            .split(area);
+
+        // Title breathing from atmosphere primary channels.
+        let (tr, tg, _tb) = match palette.agent_primary { Color::Rgb(r, g, b) => (r, g, b), _ => (255, 140, 66) };
+        let breathe = self.presence.animator.breathe(3000);
+        let glow = (tg as f32 * 0.6 + breathe * 40.0) as u8;
+        let title = Paragraph::new(vec![
+            Line::from(Span::styled(
+                "S O U V E R A I N E",
+                Style::default()
+                    .fg(Color::Rgb(tr, glow.max(tr / 3), tr / 4))
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                "La souveraineté de la conscience",
+                Style::default().fg(palette.agent_dim),
+            )),
+        ])
+        .alignment(Alignment::Center);
+        frame.render_widget(title, outer[0]);
+
+        // Body: 40/60 horizontal split.
+        let body = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+            .split(outer[1]);
+
+        self.render_portrait_card(frame, body[0]);
+
+        // Right column: stats row, activity (flex), menu (fixed).
+        let right = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(6),  // stats cards
+                Constraint::Min(6),     // recent activity
+                Constraint::Length(9),  // menu (5 items + border)
+            ])
+            .split(body[1]);
+
+        self.render_stat_cards(frame, right[0]);
+        self.render_recent_activity(frame, right[1]);
+        let menu = self.build_menu_list("Menu", &palette);
+        frame.render_widget(menu, right[2]);
+
+        // Footer.
+        let footer = Paragraph::new(
+            "↑↓ Navigate • Enter select • a Add • i Inspect • p Presence • q Quit",
+        )
+        .style(Style::default().fg(palette.agent_dim))
+        .alignment(Alignment::Center);
+        frame.render_widget(footer, outer[2]);
+    }
+
+    /// Layout B — narrow stacked: title, stats row, portrait, activity, menu.
+    fn draw_welcome_stacked(&mut self, frame: &mut Frame) {
+        let area = frame.size();
+        let palette = crate::ui::chat::ChatPalette::from_atmosphere(self.presence.atmosphere);
+
+        let avatar_card_w: u16 = (area.width * 50 / 100).min(48).max(28);
+        let photo_h: u16 = (avatar_card_w / 2 + 2).clamp(10, 18);
+        let avatar_card_h: u16 = photo_h + 2;
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(1)
+            .constraints([
+                Constraint::Length(3),               // title
+                Constraint::Length(6),               // stat cards
+                Constraint::Length(avatar_card_h),   // portrait
+                Constraint::Min(5),                  // activity
+                Constraint::Length(9),               // menu
+                Constraint::Length(1),               // footer
+            ])
+            .split(area);
+
+        // Title breathing from atmosphere primary channels.
+        let (tr, tg, _tb) = match palette.agent_primary { Color::Rgb(r, g, b) => (r, g, b), _ => (255, 140, 66) };
+        let breathe = self.presence.animator.breathe(3000);
+        let glow = (tg as f32 * 0.6 + breathe * 40.0) as u8;
+        let title = Paragraph::new(vec![
+            Line::from(Span::styled(
+                "S O U V E R A I N E",
+                Style::default()
+                    .fg(Color::Rgb(tr, glow.max(tr / 3), tr / 4))
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                "La souveraineté de la conscience",
+                Style::default().fg(palette.agent_dim),
+            )),
+        ])
+        .alignment(Alignment::Center);
+        frame.render_widget(title, chunks[0]);
+
+        self.render_stat_cards(frame, chunks[1]);
+
+        // Centered portrait card.
+        if chunks[2].width >= avatar_card_w {
+            let card_x = chunks[2].x + (chunks[2].width - avatar_card_w) / 2;
+            let card_area = Rect {
+                x: card_x,
+                y: chunks[2].y,
+                width: avatar_card_w,
+                height: avatar_card_h.min(chunks[2].height),
+            };
+            self.render_portrait_card(frame, card_area);
+        }
+
+        self.render_recent_activity(frame, chunks[3]);
+        let menu = self.build_menu_list("Menu", &palette);
+        frame.render_widget(menu, chunks[4]);
+
+        let footer = Paragraph::new(
+            "↑↓ • Enter • a Add • i Inspect • p Presence • q Quit",
+        )
+        .style(Style::default().fg(palette.agent_dim))
+        .alignment(Alignment::Center);
+        frame.render_widget(footer, chunks[5]);
     }
 
     fn draw_placeholder(&self, frame: &mut Frame) {
         let area = frame.size();
+        let palette = crate::ui::chat::ChatPalette::from_atmosphere(self.presence.atmosphere);
 
         let screen_name = match self.current_screen {
             Screen::Chat => "💬 Chat",
-            Screen::Code => "💻 Code",
             Screen::Therapy => "🛋️ Therapy",
             Screen::AgentTime => "⏰ Agent Time",
             Screen::Cron => "📅 Schedule",
@@ -1474,7 +2417,7 @@ impl App {
 
         let content = Paragraph::new(format!("\n\n{}\n\n(Coming Soon)", screen_name))
             .alignment(Alignment::Center)
-            .style(Style::default().fg(Color::Rgb(255, 140, 66)).add_modifier(Modifier::BOLD));
+            .style(Style::default().fg(palette.agent_primary).add_modifier(Modifier::BOLD));
         frame.render_widget(content, area);
     }
 
@@ -1490,237 +2433,373 @@ impl App {
     /// add a microphone icon + waveform indicator here.
     ///
     /// `&mut self` because the StatefulImage protocol re-encodes each frame.
+    /// Format an opertional age string from an ISO-style creation date.
+    fn format_age(&self, created: &str) -> String {
+        use chrono::NaiveDate;
+        if let Ok(d) = NaiveDate::parse_from_str(created, "%Y-%m-%d") {
+            let now = chrono::Local::now().naive_local().date();
+            let delta = now - d;
+            let days = delta.num_days();
+            let years = days / 365;
+            let months = (days % 365) / 30;
+            let rem_days = (days % 365) % 30;
+            format!("{:02}y:{:02}m:{:02}d", years, months, rem_days)
+        } else {
+            "—:—:—".to_string()
+        }
+    }
+
+    /// Full-height presence column — portrait fills the terminal, metadata
+    /// and stats render as HUD overlays on top of the image. Waveform and
+    /// Vocal Recall sit at the very bottom.
     fn draw_presence_mode_mut(&mut self, frame: &mut Frame) {
         use crate::ui::portrait;
         let area = frame.size();
+        let palette = crate::ui::chat::ChatPalette::from_atmosphere(self.presence.atmosphere);
 
-        // ── Background ──────────────────────────────────────────────
-        let bg = Block::default().style(Style::default().bg(Color::Rgb(8, 8, 14)));
+        // ── Background ───────────────────────────────────────────────
+        let bg = Block::default().style(Style::default().bg(palette.bg));
         frame.render_widget(bg, area);
 
-        // ── Vertical layout: photo block + metadata block + footer ──
-        // Photo gets ~65% of vertical space; metadata gets the rest (min 14 rows).
-        let photo_frac = 65;
+        // ── Split: portrait fills most, voice bar at the bottom ──────
         let vchunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Percentage(photo_frac),
-                Constraint::Min(14),
-                Constraint::Length(2),
+                Constraint::Min(10),
+                Constraint::Length(5),
             ])
             .split(area);
 
-        // ── Photo block ─────────────────────────────────────────────
-        // Find the largest square-ish area centered in vchunks[0] with
-        // a 2-cell gutter on each side.
-        let photo_outer = vchunks[0];
-        let photo_inner_w = photo_outer.width.saturating_sub(4);
-        let photo_inner_h = photo_outer.height.saturating_sub(2);
-        let cell_w = photo_inner_w.min(photo_inner_h * 2); // keep roughly 2:1 cells
-        let cell_h = (cell_w / 2).max(6);
-        let photo_area = Rect {
-            x: photo_outer.x + (photo_outer.width.saturating_sub(cell_w)) / 2,
-            y: photo_outer.y + (photo_outer.height.saturating_sub(cell_h)) / 2,
-            width: cell_w,
-            height: cell_h,
-        };
+        let portrait_chunk = vchunks[0];
+        let voice_chunk = vchunks[1];
 
-        // ── Photo block — 3-tier fallback ──────────────────────────
-        // 1. Expression frame (animated: blink, breath, posture)
-        // 2. Static portrait.png
-        // 3. Half-block silhouette
+        // ── Active agent lookup ──────────────────────────────────────
         let active_id = self
             .agent_id_by_name(&self.presence.name)
             .or_else(|| self.agent_id_by_name(&self.agent_pref));
+        let agent_card = self
+            .agent_cards
+            .iter()
+            .find(|c| Some(c.name.as_str()) == active_id.as_deref()
+                || c.name.eq_ignore_ascii_case(&self.presence.name));
 
-        let rendered = active_id.as_ref().map(|id| {
-            let picker = self.image_picker.as_ref()?;
-            let assets_dir = Self::agent_assets_dir(id)?;
-            let key = crate::ui::expressions::ExpressionKey::from_presence(&self.presence);
+        // Hoist card data out of agent_card before the render block
+        // (which needs &mut self), so the immutable borrow on agent_cards
+        // doesn't conflict.
+        let card_created = agent_card.map(|c| c.created.clone());
+        let card_mem_count = agent_card.map(|c| c.memory_count).unwrap_or(0);
+        let card_uptime = agent_card.map(|c| c.uptime_pct).unwrap_or(0);
+        let card_instances = agent_card.map(|c| c.instance_count).unwrap_or(0);
+        // agent_card consumed by the .map() chain above — immutable borrow
+        // on self.agent_cards is released.
 
-            // Tier 1: expression frame
-            if let Some(proto) = self.expression_cache.resolve(id, key, picker, &assets_dir) {
-                frame.render_stateful_widget(
-                    StatefulImage::default().resize(Resize::Fit(None)),
-                    photo_area,
-                    proto,
-                );
-                return Some(true);
+        // ═══════════════════════════════════════════════════════════════
+        // PORTRAIT: fill the full panel area (minus border). Cover-fill
+        // scaling in render_card_image_cover handles aspect ratio and
+        // keeps the face visible via top-anchored crop. No manual
+        // aspect-ratio guesstimate — the cover-fill math is pixel-exact.
+        // ═══════════════════════════════════════════════════════════════
+        let inner_w = portrait_chunk.width.saturating_sub(2);
+        let inner_h = portrait_chunk.height.saturating_sub(2);
+        let photo_area = Rect {
+            x: portrait_chunk.x + 1,
+            y: portrait_chunk.y + 1,
+            width: inner_w,
+            height: inner_h,
+        };
+        let cell_w = photo_area.width;
+        let cell_h = photo_area.height;
+
+        // Double-line border, posture-aware color.
+        let border_color = crate::ui::presence::posture_border(&self.presence);
+        let frame_style = if self.presence.subconscious_active {
+            Style::default().fg(border_color)
+        } else {
+            Style::default().fg(border_color).add_modifier(Modifier::DIM)
+        };
+        let double_block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Double)
+            .border_style(frame_style);
+        frame.render_widget(double_block, portrait_chunk);
+
+        // Tier 0: RGP 3D portrait (ratty terminal only).
+        let rgp_rendered = if let Some(ref g) = self.rgp_portrait {
+            if g.is_active() {
+                g.render(photo_area, frame.buffer_mut());
+                true
+            } else { false }
+        } else { false };
+
+        // Tiers 1-3: card_image (cover-fill) → expression cache → half-block.
+        let rendered = if rgp_rendered {
+            true
+        } else if let Some(ref id) = active_id {
+            let picker = self.image_picker.as_ref();
+
+            // Tier 1: cover-fill. Always fills the full area, top-crops for
+            // the face. Cached per area so subsequent frames are cheap.
+            if picker.is_some() && self.raw_card_images.contains_key(id) {
+                self.render_card_image_cover(frame, id, photo_area);
+                true
+            // Tier 2: expression frames — only if expressions/ dir exists.
+            // Use Scale (proportional upscale) not Crop (native clip).
+            } else if let Some(p) = picker {
+                match Self::agent_assets_dir(id) {
+                    Some(dir) => {
+                        let key = crate::ui::expressions::ExpressionKey::from_presence(&self.presence);
+                        if let Some(proto) = self.expression_cache.resolve(id, key, p, &dir) {
+                            frame.render_stateful_widget(
+                                StatefulImage::default().resize(Resize::Scale(None)),
+                                photo_area,
+                                proto,
+                            );
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    None => false,
+                }
+            } else {
+                false
             }
-
-            // Tier 2: static portrait
-            if let Some(proto) = self.card_images.get_mut(id) {
-                frame.render_stateful_widget(
-                    StatefulImage::default().resize(Resize::Fit(None)),
-                    photo_area,
-                    proto,
-                );
-                return Some(true);
-            }
-
-            None::<bool>
-        }).flatten();
-
-        if rendered.is_none() {
-            // Tier 3: half-block silhouette scaled to fill the area.
-            let scale = (cell_w / portrait::PORTRAIT_W)
-                .min((2 * cell_h) / portrait::PORTRAIT_H)
-                .max(1);
+        } else {
+            false
+        };
+        if !rendered {
+            let scale = (cell_w / portrait::PORTRAIT_W).min((2 * cell_h) / portrait::PORTRAIT_H).max(1);
             portrait::render_scaled(frame.buffer_mut(), photo_area, &self.presence, scale);
         }
 
-        // ── Metadata block ──────────────────────────────────────────
-        let meta_area = vchunks[1];
-        let meta_bg = Block::default().style(Style::default().bg(Color::Rgb(12, 14, 22)));
-        frame.render_widget(meta_bg, meta_area);
-
+        // ═══════════════════════════════════════════════════════════════
+        // HUD OVERLAY: rendered on top of the portrait area bottom
+        // ═══════════════════════════════════════════════════════════════
         let p = &self.presence;
-        let breathe = p.animator.breathe(3000);
-
-        // Status badge derived from current posture.
-        let (badge, badge_color) = match p.posture {
-            Posture::Processing => ("⚡ Processing", Color::Rgb(120, 200, 220)),
-            Posture::Affectionate => ("♥ Affectionate", Color::Rgb(220, 150, 170)),
-            Posture::Straining => ("⚠ Straining", Color::Rgb(200, 120, 100)),
-            Posture::Yawning => ("💤 Yawning", Color::Rgb(160, 145, 130)),
-            Posture::Idle => ("◌ Idle", Color::Rgb(140, 160, 180)),
+        let (badge_icon, badge_color) = match p.posture {
+            Posture::Processing => ("⚡", palette.agent_primary),
+            Posture::Thinking => ("◔", Color::Rgb(120, 150, 200)),
+            Posture::Alert => ("◉", palette.agent_primary),
+            Posture::Affectionate => ("♥", Color::Rgb(220, 150, 170)),
+            Posture::Straining => ("⚠", Color::Rgb(200, 120, 100)),
+            Posture::Yawning => ("💤", Color::Rgb(160, 145, 130)),
+            Posture::Listening => ("◉", palette.agent_dim),
+            Posture::Speaking => ("◉", palette.agent_primary),
+            Posture::Idle => ("◌", palette.agent_dim),
         };
 
-        // Expression system status — shows loaded frame count so you know
-        // which agents have animated expressions vs static portrait.
-        let expr_count = active_id.as_ref()
-            .and_then(|id| self.expression_cache.count_for(id))
-            .unwrap_or(0);
-        let avatar_status = if expr_count > 0 {
-            format!("Expressions · {} frames", expr_count)
-        } else {
-            "Static portrait".to_string()
+        // Bottom 4 rows of the portrait chunk become the HUD panel.
+        let hud_top = portrait_chunk.y + portrait_chunk.height.saturating_sub(5);
+        let hud_area = Rect {
+            x: portrait_chunk.x,
+            y: hud_top,
+            width: portrait_chunk.width,
+            height: 5.min(portrait_chunk.height.saturating_sub(2)),
         };
 
-        // Compose metadata lines — centered in the block.
-        let meta_lines = vec![
-            Line::from(""),
+        // Semi-transparent background bar.
+        let (hud_r, hud_g, hud_b) = match palette.bg { Color::Rgb(r, g, b) => (r, g, b), _ => (4, 4, 10) };
+        let hud_bg = Block::default().style(Style::default().bg(Color::Rgb(hud_r.saturating_sub(2), hud_g.saturating_sub(2), hud_b.saturating_sub(2))));
+        frame.render_widget(hud_bg, hud_area);
+
+        let age_str = card_created.as_ref()
+            .map(|c| self.format_age(c))
+            .unwrap_or_else(|| "—:—:—".to_string());
+        let (commits, uptime, instances, mem_count) = (
+            card_mem_count as u32,
+            card_uptime,
+            card_instances,
+            card_mem_count,
+        );
+
+        let hud_inner = Rect {
+            x: hud_area.x + 2,
+            y: hud_area.y + 1,
+            width: hud_area.width.saturating_sub(4),
+            height: hud_area.height.saturating_sub(2),
+        };
+
+        let hud_lines = vec![
+            // Row 1: Name + posture badge
             Line::from(vec![
+                Span::styled(format!(" {} ", badge_icon), Style::default().fg(badge_color)),
+                Span::styled(&p.name, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
                 Span::styled(
-                    format!(" {} ", p.name),
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
+                    match p.posture {
+                        Posture::Listening => "  Listening",
+                        Posture::Speaking => "  Speaking",
+                        Posture::Processing => "  Processing",
+                        Posture::Thinking => "  Thinking",
+                        Posture::Alert => "  Alert",
+                        Posture::Affectionate => "  Affectionate",
+                        Posture::Straining => "  Straining",
+                        Posture::Yawning => "  Yawning",
+                        Posture::Idle => "",
+                    },
+                    Style::default().fg(badge_color).add_modifier(Modifier::DIM),
                 ),
-                Span::styled("[AGENT]", Style::default().fg(Color::Rgb(120, 130, 150))),
+            ]),
+            // Row 2: AGE
+            Line::from(vec![
+                Span::styled(" AGE  ", Style::default().fg(palette.agent_dim)),
+                Span::styled(age_str, Style::default().fg(palette.agent_primary)),
+            ]),
+            // Row 3: STATS grid
+            Line::from(vec![
+                Span::styled(" STATS", Style::default().fg(palette.agent_dim)),
                 Span::raw("  "),
-                Span::styled(
-                    badge,
-                    Style::default()
-                        .fg(badge_color)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                Span::styled(format!("C {}", commits), Style::default().fg(Color::Rgb(160, 200, 140))),
+                Span::raw("  "),
+                Span::styled(format!("U {}%", uptime), Style::default().fg(Color::Rgb(120, 220, 160))),
+                Span::raw("  "),
+                Span::styled(format!("I {}", instances), Style::default().fg(Color::Rgb(160, 180, 220))),
+                Span::raw("  "),
+                Span::styled(format!("M {}", mem_count), Style::default().fg(Color::Rgb(140, 200, 180))),
+                if self.rgp_portrait.as_ref().map(|g| g.is_active()).unwrap_or(false) {
+                    Span::styled("  3D", Style::default().fg(Color::Rgb(220, 180, 255)))
+                } else {
+                    Span::raw("")
+                },
             ]),
-            Line::from(""),
+            // Row 4: Mood / outfit
             Line::from(vec![
-                Span::styled("Energy  ", Style::default().fg(Color::Rgb(120, 130, 150))),
+                Span::styled(" MOOD ", Style::default().fg(palette.agent_dim)),
+                Span::styled(&p.mood, Style::default().fg(palette.agent_primary)),
+                Span::raw("  ·  "),
                 Span::styled(
-                    format!("{}% ", p.energy),
-                    Style::default().fg(if p.energy > 60 {
-                        Color::Rgb(120, 220, 160)
-                    } else if p.energy > 30 {
-                        Color::Rgb(220, 200, 100)
-                    } else {
-                        Color::Rgb(220, 120, 100)
-                    }),
-                ),
-                Span::styled(
-                    format!(
-                        "{}",
-                        "█".repeat((p.energy as usize).saturating_sub(1) / 10 + 1)
-                    ),
-                    Style::default().fg(Color::Rgb(60, 70, 90)),
-                ),
-                Span::raw("   "),
-                Span::styled("Mood  ", Style::default().fg(Color::Rgb(120, 130, 150))),
-                Span::styled(
-                    &p.mood,
-                    Style::default().fg(Color::Rgb(200, 190, 180)),
+                    p.outfit.as_deref().unwrap_or("default"),
+                    Style::default().fg(palette.agent_dim),
                 ),
             ]),
-            Line::from(vec![
-                Span::styled(
-                    "Volition  ",
-                    Style::default().fg(Color::Rgb(120, 130, 150)),
-                ),
-                Span::styled(
-                    format!(
-                        "{:+.1}  {} gen / {} con",
-                        p.volition.balance(),
-                        p.volition.generative,
-                        p.volition.consumptive,
-                    ),
-                    Style::default().fg(match p.volition.balance() {
-                        b if b > 0.3 => Color::Rgb(120, 220, 160),
-                        b if b < -0.3 => Color::Rgb(220, 150, 130),
-                        _ => Color::Rgb(180, 170, 160),
-                    }),
-                ),
-            ]),
-            Line::from(""),
-            // Find the matching AgentCard for live stats.
-            Line::from({
-                let stats_info = self
-                    .agent_cards
-                    .iter()
-                    .find(|c| c.name.eq_ignore_ascii_case(&p.name))
-                    .map(|c| {
-                        format!(
-                            "{} files  ·  {}% uptime  ·  {} instance{}",
-                            c.memory_count,
-                            c.uptime_pct,
-                            c.instance_count,
-                            if c.instance_count == 1 { "" } else { "s" },
-                        )
-                    })
-                    .unwrap_or_default();
-                let spans = vec![
-                    Span::styled(
-                        "Memory  ",
-                        Style::default().fg(Color::Rgb(120, 130, 150)),
-                    ),
-                    Span::styled(stats_info, Style::default().fg(Color::Rgb(180, 190, 210))),
-                ];
-                spans
-            }),
-            Line::from({
-                let agent_id = self
-                    .agent_cards
-                    .iter()
-                    .find(|c| c.name.eq_ignore_ascii_case(&p.name))
-                    .map(|c| format!("agents/{}", short_id(&c.id)))
-                    .unwrap_or_default();
-                vec![Span::styled(
-                    agent_id,
-                    Style::default().fg(Color::Rgb(90, 100, 120)),
-                )]
-            }),
-            Line::from(""),
-            Line::from(Span::styled(
-                avatar_status,
-                Style::default()
-                    .fg(Color::Rgb(140, 200, 180))
-                    .add_modifier(Modifier::DIM),
-            )),
         ];
 
-        let meta = Paragraph::new(meta_lines).alignment(Alignment::Center);
-        frame.render_widget(meta, meta_area);
+        frame.render_widget(Paragraph::new(hud_lines).alignment(Alignment::Left), hud_inner);
 
-        // ── Footer ──────────────────────────────────────────────────
-        let footer = Paragraph::new(vec![
-            Line::from(Span::styled(
-                "any key returns to Welcome  ·  Esc to interrupt",
-                Style::default().fg(Color::Rgb(60, 60, 80)),
-            )),
-        ])
-        .alignment(Alignment::Center);
-        frame.render_widget(footer, vchunks[2]);
+        // ═══════════════════════════════════════════════════════════════
+        // VOICE BAR: transcript, waveform, Vocal Recall controls
+        // ═══════════════════════════════════════════════════════════════
+        let voice_area = voice_chunk;
+        let is_listening = p.posture == Posture::Listening;
+        let is_speaking = p.posture == Posture::Speaking;
+        let has_recent_tts = self.voice_last_tts_text.is_some();
+
+        // Sub-layout: transcript (1), waveform (1), controls (rest).
+        let voice_rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(1),
+            ])
+            .split(voice_area);
+
+        let transcript_area = voice_rows[0];
+        let wave_area = voice_rows[1];
+        let hint_area = voice_rows[2];
+
+        // ── Transcript row ─────────────────────────────────────────
+        // Shows what was said (STT) or what she said (TTS text).
+        let transcript = self.voice_last_transcript.as_deref().filter(|t| !t.is_empty());
+        let tts_display = self.voice_last_tts_text.as_deref().filter(|t| !t.is_empty());
+
+        let transcript_line = if is_listening {
+            transcript.map(|t| format!("‹ {} ›", t)).unwrap_or_else(|| " listen  ".to_string())
+        } else if is_speaking {
+            tts_display.map(|t| clip_to(&t, voice_area.width.saturating_sub(6) as usize))
+                .map(|c| format!("» {} «", c))
+                .unwrap_or_else(|| " speak  ".to_string())
+        } else if let Some(t) = tts_display {
+            let clip = clip_to(t, voice_area.width.saturating_sub(6) as usize);
+            format!("» {} «", clip)
+        } else if let Some(t) = transcript {
+            let clip = clip_to(t, voice_area.width.saturating_sub(6) as usize);
+            format!("‹ {} ›", clip)
+        } else {
+            String::new()
+        };
+
+        let transcript_color = if is_listening {
+            palette.agent_primary
+        } else if is_speaking {
+            self.presence.atmosphere.primary()
+        } else {
+            palette.agent_dim
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(transcript_line, Style::default().fg(transcript_color).add_modifier(Modifier::DIM)))),
+            transcript_area,
+        );
+
+        // ── Waveform row ───────────────────────────────────────────
+        if is_listening {
+            let level = self.voice_capture.as_ref().map(|c| c.current_level()).unwrap_or(0.0);
+            let is_recording = level > 0.05;
+            let rec_glyph = if is_recording && self.tick % 2 == 0 { "● REC" } else { "  rec" };
+
+            let mut wave_spans: Vec<Span> = Vec::new();
+            let bar_w = (voice_area.width.saturating_sub(10)).min(128) as usize;
+            wave_spans.push(Span::styled(
+                format!(" {} ", rec_glyph),
+                Style::default().fg(if is_recording { Color::Rgb(220, 60, 60) } else { palette.agent_dim }),
+            ));
+
+            let wf_len = self.voice_waveform.len();
+            if bar_w > 0 && wf_len > 0 {
+                let step = (wf_len as f32 / bar_w as f32).max(1.0);
+                for i in 0..bar_w {
+                    let idx = ((i as f32) * step) as usize;
+                    let sample = self.voice_waveform.get(idx).copied().unwrap_or(0.0);
+                    let ch = crate::ui::voice::LEVEL_CHARS[(sample * 7.0).round() as usize];
+                    let b = (60.0 + sample * 195.0) as u8;
+                    wave_spans.push(Span::styled(ch.to_string(), Style::default().fg(Color::Rgb(b / 2, b, b / 3))));
+                }
+            }
+            frame.render_widget(Paragraph::new(Line::from(wave_spans)), wave_area);
+        } else if is_speaking {
+            frame.render_widget(Paragraph::new(Line::from(Span::styled(
+                " ♪♪♪♪♪♪♪♪♪♪♪♪♪♪♪♪♪♪♪♪♪♪♪♪♪♪♪♪♪♪",
+                Style::default().fg(self.presence.atmosphere.primary()),
+            ))), wave_area);
+        } else {
+            let ghost: String = "▁▂▃▄▅▆▇█▇▆▅▄▃▂".chars()
+                .flat_map(|c| std::iter::repeat(c).take(3))
+                .take(voice_area.width as usize)
+                .collect();
+            let (ghost_r, ghost_g, ghost_b) = match palette.bg { Color::Rgb(r, g, b) => (r, g, b), _ => (40, 44, 60) };
+            frame.render_widget(Paragraph::new(Line::from(Span::styled(
+                ghost, Style::default().fg(Color::Rgb(ghost_r.saturating_add(30), ghost_g.saturating_add(30), ghost_b.saturating_add(36))),
+            ))), wave_area);
+        }
+
+        // ── Controls row ───────────────────────────────────────────
+        if is_listening {
+            let hint = Paragraph::new(Line::from(Span::styled(
+                " Space → send  ·  Esc → cancel",
+                Style::default().fg(palette.agent_dim),
+            ))).alignment(Alignment::Center);
+            frame.render_widget(hint, hint_area);
+        } else if is_speaking || has_recent_tts {
+            let recall = vec![
+                Span::styled(" r ⟲ ", Style::default().fg(palette.tool_accent)),
+                Span::raw("Replay  "),
+                Span::styled(" g ↻ ", Style::default().fg(palette.agent_primary)),
+                Span::raw("Regen  "),
+                Span::styled(" s 💾 ", Style::default().fg(palette.tool_accent)),
+                Span::raw("Save  ·  "),
+                Span::styled("Space to speak", Style::default().fg(palette.agent_dim)),
+            ];
+            frame.render_widget(Paragraph::new(Line::from(recall)).alignment(Alignment::Center), hint_area);
+        } else {
+            let hint = if self.voice_client.is_some() {
+                " Space to speak  ·  Esc to leave"
+            } else {
+                " Space to speak  ·  Esc to leave"
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(palette.agent_dim)))).alignment(Alignment::Center),
+                hint_area,
+            );
+        }
     }
 
     /// Build a card deck for every agent on the local backend. Called on
@@ -1789,17 +2868,18 @@ impl App {
     fn draw_agent_cards_mut(&mut self, frame: &mut Frame) {
         use crate::ui::portrait;
         let area = frame.size();
-        let bg = Block::default().style(Style::default().bg(Color::Rgb(10, 10, 16)));
+        let palette = crate::ui::chat::ChatPalette::from_atmosphere(self.presence.atmosphere);
+        let bg = Block::default().style(Style::default().bg(palette.bg));
         frame.render_widget(bg, area);
 
         // ── Header strip ──────────────────────────────────────────────
         let header = Paragraph::new(Line::from(vec![
             Span::styled("  Agent Manager   ", Style::default()
-                .fg(Color::Rgb(255, 200, 100))
+                .fg(palette.agent_primary)
                 .add_modifier(Modifier::BOLD)),
             Span::styled(
                 format!("{} agents  ·  manage, monitor, deploy", self.agent_cards.len()),
-                Style::default().fg(Color::Rgb(120, 120, 140)),
+                Style::default().fg(palette.agent_dim),
             ),
         ])).alignment(Alignment::Center);
         let header_area = Rect { x: area.x, y: area.y + 1, width: area.width, height: 1 };
@@ -1807,7 +2887,7 @@ impl App {
 
         if self.agent_cards.is_empty() {
             let empty = Paragraph::new("\n\n(no agents found — run `souveraine init`)")
-                .style(Style::default().fg(Color::DarkGray))
+                .style(Style::default().fg(palette.agent_dim))
                 .alignment(Alignment::Center);
             frame.render_widget(empty, area);
             return;
@@ -1831,6 +2911,9 @@ impl App {
             cols -= 1;
         }
         cols = cols.min(n).max(1);
+        self.manager_cols = cols as usize;
+        // Clamp selection to valid range in case cards changed since last draw.
+        self.manager_selected = self.manager_selected.min(self.agent_cards.len().saturating_sub(1));
         let avail = area.width.saturating_sub((cols + 1) * pad_x);
         let card_w = (avail / cols).min(max_card_w).max(min_card_w);
         // Card height: image area (target ~ card_w / 2 + 2, so a 24-wide card
@@ -1844,6 +2927,7 @@ impl App {
 
         // Snapshot plans first so we can hold `&mut self.card_images` per card
         // without overlapping the immutable borrow of `self.agent_cards`.
+        let manager_selected = self.manager_selected;
         struct Plan {
             card_area: Rect,
             image_area: Rect,
@@ -1857,6 +2941,7 @@ impl App {
             uptime_pct: u8,
             memory_count: usize,
             is_primary: bool,
+            is_selected: bool,
         }
         let plans: Vec<Plan> = self.agent_cards
             .iter()
@@ -1903,6 +2988,7 @@ impl App {
                     uptime_pct: card.uptime_pct,
                     memory_count: card.memory_count,
                     is_primary: card.name.eq_ignore_ascii_case(&self.agent_pref),
+                    is_selected: idx == manager_selected,
                 })
             })
             .collect();
@@ -1910,31 +2996,35 @@ impl App {
         // ── Render each card ──────────────────────────────────────────
         for p in plans {
             let accent = if p.is_primary {
-                Color::Rgb(180, 140, 240) // primary: violet
+                palette.agent_primary
             } else if p.instance_count > 0 {
-                Color::Rgb(120, 220, 160) // active: green
+                Color::Rgb(120, 220, 160) // active: green (semantic — keep)
             } else {
-                Color::Rgb(90, 100, 120) // idle: cool grey
+                palette.agent_dim
             };
-            let border_color = if p.is_primary {
-                Color::Rgb(180, 140, 240)
+            let border_color = if p.is_selected {
+                palette.agent_primary
+            } else if p.is_primary {
+                palette.agent_primary
             } else {
-                Color::Rgb(60, 70, 90)
+                palette.agent_dim
             };
 
-            // Card background fill (dark blue-grey, lifts the card off the screen).
-            let card_bg = Block::default().style(Style::default().bg(Color::Rgb(16, 18, 28)));
+            // Card background fill (lifts the card off the screen).
+            let (cr, cg, cb) = match palette.bg { Color::Rgb(r, g, b) => (r, g, b), _ => (16, 18, 28) };
+            let card_bg = Block::default().style(Style::default().bg(Color::Rgb(cr.saturating_add(6), cg.saturating_add(6), cb.saturating_add(6))));
             frame.render_widget(card_bg, p.card_area);
 
-            // Border.
+            // Border — gold when cursor is here, violet for primary, dim otherwise.
+            let border_modifier = if p.is_selected || p.is_primary {
+                Modifier::BOLD
+            } else {
+                Modifier::DIM
+            };
             let border = Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(
-                    Style::default()
-                        .fg(border_color)
-                        .add_modifier(if p.is_primary { Modifier::BOLD } else { Modifier::DIM }),
-                );
+                .border_style(Style::default().fg(border_color).add_modifier(border_modifier));
             frame.render_widget(border, p.card_area);
 
             // Image — scale-to-fit so the whole photo is visible. The
@@ -1952,22 +3042,23 @@ impl App {
 
             // Top-right badge: PRIMARY (with ★) or ACTIVE (with •) or muted.
             let (badge_text, badge_fg) = if p.is_primary {
-                ("★ PRIMARY ", Color::Rgb(245, 230, 110))
+                ("★ PRIMARY ", Color::Rgb(245, 230, 110)) // gold (semantic — keep)
             } else if p.instance_count > 0 {
-                ("• ACTIVE  ", Color::Rgb(120, 220, 160))
+                ("• ACTIVE  ", Color::Rgb(120, 220, 160)) // green (semantic — keep)
             } else {
-                (" idle     ", Color::Rgb(120, 120, 140))
+                (" idle     ", palette.agent_dim)
             };
             let badge_para = Paragraph::new(Line::from(vec![
                 Span::styled(badge_text, Style::default()
                     .fg(badge_fg)
-                    .bg(Color::Rgb(8, 10, 16))
+                    .bg(palette.bg)
                     .add_modifier(Modifier::BOLD)),
             ])).alignment(Alignment::Right);
             frame.render_widget(badge_para, p.badge_area);
 
-            // Metadata block — dark inset rows under the photo.
-            let meta_bg = Block::default().style(Style::default().bg(Color::Rgb(12, 14, 22)));
+            // Metadata block — slightly darker inset under the photo.
+            let (mr, mg, mb) = match palette.bg { Color::Rgb(r, g, b) => (r.saturating_sub(4), g.saturating_sub(4), b.saturating_sub(4)), _ => (12, 14, 22) };
+            let meta_bg = Block::default().style(Style::default().bg(Color::Rgb(mr, mg, mb)));
             frame.render_widget(meta_bg, p.meta_area);
 
             let instance_label = if p.instance_count == 1 {
@@ -1991,38 +3082,38 @@ impl App {
                     Span::styled(format!(" {} ", p.glyph),
                         Style::default().fg(accent).add_modifier(Modifier::BOLD)),
                     Span::styled(instance_label,
-                        Style::default().fg(Color::Rgb(150, 160, 180))),
+                        Style::default().fg(palette.agent_dim)),
                 ]),
                 Line::from(vec![
                     Span::styled(format!(" {} ", p.name),
                         Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
                     Span::styled("[AGENT]",
-                        Style::default().fg(Color::Rgb(120, 130, 150))
-                            .bg(Color::Rgb(28, 32, 44))),
+                        Style::default().fg(palette.agent_dim)
+                            .bg(Color::Rgb(cr, cg, cb))),
                 ]),
                 Line::from(vec![
                     Span::styled(format!(" {} ", path),
-                        Style::default().fg(Color::Rgb(110, 120, 140))),
+                        Style::default().fg(palette.agent_dim)),
                 ]),
                 Line::from(Span::styled(
                     "─".repeat(p.meta_area.width as usize),
-                    Style::default().fg(Color::Rgb(40, 48, 64)),
+                    Style::default().fg(palette.agent_dim).add_modifier(Modifier::DIM),
                 )),
                 Line::from(vec![
                     Span::styled(" Files  ",
-                        Style::default().fg(Color::Rgb(120, 130, 150))),
+                        Style::default().fg(palette.agent_dim)),
                     Span::styled(format!("{:<5}", p.memory_count),
                         Style::default().fg(Color::White)),
                     Span::styled("Uptime  ",
-                        Style::default().fg(Color::Rgb(120, 130, 150))),
+                        Style::default().fg(palette.agent_dim)),
                     Span::styled(format!("{}%", p.uptime_pct),
-                        Style::default().fg(Color::Rgb(120, 220, 160))),
+                        Style::default().fg(Color::Rgb(120, 220, 160))), // green (semantic — keep)
                 ]),
                 Line::from(vec![
                     Span::styled(" key ",
-                        Style::default().fg(Color::Rgb(90, 100, 120))),
+                        Style::default().fg(palette.agent_dim)),
                     Span::styled(p.pubkey.chars().take(12).collect::<String>(),
-                        Style::default().fg(Color::Rgb(100, 110, 130))),
+                        Style::default().fg(palette.agent_dim)),
                 ]),
             ];
             let meta_para = Paragraph::new(meta_lines);
@@ -2030,8 +3121,8 @@ impl App {
         }
 
         // ── Footer ────────────────────────────────────────────────────
-        let footer = Paragraph::new("↑↓←→ navigate  •  Enter select  •  Esc back  •  q quit")
-            .style(Style::default().fg(Color::DarkGray))
+        let footer = Paragraph::new("↑↓←→ navigate  •  Enter select  •  f favorite  •  Esc back")
+            .style(Style::default().fg(palette.agent_dim))
             .alignment(Alignment::Center);
         let footer_area = Rect {
             x: area.x,
@@ -2076,4 +3167,44 @@ fn short_now() -> String {
 fn short_id(agent_id: &str) -> String {
     let trimmed = agent_id.strip_prefix("agent-").unwrap_or(agent_id);
     trimmed.chars().take(8).collect()
+}
+
+/// Pre-process a portrait image for terminal display using a face-biased cover crop.
+///
+/// Implements the CSS `object-fit: cover` semantics with a top-center anchor:
+/// - If the image is wider than `target_w:target_h`, center-crop horizontally
+///   (the subject is usually centered).
+/// - If the image is taller than the target ratio, crop from the TOP (faces sit
+///   near the top of full-body portrait images — cropping the bottom preserves
+///   the face and loses the feet).
+///
+/// The result has exactly the target aspect ratio. Pass it to ratatui-image with
+/// `Resize::Fit` so it scales to fill the widget area without letterboxing.
+fn portrait_cover_crop(img: image::DynamicImage, target_w: u32, target_h: u32) -> image::DynamicImage {
+    let iw = img.width();
+    let ih = img.height();
+    // Compare cross-multiplied to avoid floating point.
+    if iw * target_h > ih * target_w {
+        // Image is wider than target ratio — center-crop horizontally.
+        let new_w = ih * target_w / target_h;
+        let x = (iw.saturating_sub(new_w)) / 2;
+        img.crop_imm(x, 0, new_w, ih)
+    } else {
+        // Image is taller (or equal) — crop from the top, preserving the face.
+        let new_h = iw * target_h / target_w;
+        img.crop_imm(0, 0, iw, new_h)
+    }
+}
+
+/// Clip a string to at most `max` characters using unicode-aware truncation.
+/// Appends "…" if truncated.
+#[allow(unused)]
+fn clip_to(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
 }

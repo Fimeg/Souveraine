@@ -92,6 +92,15 @@ pub enum BackendEvent {
     },
     /// Agent set an atmospheric preset for the UI chrome.
     Atmosphere(String),
+    /// N+1 subconscious pass started (`true`) or finished (`false`).
+    /// Presence reads this to flip into / out of `Posture::Thinking` so the
+    /// face shows when the subconscious is the one looking at the conversation.
+    /// (For Casey's agent the subconscious instance is "Aster", but the event
+    /// itself is generic — every agent's subconscious is what's named here.)
+    SubconsciousPass(bool),
+    /// Agent changed her outfit. The string is the outfit name (a subdirectory
+    /// under `expressions/`). Empty string clears to default expressions.
+    Outfit(String),
     /// Stream ended cleanly.
     Done,
 }
@@ -162,5 +171,14 @@ pub trait Backend: Send + Sync {
         _interject: InterjectionQueue,
     ) -> Result<BoxStream<'static, Result<BackendEvent>>> {
         self.send_with_cancel(conversation_id, text, cancel).await
+    }
+
+    /// Push an llm_config update to the agent record. LocalBackend writes
+    /// through to SQLite + agent.json; RemoteBackend is stubbed until the
+    /// SSE backchannel supports agent updates. The caller must also persist
+    /// the config file independently (Settings handles both).
+    async fn update_agent_model(&self, agent_id: &str, model: &str) -> Result<()> {
+        let _ = (agent_id, model);
+        Ok(())
     }
 }

@@ -96,14 +96,20 @@ fn pixel_at(x: usize, y: usize, _p: &Presence) -> char {
 ///
 /// Returns `None` for `.` (transparent — the renderer skips this pixel).
 fn color_for(key: char, posture: Posture, breath: f32) -> Option<Color> {
-    let warm = matches!(posture, Posture::Affectionate);
+    let warm = matches!(posture, Posture::Affectionate | Posture::Speaking);
     let strained = matches!(posture, Posture::Straining);
     let processing = matches!(posture, Posture::Processing);
     let yawning = matches!(posture, Posture::Yawning);
+    let alert = matches!(posture, Posture::Alert | Posture::Listening);
+    let thinking = matches!(posture, Posture::Thinking);
 
     // Subtle pulse on cyan elements driven by breath.
     let cyan_lum = (170.0 + breath * 60.0).clamp(120.0, 235.0) as u8;
     let cyan_lum = if processing { cyan_lum.saturating_add(25).min(255) } else { cyan_lum };
+    // Alert: eyes brighter (the room just came into focus).
+    let cyan_lum = if alert { cyan_lum.saturating_add(15).min(255) } else { cyan_lum };
+    // Thinking: gaze narrows inward — cyan goes cooler and dimmer.
+    let cyan_lum = if thinking { cyan_lum.saturating_sub(40) } else { cyan_lum };
 
     let base = match key {
         '.' => return None,
@@ -126,10 +132,26 @@ fn color_for(key: char, posture: Posture, breath: f32) -> Option<Color> {
     let (r, g, b) = base;
 
     // Yawning droops everything subtly — pull luminance down.
-    let dim = if yawning { 0.82 } else { 1.0 };
+    // Thinking pulls it down further still — the lights are turned in.
+    let dim = if yawning {
+        0.82
+    } else if thinking {
+        0.75
+    } else if alert {
+        1.05
+    } else {
+        1.0
+    };
 
     // Straining desaturates toward greyscale.
-    let sat = if strained { 0.55 } else { 1.0 };
+    // Thinking also desaturates — the inward focus mutes warmth.
+    let sat = if strained {
+        0.55
+    } else if thinking {
+        0.7
+    } else {
+        1.0
+    };
     let avg = ((r as u16 + g as u16 + b as u16) / 3) as f32;
     let mix = |c: u8| {
         let f = (c as f32 * sat + avg * (1.0 - sat)) * dim;

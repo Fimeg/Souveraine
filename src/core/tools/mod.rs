@@ -5,12 +5,14 @@
 //! for backward compatibility with the tool loop in local.rs.
 
 pub mod agent;
+pub mod atmosphere;
 pub mod bash;
 pub mod defs;
 pub mod edit;
 pub mod glob;
 pub mod grep;
 pub mod list_dir;
+pub mod outfit;
 pub mod read;
 pub mod schedule;
 pub mod subagent;
@@ -28,9 +30,11 @@ use self::edit::Edit;
 use self::glob::Glob;
 use self::grep::Grep;
 use self::list_dir::ListDir;
+use self::outfit::Outfit;
 use self::read::Read;
 use self::subagent::Subagent;
 use self::agent::Agent;
+use self::atmosphere::Atmosphere;
 use self::schedule::Schedule;
 use self::write::Write;
 
@@ -74,12 +78,14 @@ impl Sensorium {
         Self {
             tools: vec![
                 Box::new(Read),
+                Box::new(Outfit),
                 Box::new(Write),
                 Box::new(Edit),
                 Box::new(Glob),
                 Box::new(Grep),
                 Box::new(ListDir),
                 Box::new(Subagent),
+                Box::new(Atmosphere),
                 Box::new(Agent),
                 Box::new(Schedule),
             ],

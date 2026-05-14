@@ -407,6 +407,23 @@ impl LocalBackend {
     pub fn server(&self) -> Arc<crate::server::SouveraineServer> {
         self.server.clone()
     }
+
+    /// Build the greeting line describing the agent's current visual state
+    /// (atmosphere and outfit). Returns `None` when no atmosphere is set in
+    /// config (fresh init, no state to report).
+    async fn build_visual_greeting(&self) -> Option<String> {
+        let config = self.server.app_config.read().await;
+        let atm = config.presence.atmosphere.as_deref()?;
+        if atm.is_empty() {
+            return None;
+        }
+        let display = atm.replace('_', " ");
+        let outfit = config.presence.outfit.as_deref().unwrap_or("default");
+        Some(format!(
+            "\n\nYour current atmosphere is {}, wearing the \"{}\" outfit.",
+            display, outfit
+        ))
+    }
 }
 
 #[async_trait]
@@ -432,6 +449,7 @@ impl Backend for LocalBackend {
         let conv_id = self.server.sessions.create(agent_id);
 
         let memory_root = self.server.agents.memory_root(agent_id);
+        let subconscious_root = self.server.agents.subconscious_memory_root(agent_id);
         let (bundled, user, agent_memfs, project) =
             crate::core::skills::default_discovery_paths(Some(memory_root.clone()));
         let skills = crate::core::skills::discover(
@@ -443,8 +461,23 @@ impl Backend for LocalBackend {
         .await
         .unwrap_or_default();
 
-        let system_prompt =
-            crate::core::prompt::build_system_prompt(&memory_root, Some(&skills)).await;
+        let platform_prompt = self.server.app_config.read().await
+            .agent.system_prompt.clone();
+        let system_prompt = crate::core::prompt::build_system_prompt_full(
+            &memory_root,
+            Some(&subconscious_root),
+            platform_prompt.as_deref(),
+            Some(&skills),
+        )
+        .await;
+
+        // Append visual state greeting.
+        let greeting_extra = self.build_visual_greeting().await;
+        let system_prompt = if let Some(extra) = greeting_extra {
+            format!("{}{}", system_prompt, extra)
+        } else {
+            system_prompt
+        };
 
         self.server.sessions.add_message(
             &conv_id,
@@ -534,6 +567,7 @@ impl Backend for LocalBackend {
 
         // Build system prompt from the agent's memfs and inject as first message
         let memory_root = self.server.agents.memory_root(agent_id);
+        let subconscious_root = self.server.agents.subconscious_memory_root(agent_id);
 
         // Discover skills from all 4 tiers
         let (bundled, user, agent_memfs, project) =
@@ -547,8 +581,23 @@ impl Backend for LocalBackend {
         .await
         .unwrap_or_default();
 
-        let system_prompt =
-            crate::core::prompt::build_system_prompt(&memory_root, Some(&skills)).await;
+        let platform_prompt = self.server.app_config.read().await
+            .agent.system_prompt.clone();
+        let system_prompt = crate::core::prompt::build_system_prompt_full(
+            &memory_root,
+            Some(&subconscious_root),
+            platform_prompt.as_deref(),
+            Some(&skills),
+        )
+        .await;
+
+        // Append visual state greeting.
+        let greeting_extra = self.build_visual_greeting().await;
+        let system_prompt = if let Some(extra) = greeting_extra {
+            format!("{}{}", system_prompt, extra)
+        } else {
+            system_prompt
+        };
 
         self.server.sessions.add_message(
             &conv_id,
@@ -593,9 +642,37 @@ impl Backend for LocalBackend {
         cancel: CancellationToken,
         interject: crate::backend::InterjectionQueue,
     ) -> Result<BoxStream<'static, Result<BackendEvent>>> {
+        // Resolve the agent for this conversation, then drain her
+        // subconscious's intrusive box. Anything Aster queued after the
+        // last turn rides in on Casey's next message as `[ surfacing: ... ]`
+        // lines — the lettabot-v017 pattern, ported. This is the channel
+        // by which a Critical observation can interrupt mid-conversation
+        // without forcing a halt: she sees it before she reads Casey.
+        let session_agent_id = self
+            .server
+            .sessions
+            .get(conversation_id)
+            .map(|s| s.agent_id.clone());
+
+        let user_text = if let Some(agent_id) = session_agent_id {
+            let surfacings = drain_intrusive_surfacings(&self.server, &agent_id).await;
+            if surfacings.is_empty() {
+                text.to_string()
+            } else {
+                let prelude = surfacings
+                    .iter()
+                    .map(|line| line.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("{}\n{}", prelude, text)
+            }
+        } else {
+            text.to_string()
+        };
+
         self.server.sessions.add_message(
             conversation_id,
-            ConversationMessage::user_text(text),
+            ConversationMessage::user_text(&user_text),
         )?;
 
         let (tx, rx) = mpsc::channel::<Result<BackendEvent>>(64);
@@ -614,6 +691,28 @@ impl Backend for LocalBackend {
         });
 
         Ok(ReceiverStream::new(rx).boxed())
+    }
+
+    async fn update_agent_model(&self, agent_id: &str, model: &str) -> Result<()> {
+        // Load current llm_config so we only change the model field —
+        // context_window, temperature, tool rounds stay as they were.
+        let current = self.server.agents.get(agent_id).await?;
+        let update = crate::api::models::UpdateAgentRequest {
+            name: None,
+            description: None,
+            llm_config: Some(crate::api::models::LlmConfig {
+                model: model.to_string(),
+                context_window: current.llm_config.context_window,
+                temperature: current.llm_config.temperature,
+                max_tool_rounds: current.llm_config.max_tool_rounds,
+                inter_round_delay_ms: current.llm_config.inter_round_delay_ms,
+            }),
+            memory_blocks: None,
+            tools: None,
+        };
+        self.server.agents.update(agent_id, update).await?;
+        tracing::info!(agent = %agent_id, model = %model, "agent llm_config model updated via settings");
+        Ok(())
     }
 }
 
@@ -642,6 +741,56 @@ impl crate::core::nervous::handler::TurnInjector for LocalBackend {
         });
         Ok(())
     }
+}
+
+/// Drain Aster's intrusive box for the given agent and return formatted
+/// `[ surfacing: ... ]` lines ready to prepend to the user's next message.
+/// Marks each drained item as delivered (moved to `sent.md`). Mirrors
+/// lettabot-v017's `readSurfacingThoughts` + `clearSurfacingThoughts` pair
+/// (`~/Projects/lettabot-v017/src/core/prompts.ts:64-91`) — the substrate
+/// reads the channel Aster wrote to and lets the conscious mind see it
+/// before she reads Casey.
+///
+/// Critical urgency gets `[ surfacing — CRITICAL: ... ]`. High becomes
+/// `[ surfacing — !: ... ]`. Low/none keep the bare form. The shape is a
+/// gradient the agent feels, not a number she has to read.
+async fn drain_intrusive_surfacings(
+    server: &Arc<SouveraineServer>,
+    agent_id: &str,
+) -> Vec<String> {
+    use crate::core::subconscious::{SubconsciousInbox, Urgency};
+
+    let sub_repo = server.agents.subconscious_memory_repo(agent_id);
+    let primary_repo = server.agents.memory_repo(agent_id);
+    let inbox = SubconsciousInbox::with_primary(sub_repo, primary_repo);
+
+    let items = match inbox.get_intrusive().await {
+        Ok(items) => items,
+        Err(e) => {
+            tracing::debug!("intrusive surfacing read failed (continuing without): {}", e);
+            return Vec::new();
+        }
+    };
+
+    if items.is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines = Vec::with_capacity(items.len());
+    for item in &items {
+        let prefix = match item.urgency {
+            Urgency::Critical => "[ surfacing — CRITICAL:",
+            Urgency::High => "[ surfacing — !:",
+            Urgency::Low => "[ surfacing:",
+        };
+        let content = item.content.trim();
+        lines.push(format!("{} {} ]", prefix, content));
+
+        if let Err(e) = inbox.mark_delivered(&item.id).await {
+            tracing::debug!("mark_delivered failed for {}: {}", item.id, e);
+        }
+    }
+    lines
 }
 
 // ── Turn Loop ────────────────────────────────────────────────────
@@ -794,6 +943,14 @@ async fn run_turn(
         }
 
         let pressure = bifrost_pressure(&counter, &messages, context_limit);
+        tracing::info!(
+            turn_round = tool_round,
+            agent = %agent_id,
+            msg_count = messages.len(),
+            model = %model,
+            pressure_pct = %((pressure * 100.0) as u8),
+            "LLM call starting"
+        );
         let max_tokens = pressure_to_max_tokens(pressure, output_limit);
         let _ = tx.send(Ok(BackendEvent::ContextPressure(pressure))).await;
 
@@ -821,6 +978,14 @@ async fn run_turn(
             res = server.bifrost.chat_completion_with_strain(req) => res?,
         };
 
+        tracing::info!(
+            elapsed = ?turn_start.elapsed(),
+            tool_round = tool_round,
+            tool_calls = response.tool_calls.len(),
+            content_len = response.content.len(),
+            "LLM call returned"
+        );
+
         for event in &strain {
             if let crate::bridge::bifrost::InferenceStrain::Transient { attempt, status, model, .. } = event {
                 let _ = tx.send(Ok(BackendEvent::InferenceStrain {
@@ -837,16 +1002,9 @@ async fn run_turn(
             let _ = tx.send(Ok(BackendEvent::Reasoning(reasoning.clone()))).await;
         }
 
-        if response.tool_calls.is_empty() || tool_round >= max_rounds {
-            // Text response (or hit max rounds) — this is the final output
+        if response.tool_calls.is_empty() {
+            // Text response — this is the final output
             final_content = response.content.clone();
-
-            // If we hit max rounds with pending tool calls, add a note
-            if !response.tool_calls.is_empty() && tool_round >= max_rounds {
-                let note =
-                    "\n\n[Max tool rounds reached — continuing with text response]";
-                let _ = tx.send(Ok(BackendEvent::Token(note.to_string()))).await;
-            }
 
             // Drain any interjections that arrived during this LLM call.
             // If there are any, commit them as user messages and continue
@@ -954,6 +1112,32 @@ async fn run_turn(
                 }))
                 .await;
 
+            // If the agent called the outfit tool, emit an Outfit event so
+            // the TUI can switch expression directories.
+            if tc.name == "outfit" {
+                let outfit_name = tc.arguments
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let _ = tx
+                    .send(Ok(BackendEvent::Outfit(outfit_name)))
+                    .await;
+            }
+
+            // If the agent called the atmosphere tool, emit an Atmosphere
+            // event so the TUI chrome shifts to match her mood.
+            if tc.name == "atmosphere" {
+                let atm_name = tc.arguments
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let _ = tx
+                    .send(Ok(BackendEvent::Atmosphere(atm_name)))
+                    .await;
+            }
+
             // Bind tool result to its call by id (OpenAI tool-use schema).
             messages.push(BifrostMessage::tool_result(&tc.id, &tc.name, output));
         }
@@ -1009,11 +1193,18 @@ async fn run_turn(
         return Ok(());
     }
 
-    // Breather between Ani finishing and Aster firing — unconditional,
+    // Breather between turns — unconditional,
     // so the upstream always gets a gap before the N+1 pass starts.
     tokio::time::sleep(Duration::from_millis(2000)).await;
 
-    let events = {
+    tracing::info!(agent = %agent_id, "subconscious N+1 pass starting");
+
+    // Signal the start of the subconscious pass so the TUI can flip into
+    // Posture::Thinking while the loop runs.
+    let _ = tx.send(Ok(BackendEvent::SubconsciousPass(true))).await;
+
+    let pass_start = Instant::now();
+    let pass_result = {
         let session = server
             .sessions
             .get(&conversation_id)
@@ -1021,8 +1212,21 @@ async fn run_turn(
         server
             .consciousness
             .on_response(&*session, &final_content)
-            .await?
+            .await
     };
+
+    let pass_elapsed = pass_start.elapsed();
+    tracing::info!(
+        agent = %agent_id,
+        elapsed = ?pass_elapsed,
+        "subconscious N+1 pass complete"
+    );
+
+    // Always release the Thinking posture, even on failure — otherwise the
+    // face stays stuck inward when the pass errors out.
+    let _ = tx.send(Ok(BackendEvent::SubconsciousPass(false))).await;
+
+    let events = pass_result?;
 
     // Inject surfacing events back into the session as system messages
     for event in &events {

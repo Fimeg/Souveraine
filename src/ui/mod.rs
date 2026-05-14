@@ -9,7 +9,10 @@ pub mod markdown;
 pub mod expressions;
 pub mod portrait;
 pub mod presence;
+pub mod rgp;
 pub mod schedules;
+pub mod settings;
+pub mod voice;
 
 pub use app::App;
 pub use cockpit_panel::CockpitPane;

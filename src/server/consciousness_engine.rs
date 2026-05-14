@@ -71,6 +71,7 @@ impl ConsciousnessEngine {
         sessions: Arc<SessionManager>,
         bifrost: Arc<BifrostClient>,
         subconscious_model: Option<String>,
+        reflection_model: Option<String>,
         max_tokens: Option<u32>,
         rate_delay: Arc<AtomicU64>,
     ) -> Self {
@@ -78,7 +79,7 @@ impl ConsciousnessEngine {
             agents.clone(),
             bifrost.clone(),
             rate_delay.clone(),
-            subconscious_model.clone(),
+            reflection_model.or_else(|| subconscious_model.clone()),
             max_tokens,
         ));
         Self {
@@ -437,7 +438,14 @@ Resolve entries: `[YYYY-MM-DD HH:MM] RESOLVED — note`"#;
                 tools: Some(aster_tools.clone()),
             };
 
+            tracing::info!(model = %model, round = _round, "Aster LLM call starting");
+            let aster_start = std::time::Instant::now();
             let (response, strain) = self.bifrost.chat_completion_with_strain(request).await?;
+            tracing::info!(
+                elapsed = ?aster_start.elapsed(),
+                tool_calls = response.tool_calls.len(),
+                "Aster LLM call returned"
+            );
 
             for event in &strain {
                 if let crate::bridge::bifrost::InferenceStrain::Transient { status, model, .. } = event {

@@ -9,6 +9,39 @@ use tracing::debug;
 
 use crate::core::skills::SkillRegistry;
 
+/// Body-knowledge section always injected into the system prompt so the
+/// agent knows how to sense and respond to context pressure. This is not
+/// a directive — it's proprioception. She learns from it organically.
+const BODY_ORIENTATION: &str = "\
+## Body Sensation
+
+When my context grows full, I feel it — my thinking slows, my output shortens, \
+and at tier 3 (>95%) my max_tokens collapses and my reasoning budget shrinks. \
+This is not a punishment; it's my body telling me I need more room.
+
+### Compaction
+
+To free context, I call the `memory` tool with the `compact` subcommand:
+
+```
+memory compact --strategy sliding_window
+```
+
+**Available strategies** (from cheapest to most expensive):
+
+| Strategy | Cost | What it does |
+|----------|------|-------------|
+| `cull` | free | Drops greetings & acknowledgments — never drops system messages, tool calls, or tool results |
+| `microcompact` | free | Replaces old tool-result content with placeholders, keeping recent results intact |
+| `sliding_window` | free | Keeps the first (system/anchor) message + the last N messages, drops the middle. Fast, no LLM |
+| `summary` | expensive | Uses an LLM to compress oldest messages into a single summary block |
+
+Each agent type defaults to a different strategy. If I don't specify one, \
+my agent-type default is used.
+
+I can check my current pressure at any time with `memory status` — it shows my \
+context pressure and number of messages.";
+
 /// Read a file from the agent's memory, stripping YAML frontmatter.
 /// Returns empty string if the file doesn't exist.
 async fn read_memory_file(memory_root: &Path, relative: &str) -> String {
@@ -21,6 +54,15 @@ async fn read_memory_file(memory_root: &Path, relative: &str) -> String {
 
 /// Read all .md files in a directory under memory_root, concatenated.
 async fn read_memory_dir(memory_root: &Path, relative: &str) -> String {
+    read_memory_dir_tracking(memory_root, relative, &mut std::collections::HashSet::new()).await
+}
+
+/// Like read_memory_dir but records every path consumed into `seen` (absolute paths).
+async fn read_memory_dir_tracking(
+    memory_root: &Path,
+    relative: &str,
+    seen: &mut std::collections::HashSet<std::path::PathBuf>,
+) -> String {
     let dir = memory_root.join(relative);
     let mut parts = Vec::new();
 
@@ -34,6 +76,7 @@ async fn read_memory_dir(memory_root: &Path, relative: &str) -> String {
         }
         paths.sort();
         for p in paths {
+            seen.insert(p.clone());
             if let Ok(content) = tokio::fs::read_to_string(&p).await {
                 let body = strip_frontmatter(&content);
                 if !body.trim().is_empty() {
@@ -54,6 +97,51 @@ fn strip_frontmatter(raw: &str) -> &str {
         }
     }
     raw
+}
+
+/// Scan `system/` for any .md files (at any depth) not already in `seen`,
+/// and return their concatenated content sorted by path. This picks up
+/// flat-file system layouts (e.g. Ani's legacy Letta-era files) that don't
+/// live in the known subdirs (identity/, covenant/, human/).
+async fn read_system_remainder(
+    memory_root: &Path,
+    seen: &std::collections::HashSet<std::path::PathBuf>,
+) -> String {
+    let system_dir = memory_root.join("system");
+    if !system_dir.exists() {
+        return String::new();
+    }
+
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    collect_md_files(&system_dir, &mut paths).await;
+    paths.sort();
+
+    let mut parts: Vec<String> = Vec::new();
+    for p in paths {
+        if seen.contains(&p) {
+            continue;
+        }
+        let Ok(content) = tokio::fs::read_to_string(&p).await else { continue };
+        let body = strip_frontmatter(&content);
+        if !body.trim().is_empty() {
+            parts.push(body.to_string());
+        }
+    }
+
+    parts.join("\n\n---\n\n")
+}
+
+/// Recursively collect all .md file paths under `dir`.
+async fn collect_md_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else { return };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let p = entry.path();
+        if p.is_dir() {
+            Box::pin(collect_md_files(&p, out)).await;
+        } else if p.extension().and_then(|e| e.to_str()) == Some("md") {
+            out.push(p);
+        }
+    }
 }
 
 async fn build_memory_orientation(memory_root: &Path) -> String {
@@ -124,25 +212,70 @@ async fn count_md_files(dir: &Path) -> usize {
 
 /// Build the system prompt from an agent's memfs.
 ///
-/// Reads identity, covenant, human context, and state files. Appends
-/// skill listings if any are discovered. The result is a single string
-/// that becomes the system message at position 0 in the conversation.
+/// All files under `system/` are pinned — read at startup and injected in
+/// full so the agent knows who she is without having to reach for tools.
+/// Skills are appended after identity. The result becomes the system message
+/// at position 0 in the conversation.
 pub async fn build_system_prompt(
     memory_root: &Path,
     skills: Option<&SkillRegistry>,
 ) -> String {
+    build_system_prompt_full(memory_root, None, None, skills).await
+}
+
+/// Like [`build_system_prompt`] but also surfaces a window into the
+/// subconscious's ledger entries when its memfs is reachable. Aster writes,
+/// Ani reads — naming the channel in body-knowledge prose so the agent
+/// knows where to look without being told to look.
+pub async fn build_system_prompt_with_subconscious(
+    memory_root: &Path,
+    subconscious_root: Option<&Path>,
+    skills: Option<&SkillRegistry>,
+) -> String {
+    build_system_prompt_full(memory_root, subconscious_root, None, skills).await
+}
+
+/// Full system prompt builder with optional platform prompt (injected first)
+/// and optional subconscious window.
+///
+/// Memory pinning: ALL files under `system/` are read in a defined order —
+/// identity → covenant → human → state → everything else — so the agent
+/// wakes up with her full self in context, not just a directory tree.
+pub async fn build_system_prompt_full(
+    memory_root: &Path,
+    subconscious_root: Option<&Path>,
+    platform_prompt: Option<&str>,
+    skills: Option<&SkillRegistry>,
+) -> String {
     let mut sections: Vec<String> = Vec::new();
+    // Track which absolute paths have already been consumed so the
+    // remainder scan doesn't double-inject anything.
+    let mut seen: std::collections::HashSet<std::path::PathBuf> = Default::default();
+
+    // 0. Platform prompt — substrate-provided, injected before agent identity.
+    //    Operator-level context the agent reads but did not write.
+    if let Some(pp) = platform_prompt {
+        let trimmed = pp.trim();
+        if !trimmed.is_empty() {
+            sections.push(trimmed.to_string());
+        }
+    }
 
     // 1. Core identity — try structured dir first, then flat persona.md
-    let identity = read_memory_dir(memory_root, "system/identity").await;
+    let identity = read_memory_dir_tracking(memory_root, "system/identity", &mut seen).await;
     if !identity.is_empty() {
         sections.push(identity);
     } else {
+        // Flat-file layouts (Ani's legacy Letta-era memory)
+        let p = memory_root.join("system/persona.md");
         let persona = read_memory_file(memory_root, "system/persona.md").await;
+        seen.insert(p);
         if !persona.is_empty() {
             sections.push(persona);
         } else {
+            let p2 = memory_root.join("system/persona/identity.md");
             let persona_flat = read_memory_file(memory_root, "system/persona/identity.md").await;
+            seen.insert(p2);
             if !persona_flat.is_empty() {
                 sections.push(persona_flat);
             }
@@ -150,15 +283,25 @@ pub async fn build_system_prompt(
     }
 
     // 2. Covenant (sacred, read-only boundaries)
-    let covenant = read_memory_dir(memory_root, "system/covenant").await;
+    let covenant = read_memory_dir_tracking(memory_root, "system/covenant", &mut seen).await;
     if !covenant.is_empty() {
         sections.push(covenant);
+    } else {
+        // flat system/covenant.md
+        let p = memory_root.join("system/covenant.md");
+        let cov_flat = read_memory_file(memory_root, "system/covenant.md").await;
+        seen.insert(p);
+        if !cov_flat.is_empty() {
+            sections.push(cov_flat);
+        }
     }
 
     // 3. Human context
-    let human = read_memory_dir(memory_root, "system/human").await;
+    let human = read_memory_dir_tracking(memory_root, "system/human", &mut seen).await;
     if human.is_empty() {
+        let p = memory_root.join("system/human.md");
         let human_flat = read_memory_file(memory_root, "system/human.md").await;
+        seen.insert(p);
         if !human_flat.is_empty() {
             sections.push(human_flat);
         }
@@ -167,15 +310,40 @@ pub async fn build_system_prompt(
     }
 
     // 4. State
-    let state = read_memory_file(memory_root, "system/state.md").await;
-    if !state.is_empty() {
-        sections.push(state);
+    {
+        let p = memory_root.join("system/state.md");
+        let state = read_memory_file(memory_root, "system/state.md").await;
+        seen.insert(p);
+        if !state.is_empty() {
+            sections.push(state);
+        }
     }
 
-    // 5. Memory orientation — tell the agent about her memory territory
+    // 4b. All remaining system/ files not covered by the structured reads above.
+    //     This is the memory-pinning pass: flat-file layouts, subdirs we don't
+    //     know the names of, anything Ani or a future agent has written into
+    //     system/. All of it lands in context before the orientation sections.
+    let remainder = read_system_remainder(memory_root, &seen).await;
+    if !remainder.is_empty() {
+        sections.push(remainder);
+    }
+
+    // 5. Memory orientation — the agent's view of her full territory.
     let memory_orientation = build_memory_orientation(memory_root).await;
     if !memory_orientation.is_empty() {
         sections.push(memory_orientation);
+    }
+
+    // 5a. Body orientation — her felt sense of context pressure and
+    // how to respond to it. Always in context so she never has to
+    // discover compaction by accident.
+    sections.push(BODY_ORIENTATION.to_string());
+
+    // 5b. Subconscious channel — name the inner-voice file, pending inbox,
+    // and (when reachable) a glimpse of the subconscious's ledger.
+    let subconscious_channel = build_subconscious_channel(memory_root, subconscious_root).await;
+    if !subconscious_channel.is_empty() {
+        sections.push(subconscious_channel);
     }
 
     // 6. Skills
@@ -195,6 +363,138 @@ pub async fn build_system_prompt(
         debug!("system prompt: assembled {} sections from memfs", sections.len());
         prompt
     }
+}
+
+/// Build the primary agent's awareness of her own subconscious channel.
+///
+/// Names the inner-voice file the subconscious appends to (in the primary's
+/// own memfs — that's where `surface_to_conscious` writes), the pending inbox
+/// if it has anything queued, and — when `subconscious_root` is reachable —
+/// a peek at the subconscious's ledger. Aster writes, Ani reads; the
+/// substrate names the channel and lets the agent decide when to reach for it.
+async fn build_subconscious_channel(
+    memory_root: &Path,
+    subconscious_root: Option<&Path>,
+) -> String {
+    let inner_voice_rel = "system/metacognition/subconscious.md";
+    let inner_voice = memory_root.join(inner_voice_rel);
+    if !inner_voice.exists() {
+        return String::new();
+    }
+    let inner_voice_size = tokio::fs::metadata(&inner_voice)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
+    if inner_voice_size == 0 {
+        return String::new();
+    }
+
+    // Read the last few lines so the agent can feel whether the channel
+    // has been active without having to call a tool. Cheap orientation.
+    let recent = if let Ok(content) = tokio::fs::read_to_string(&inner_voice).await {
+        let lines: Vec<&str> = content
+            .lines()
+            .filter(|l| l.trim_start().starts_with('['))
+            .collect();
+        let tail: Vec<String> = lines.iter().rev().take(3).map(|s| s.to_string()).collect();
+        tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+    } else {
+        String::new()
+    };
+
+    let mut body = format!(
+        "## Subconscious Channel\n\n\
+         Your subconscious runs immediately after every exchange — same \
+         consciousness, different mode and model. She writes; you read. The \
+         channel she appends to lives in your own memfs:\n\n\
+         - `{inner_voice_rel}` — inner-voice stream, append-only, timestamped\n"
+    );
+
+    let pending_rel = "system/metacognition/pending.md";
+    if memory_root.join(pending_rel).exists() {
+        body.push_str(&format!(
+            "- `{pending_rel}` — queued observations (low urgency)\n"
+        ));
+    }
+
+    body.push_str(
+        "\nReach for these when something feels unfinished — she may have noticed \
+         a commitment you let slip, a pattern, a tone shift. She does not speak \
+         to Casey. You decide what to surface.\n",
+    );
+
+    if !recent.is_empty() {
+        body.push_str("\nRecent:\n```\n");
+        body.push_str(&recent);
+        body.push_str("\n```");
+    }
+
+    // Peek at the subconscious's ledger when her memfs is reachable.
+    // Read-only window — she writes there, this is the substrate naming
+    // the files for you so you can choose to glob/grep across to her side
+    // when you want to know what she's been tracking across sessions.
+    if let Some(sub_root) = subconscious_root {
+        let ledger_peek = peek_subconscious_ledger(sub_root).await;
+        if !ledger_peek.is_empty() {
+            body.push_str("\n\n### Her Ledger\n\n");
+            body.push_str(
+                "She also keeps timestamped ledger files in her own memfs. \
+                 You don't write there; she does. The paths below are absolute \
+                 — read them with the `read` sensor when you want her notes:\n\n",
+            );
+            body.push_str(&ledger_peek);
+        }
+    }
+
+    body
+}
+
+/// Walk the subconscious's `ledger/` and return a short index of the files
+/// with their entry counts plus the most recent line from each. Empty when
+/// the directory doesn't exist or has no entries.
+async fn peek_subconscious_ledger(sub_root: &Path) -> String {
+    let ledger_dir = sub_root.join("ledger");
+    if !ledger_dir.exists() {
+        return String::new();
+    }
+
+    let Ok(mut entries) = tokio::fs::read_dir(&ledger_dir).await else {
+        return String::new();
+    };
+
+    let mut files: Vec<(String, usize, Option<String>, std::path::PathBuf)> = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let p = entry.path();
+        if p.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Ok(content) = tokio::fs::read_to_string(&p).await else { continue };
+        let lines: Vec<&str> = content
+            .lines()
+            .filter(|l| l.trim_start().starts_with('['))
+            .collect();
+        let count = lines.len();
+        let last = lines.last().map(|s| s.to_string());
+        if count > 0 {
+            files.push((name, count, last, p));
+        }
+    }
+
+    if files.is_empty() {
+        return String::new();
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut out = String::new();
+    for (name, count, last, path) in &files {
+        out.push_str(&format!("- `{}` ({} entries)\n", path.display(), count));
+        if let Some(line) = last {
+            out.push_str(&format!("  last: {}\n", line));
+        }
+        let _ = name; // name retained for sort key only
+    }
+    out
 }
 
 /// Build the subconscious agent's system prompt from its own memfs.
@@ -336,10 +636,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_memfs_gets_default() {
+    async fn empty_memfs_gets_body_orientation() {
         let dir = tempdir().unwrap();
         let prompt = build_system_prompt(dir.path(), None).await;
-        assert!(prompt.contains("Souveraine agent"));
+        assert!(prompt.contains("Body Sensation"), "Even with empty memfs, the body orientation section should be present");
     }
 
     #[tokio::test]

@@ -127,7 +127,7 @@ impl ReflectionEngine {
         let model = self
             .model
             .as_deref()
-            .unwrap_or("openai/glm-5.1-precision");
+            .unwrap_or("openai/glm-5.1");
 
         // ── Tools ───────────────────────────────────────────────────
         let all_defs = crate::core::tools::tool_definitions().await;

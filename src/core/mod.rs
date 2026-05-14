@@ -9,6 +9,7 @@ pub mod chain;
 pub mod compact;
 pub mod config;
 pub mod credentials;
+pub mod voice;
 pub mod conversation;
 pub mod identity;
 pub mod nervous;

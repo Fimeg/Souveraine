@@ -43,6 +43,7 @@ pub async fn run_model_command(
         &config.bifrost.api_key,
         &config.bifrost.virtual_key,
         &config.bifrost.primary_model,
+        config.bifrost.timeout_secs,
     );
 
     // Fetch models from Bifrost

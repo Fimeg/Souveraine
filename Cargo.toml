@@ -43,7 +43,12 @@ tempfile = "3"
 walkdir = "2"
 
 # HTTP client (for Bifrost/Ollama)
-reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls", "multipart"] }
+
+# Voice channel — mic capture, mp3 playback, WAV encoding, STT/TTS HTTP clients
+cpal = "0.15"
+rodio = { version = "0.19", default-features = false, features = ["mp3"] }
+hound = "3.5"
 
 # Embeddings/ML
 # tokenizers = "0.15"  # For local tokenization
@@ -55,6 +60,7 @@ unicode-width = "0.1"
 colored = "2"       # Color gradients and effects
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }  # Per-agent portraits (assets/portrait.{png,jpg})
 ratatui-image = "11"  # Real photo rendering in TUI (kitty/sixel/halfblock)
+ratatui-ratty = { version = "0.2", optional = true }  # Inline 3D graphics via Ratty Graphics Protocol
 
 # Logging/tracing
 tracing = "0.1"
@@ -140,3 +146,4 @@ default = ["figlet-rs"]
 figlet-rs = ["dep:figlet-rs"]
 cowsay = ["dep:cowsay"]
 tauri-desktop = ["dep:tauri", "dep:tauri-plugin-shell"]
+rgp = ["dep:ratatui-ratty"]

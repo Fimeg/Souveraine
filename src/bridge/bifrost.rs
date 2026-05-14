@@ -340,19 +340,22 @@ enum ErrorClass {
 }
 
 impl BifrostClient {
-    pub fn new(base_url: &str, api_key: &str, virtual_key: &str, default_model: &str) -> Self {
+    pub fn new(base_url: &str, api_key: &str, virtual_key: &str, default_model: &str, timeout_secs: u64) -> Self {
         let base = base_url.trim_end_matches('/').to_string();
         let base_url = if base.ends_with("/v1") { base } else { format!("{}/v1", base) };
 
         info!(
-            "🌉 Bifrost client initialized — model: {}, endpoint: {}",
-            default_model, base_url
+            "🌉 Bifrost client initialized — model: {}, endpoint: {}, timeout: {}s",
+            default_model, base_url, timeout_secs
         );
         Self {
             base_url,
             api_key: api_key.to_string(),
             virtual_key: virtual_key.to_string(),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(timeout_secs))
+                .build()
+                .expect("reqwest Client::builder() should never fail with static config"),
             default_model: default_model.to_string(),
             retry_policy: RetryPolicy::default(),
         }
@@ -415,10 +418,7 @@ impl BifrostClient {
         let mut strain_events: Vec<InferenceStrain> = Vec::new();
 
         // Try primary model
-        let mut fallbacks = self.retry_policy.fallback_models.clone();
-        if fallbacks.is_empty() && !request.model.ends_with("-precision") {
-            fallbacks.push(format!("{}-precision", request.model));
-        }
+        let fallbacks = self.retry_policy.fallback_models.clone();
 
         match self.try_model_with_retries(&request, &request.model, &mut strain_events).await {
             Ok(result) => return Ok((result, strain_events)),
@@ -588,6 +588,7 @@ mod tests {
             "sk-bf-test",
             "",
             "openai/deepseek-v4-pro",
+            120,
         );
         assert!(client.base_url.ends_with("/v1"));
     }

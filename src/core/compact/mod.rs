@@ -23,7 +23,7 @@ pub mod strategy;
 
 pub use config::{CompactionConfig, CompactionStrategyKind};
 pub use plan::{AuditEntry, CompactionPlan, CompactionReport};
-pub use strategy::{CompactionStrategy, CullStrategy, MicrocompactStrategy, SlidingWindowStrategy, SummaryStrategy};
+pub use strategy::{CompactionStrategy, CullStrategy, MicrocompactStrategy, SlidingReflectStrategy, SlidingWindowStrategy, SummaryStrategy};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -105,9 +105,13 @@ impl CompactionEngine for DefaultCompactionEngine {
         // Resolve config early so we can bail before requiring a session
         let agent_type = (self.get_agent_type)(agent_id)
             .unwrap_or_else(|| "primary".to_string());
-        let cfg = {
+        let (cfg, reflect_prompt, summary_prompt) = {
             let app_config = self.config.read().await;
-            app_config.compaction.for_agent_type(&agent_type)
+            (
+                app_config.compaction.for_agent_type(&agent_type),
+                app_config.compaction.reflect_prompt.clone(),
+                app_config.compaction.summary_prompt.clone(),
+            )
         };
 
         let messages = match (self.get_messages)(agent_id) {
@@ -156,6 +160,7 @@ impl CompactionEngine for DefaultCompactionEngine {
                     let s = SummaryStrategy {
                         client: client.clone(),
                         model: model.to_string(),
+                        prompt_override: summary_prompt,
                     };
                     s.plan(&messages, &cfg, &self.counter).await?
                 }
@@ -173,6 +178,24 @@ impl CompactionEngine for DefaultCompactionEngine {
                 let s = SlidingWindowStrategy;
                 s.plan(&messages, &cfg, &self.counter).await?
             }
+            CompactionStrategyKind::SlidingReflect => match &self.bifrost {
+                Some(client) => {
+                    let model = self
+                        .model
+                        .as_deref()
+                        .unwrap_or("openai/kimi-k2.6");
+                    let s = SlidingReflectStrategy {
+                        client: client.clone(),
+                        model: model.to_string(),
+                        prompt_override: reflect_prompt,
+                    };
+                    s.plan(&messages, &cfg, &self.counter).await?
+                }
+                None => {
+                    tracing::warn!("[sliding_reflect] no bifrost client, falling back to plain sliding window");
+                    SlidingWindowStrategy.plan(&messages, &cfg, &self.counter).await?
+                }
+            },
         };
 
         if plan.is_empty() {

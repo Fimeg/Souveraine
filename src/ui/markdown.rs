@@ -19,16 +19,41 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-const CODE_BG: Color = Color::Rgb(38, 38, 46);
-const CODE_FG: Color = Color::Rgb(220, 220, 230);
-const LINK_DIM: Color = Color::Rgb(140, 160, 200);
-const QUOTE_BAR: Color = Color::Rgb(120, 100, 150);
-const HEADING: Color = Color::Rgb(255, 200, 120);
-const BULLET: Color = Color::Rgb(180, 180, 180);
+use super::chat::ChatPalette;
+
+/// Palette of markdown-specific colours derived from the agent's atmosphere.
+/// Constructed from a `ChatPalette` at the call site in chat.rs.
+#[derive(Debug, Clone, Copy)]
+pub struct MarkdownPalette {
+    pub code_bg: Color,
+    pub code_fg: Color,
+    pub link_dim: Color,
+    pub quote_bar: Color,
+    pub heading: Color,
+    pub bullet: Color,
+}
+
+impl MarkdownPalette {
+    pub fn from_chat_palette(cpal: &ChatPalette) -> Self {
+        let (pr, pg, pb) = match cpal.agent_primary { Color::Rgb(r, g, b) => (r, g, b), _ => (255, 140, 66) };
+        let r = |c: Color| -> u8 { match c { Color::Rgb(r, _, _) => r, _ => 0 } };
+        let g = |c: Color| -> u8 { match c { Color::Rgb(_, g, _) => g, _ => 0 } };
+        let b = |c: Color| -> u8 { match c { Color::Rgb(_, _, b) => b, _ => 0 } };
+        let bg = cpal.bg;
+        Self {
+            code_bg: Color::Rgb(r(bg).saturating_add(22).min(255), g(bg).saturating_add(22).min(255), b(bg).saturating_add(34).min(255)),
+            code_fg: Color::Rgb(pr.max(160), pg.max(160), pb.max(200)),
+            link_dim: Color::Rgb((pr / 3).saturating_add(100).min(220), (pg / 3).saturating_add(120).min(220), (pb / 2).saturating_add(100).min(220)),
+            quote_bar: Color::Rgb((pr / 3).saturating_add(80).min(200), (pg / 3).saturating_add(70).min(180), (pb / 2).saturating_add(80).min(200)),
+            heading: Color::Rgb(pr.max(200), pg.max(160), pb.max(80)),
+            bullet: Color::Rgb((pr / 2).saturating_add(80), (pg / 2).saturating_add(80), (pb / 2).saturating_add(80)),
+        }
+    }
+}
 
 /// Render markdown to a Vec of styled lines.
-pub fn render(md: &str, default_fg: Color) -> Vec<Line<'static>> {
-    render_with_width(md, default_fg, None)
+pub fn render(md: &str, default_fg: Color, mdpal: &MarkdownPalette) -> Vec<Line<'static>> {
+    render_with_width(md, default_fg, None, mdpal)
 }
 
 /// Render markdown to a Vec of styled lines, optionally wrapping any line
@@ -41,12 +66,13 @@ pub fn render_with_width(
     md: &str,
     default_fg: Color,
     max_width: Option<usize>,
+    mdpal: &MarkdownPalette,
 ) -> Vec<Line<'static>> {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     let parser = Parser::new_ext(md, opts);
 
-    let mut renderer = Renderer::new(default_fg);
+    let mut renderer = Renderer::new(default_fg, mdpal);
     for ev in parser {
         renderer.handle(ev);
     }
@@ -503,7 +529,7 @@ fn build_balanced_spans(tokens: &[WrapToken]) -> Vec<Span<'static>> {
     spans
 }
 
-struct Renderer {
+struct Renderer<'a> {
     lines: Vec<Line<'static>>,
     current: Vec<Span<'static>>,
     style_stack: Vec<Style>,
@@ -514,6 +540,7 @@ struct Renderer {
     default_fg: Color,
     /// Pending list item bullet to emit on next text.
     pending_bullet: Option<String>,
+    palette: &'a MarkdownPalette,
 }
 
 enum ListMode {
@@ -521,8 +548,8 @@ enum ListMode {
     Ordered(u64),
 }
 
-impl Renderer {
-    fn new(default_fg: Color) -> Self {
+impl<'a> Renderer<'a> {
+    fn new(default_fg: Color, palette: &'a MarkdownPalette) -> Self {
         Self {
             lines: Vec::new(),
             current: Vec::new(),
@@ -533,6 +560,7 @@ impl Renderer {
             quote_depth: 0,
             default_fg,
             pending_bullet: None,
+            palette,
         }
     }
 
@@ -565,7 +593,7 @@ impl Renderer {
         if self.quote_depth > 0 {
             Some(Span::styled(
                 "▌ ".repeat(self.quote_depth),
-                Style::default().fg(QUOTE_BAR),
+                Style::default().fg(self.palette.quote_bar),
             ))
         } else {
             None
@@ -578,7 +606,7 @@ impl Renderer {
                 self.current.push(p);
             }
             if let Some(b) = self.pending_bullet.take() {
-                self.current.push(Span::styled(b, Style::default().fg(BULLET)));
+                self.current.push(Span::styled(b, Style::default().fg(self.palette.bullet)));
             }
         }
     }
@@ -591,11 +619,10 @@ impl Renderer {
                 self.ensure_line_started();
                 let style = self.current_style();
                 let style = if self.in_code_block {
-                    Style::default().fg(CODE_FG).bg(CODE_BG)
+                    Style::default().fg(self.palette.code_fg).bg(self.palette.code_bg)
                 } else {
                     style
                 };
-                // Code blocks may include newlines inside one Text event.
                 let text = t.into_string();
                 let mut first = true;
                 for chunk in text.split('\n') {
@@ -613,7 +640,7 @@ impl Renderer {
                 self.ensure_line_started();
                 self.current.push(Span::styled(
                     format!("`{}`", c.into_string()),
-                    Style::default().fg(CODE_FG).bg(CODE_BG),
+                    Style::default().fg(self.palette.code_fg).bg(self.palette.code_bg),
                 ));
             }
             Event::SoftBreak | Event::HardBreak => {
@@ -623,7 +650,7 @@ impl Renderer {
                 self.flush();
                 self.lines.push(Line::from(Span::styled(
                     "─".repeat(40),
-                    Style::default().fg(Color::Rgb(80, 80, 80)),
+                    Style::default().fg(self.palette.bullet),
                 )));
             }
             // Pulldown-cmark events we don't render specially fall through.
@@ -644,9 +671,9 @@ impl Renderer {
                 };
                 self.current.push(Span::styled(
                     prefix.to_string(),
-                    Style::default().fg(HEADING).add_modifier(Modifier::BOLD),
+                    Style::default().fg(self.palette.heading).add_modifier(Modifier::BOLD),
                 ));
-                self.push_style(Style::default().fg(HEADING).add_modifier(Modifier::BOLD));
+                self.push_style(Style::default().fg(self.palette.heading).add_modifier(Modifier::BOLD));
             }
             Tag::Paragraph => {
                 // Blank line between paragraphs (but not inside list items
@@ -667,7 +694,7 @@ impl Renderer {
             Tag::Link { dest_url, .. } => {
                 self.push_style(
                     Style::default()
-                        .fg(LINK_DIM)
+                        .fg(self.palette.link_dim)
                         .add_modifier(Modifier::UNDERLINED),
                 );
                 // Defer the URL; emit on Tag::End(Link).
@@ -684,7 +711,7 @@ impl Renderer {
                 let label = lang.filter(|s| !s.is_empty()).unwrap_or_else(|| "code".to_string());
                 self.lines.push(Line::from(Span::styled(
                     format!("┌─ {} ", label),
-                    Style::default().fg(Color::Rgb(120, 120, 130)),
+                    Style::default().fg(self.palette.code_fg).add_modifier(Modifier::DIM),
                 )));
             }
             Tag::List(start) => {
@@ -734,7 +761,7 @@ impl Renderer {
                     self.current.push(Span::styled(
                         format!(" ({})", url),
                         Style::default()
-                            .fg(LINK_DIM)
+                            .fg(self.palette.link_dim)
                             .add_modifier(Modifier::DIM),
                     ));
                 }
@@ -745,7 +772,7 @@ impl Renderer {
                 self.code_lang = None;
                 self.lines.push(Line::from(Span::styled(
                     "└─".to_string(),
-                    Style::default().fg(Color::Rgb(120, 120, 130)),
+                    Style::default().fg(self.palette.code_fg).add_modifier(Modifier::DIM),
                 )));
             }
             TagEnd::List(_) => {

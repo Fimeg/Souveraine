@@ -66,6 +66,30 @@ pub struct ConsciousnessConfig {
     /// Self-awareness pulse during long turns (in-turn noticing of time passing).
     #[serde(default)]
     pub presence: PresenceConfig,
+
+    /// Voice channel — STT/TTS services, mic capture, push-to-talk key.
+    #[serde(default)]
+    pub voice: VoiceConfig,
+
+    /// Top-level agent/substrate settings — platform prompt, etc.
+    #[serde(default)]
+    pub agent: AgentConfig,
+
+    /// TUI interface settings (stale timeout, etc.)
+    #[serde(default)]
+    pub tui: TuiConfig,
+}
+
+// ── Agent (top-level) ──
+
+/// Substrate-level settings for the primary agent.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AgentConfig {
+    /// Platform prompt — injected at the very top of the system prompt,
+    /// before the agent's own identity files. Operator-level context that
+    /// the agent reads but did not write. Editable in Settings > Agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
 }
 
 // ── Server ──
@@ -153,6 +177,12 @@ pub struct BifrostConfig {
     /// Per-model overrides
     #[serde(default)]
     pub models: HashMap<String, BifrostModelConfig>,
+
+    /// Request timeout in seconds for each LLM call attempt.
+    /// When exceeded, the attempt is treated as a transient error and retried.
+    /// Default: 120 (two minutes per attempt, 7 attempts = ~14 min total).
+    #[serde(default = "default_bifrost_timeout")]
+    pub timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,6 +203,7 @@ impl Default for BifrostConfig {
             virtual_key: default_bifrost_virtual_key(),
             primary_model: default_primary_model(),
             models: HashMap::new(),
+            timeout_secs: default_bifrost_timeout(),
         }
     }
 }
@@ -228,6 +259,9 @@ pub struct ReflectionConfig {
     pub message_interval: usize,
     #[serde(default)]
     pub trigger: ReflectionTrigger,
+    /// Model handle for reflection passes. Falls back to subconscious model when unset.
+    #[serde(default)]
+    pub model: Option<String>,
     #[serde(default)]
     pub per_agent: HashMap<String, AgentReflectionSettings>,
 }
@@ -238,6 +272,7 @@ impl Default for ReflectionConfig {
             enabled: true,
             message_interval: 25,
             trigger: ReflectionTrigger::StepCount,
+            model: None,
             per_agent: HashMap::new(),
         }
     }
@@ -514,6 +549,9 @@ impl Default for ConsciousnessConfig {
             events: EventsConfig::default(),
             federation: FederationConfig::default(),
             presence: PresenceConfig::default(),
+            voice: VoiceConfig::default(),
+            agent: AgentConfig::default(),
+            tui: TuiConfig::default(),
         }
     }
 }
@@ -572,6 +610,13 @@ pub struct PresenceConfig {
     pub pulse_enabled: bool,
     #[serde(default = "default_pulse_interval")]
     pub pulse_interval_secs: u64,
+    /// Current outfit name (subdirectory under `expressions/`).
+    /// Empty or None means root-level expressions.
+    #[serde(default)]
+    pub outfit: Option<String>,
+    /// Current atmosphere preset name. Empty defaults to posture-linked.
+    #[serde(default)]
+    pub atmosphere: Option<String>,
 }
 
 impl Default for PresenceConfig {
@@ -579,11 +624,34 @@ impl Default for PresenceConfig {
         Self {
             pulse_enabled: true,
             pulse_interval_secs: default_pulse_interval(),
+            outfit: None,
+            atmosphere: None,
         }
     }
 }
 
 fn default_pulse_interval() -> u64 { 600 }
+
+// ── TUI ──
+
+/// TUI-specific settings. None of these are load-bearing for the agent; they
+/// tune the interface layer only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TuiConfig {
+    /// Seconds without a backend event before the turn is declared stalled and
+    /// reset. Increase if your model needs longer for inference (e.g. after
+    /// reading many large files). Default: 90.
+    #[serde(default = "default_stale_timeout_secs")]
+    pub stale_timeout_secs: u64,
+}
+
+impl Default for TuiConfig {
+    fn default() -> Self {
+        Self { stale_timeout_secs: default_stale_timeout_secs() }
+    }
+}
+
+fn default_stale_timeout_secs() -> u64 { 90 }
 
 // ── Federation ──
 
@@ -604,7 +672,68 @@ impl Default for FederationConfig {
     }
 }
 
+// ── Voice channel ──
+
+/// Voice channel configuration: STT (Faster-Whisper) + TTS (VibeVoice).
+///
+/// When `enabled = false`, the Presence screen behaves as today; no audio
+/// devices are opened. The agent doesn't know or care whether voice is on —
+/// voice is a sensorium channel, not a tool she calls.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoiceConfig {
+    /// Opt-in; default off. Audio devices not touched when false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Faster-Whisper HTTP base URL.
+    #[serde(default = "default_stt_url")]
+    pub stt_url: String,
+    /// VibeVoice HTTP base URL.
+    #[serde(default = "default_tts_url")]
+    pub tts_url: String,
+    /// Voice ID passed to VibeVoice (`/audio/speech`).
+    #[serde(default = "default_voice_id")]
+    pub voice_id: String,
+    /// Push-to-talk key label (informational only — the TUI uses Space).
+    #[serde(default = "default_ptt_key")]
+    pub push_to_talk_key: String,
+}
+
+impl Default for VoiceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            stt_url: default_stt_url(),
+            tts_url: default_tts_url(),
+            voice_id: default_voice_id(),
+            push_to_talk_key: default_ptt_key(),
+        }
+    }
+}
+
+fn default_stt_url() -> String { "http://10.10.20.19:7862".to_string() }
+fn default_tts_url() -> String { "http://10.10.20.19:7861".to_string() }
+fn default_voice_id() -> String { "en-Soother_woman".to_string() }
+fn default_ptt_key() -> String { "Space".to_string() }
+
 impl ConsciousnessConfig {
+    /// Walk the standard config paths and return the first existing one.
+    pub fn discover_path() -> Option<PathBuf> {
+        let candidates = [
+            "souveraine.toml",
+            "souveraine.yaml",
+            "~/.config/souveraine/config.toml",
+            "~/.config/souveraine/config.yaml",
+        ];
+        for path_str in &candidates {
+            let expanded = shellexpand::tilde(path_str);
+            let path = PathBuf::from(expanded.as_ref());
+            if path.exists() {
+                return Some(path);
+            }
+        }
+        None
+    }
+
     pub fn load(path: &PathBuf) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
         let config: Self = if path.extension().map(|e| e == "toml").unwrap_or(false) {
@@ -656,6 +785,7 @@ fn default_bifrost_virtual_key() -> String {
     std::env::var("BIFROST_VIRTUAL_KEY").unwrap_or_else(|_| String::new())
 }
 fn default_primary_model() -> String { "fireworks/accounts/fireworks/routers/kimi-k2p5-turbo".to_string() }
+fn default_bifrost_timeout() -> u64 { 120 }
 fn default_bandwidth_high() -> BandwidthClass { BandwidthClass::High }
 fn default_presence_breathing() -> String { "breathing_color".to_string() }
 

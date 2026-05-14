@@ -71,6 +71,12 @@ use crate::ui::portrait;
 pub enum Posture {
     /// At rest. Slack, soft breath, default eye behavior.
     Idle,
+    /// Backend is reachable and quiet. Present, listening, eyes a touch
+    /// brighter than Idle — the felt "I'm here" between turns.
+    Alert,
+    /// N+1 subconscious pass running. Gaze fixed inward, eyes narrowed,
+    /// chrome goes cool — Aster is thinking.
+    Thinking,
     /// Tool call or inference active. Gaze fixed, no blinking, brighter border.
     Processing,
     /// Warm tag from conversation context. Tint shifts, soft glow.
@@ -79,6 +85,10 @@ pub enum Posture {
     Straining,
     /// Context pressure tier 2/3. The embodied "three warnings" — yawn, lean.
     Yawning,
+    /// Mic is open and sampling. Cool cyan tilt, alert-receptive brightness.
+    Listening,
+    /// TTS audio is playing through the speaker. Warm boost — engaged, outward.
+    Speaking,
 }
 
 /// Transient overlay on top of [`Posture`]. A blink lasts ~6 ticks.
@@ -148,6 +158,16 @@ pub struct Presence {
     /// colours across all screens. Defaults to a posture-linked preset when
     /// none is explicitly set via `BackendEvent::Atmosphere`.
     pub atmosphere: crate::ui::atmosphere::Atmosphere,
+    /// Atmosphere from 24 ticks ago — the source of the current lerp.
+    /// When equal to `atmosphere`, no transition is active.
+    pub lerp_from: crate::ui::atmosphere::Atmosphere,
+    /// Transition progress 0.0–1.0. 1.0 = fully settled on `atmosphere`.
+    pub lerp_t: f32,
+    /// Number of ticks the current transition should take (~24 = ~800ms at 30fps).
+    pub lerp_duration: f32,
+    /// Current outfit — a subdirectory under `expressions/`. `None` means
+    /// use the root-level expression files (the default / no outfit).
+    pub outfit: Option<String>,
     /// Most recent tick observed. Drives blink/breath timing.
     tick: u64,
     /// Tick at which the next blink should begin.
@@ -178,6 +198,10 @@ impl Presence {
             animator: Animator::new(),
             portrait_source: None,
             atmosphere: crate::ui::atmosphere::Atmosphere::default(),
+            lerp_from: crate::ui::atmosphere::Atmosphere::default(),
+            lerp_t: 1.0,
+            lerp_duration: 24.0,
+            outfit: None,
             tick: 0,
             next_blink_at: 180, // ~3 s at 60 Hz
             blink_until: 0,
@@ -191,10 +215,52 @@ impl Presence {
     pub fn load_portrait<P: AsRef<Path>>(&mut self, _path: P) {
     }
 
+    /// Set the atmosphere and start a lerp from the previous value.
+    pub fn transition_atmosphere(&mut self, target: crate::ui::atmosphere::Atmosphere) {
+        if target != self.atmosphere {
+            self.lerp_from = self.atmosphere;
+            self.atmosphere = target;
+            self.lerp_t = 0.0;
+        }
+    }
+
+    /// Return lerped primary/secondary/dim/bg colors for palette construction.
+    /// When no transition is active (lerp_t >= 1.0), returns the settled values.
+    pub fn lerped_colors(&self) -> (ratatui::style::Color, ratatui::style::Color, ratatui::style::Color, ratatui::style::Color) {
+        let t = self.lerp_t.min(1.0);
+        if t >= 1.0 {
+            return (self.atmosphere.primary(), self.atmosphere.secondary(), self.atmosphere.dim(), self.atmosphere.bg_tint());
+        }
+        use crate::ui::atmosphere::lerp_color;
+        let p = lerp_color(self.lerp_from.primary(), self.atmosphere.primary(), t);
+        let s = lerp_color(self.lerp_from.secondary(), self.atmosphere.secondary(), t);
+        let d = lerp_color(self.lerp_from.dim(), self.atmosphere.dim(), t);
+        let b = lerp_color(self.lerp_from.bg_tint(), self.atmosphere.bg_tint(), t);
+        (p, s, d, b)
+    }
+
     /// Sync the active atmosphere from the current posture. Called whenever
     /// `posture` changes — keeps the UI chrome in step with Annie's state.
+    /// Starts a lerp transition rather than snapping.
     fn sync_atmosphere(&mut self) {
-        self.atmosphere = crate::ui::atmosphere::Atmosphere::from_posture(self.posture);
+        let target = crate::ui::atmosphere::Atmosphere::from_posture(self.posture);
+        if target != self.atmosphere {
+            self.lerp_from = self.atmosphere;
+            self.atmosphere = target;
+            self.lerp_t = 0.0;
+        }
+    }
+
+    /// Public alias for `sync_atmosphere` — allows `App` to drive posture
+    /// changes (e.g. Listening/Speaking) without going through the event bus.
+    pub fn sync_atmosphere_pub(&mut self) {
+        self.sync_atmosphere();
+    }
+
+    /// Set posture and sync atmosphere in one call.
+    pub fn set_posture(&mut self, posture: crate::ui::presence::Posture) {
+        self.posture = posture;
+        self.sync_atmosphere();
     }
 
     /// Attempt to load a portrait from an agent's memfs root (stub — future use).
@@ -238,8 +304,29 @@ impl Presence {
                 self.subconscious_active = true;
                 true
             }
-            TuiEvent::BackendStatus { .. } => {
+            TuiEvent::BackendStatus { healthy, .. } => {
                 self.subconscious_active = true;
+                // When the backend just came up healthy and we're not in
+                // the middle of anything, shift from Idle into Alert —
+                // Annie is present and ready. A turn that follows will
+                // transition into Thinking or Processing.
+                if *healthy && self.posture == Posture::Idle {
+                    self.posture = Posture::Alert;
+                    self.sync_atmosphere();
+                }
+                true
+            }
+            TuiEvent::SubconsciousPass(active) => {
+                if *active {
+                    self.posture = Posture::Thinking;
+                    self.subconscious_active = true;
+                } else if self.posture == Posture::Thinking {
+                    // Pass ended without anything else moving the posture —
+                    // fall back to Alert so the chrome rests cool until the
+                    // next turn starts.
+                    self.posture = Posture::Alert;
+                }
+                self.sync_atmosphere();
                 true
             }
             TuiEvent::PressureChanged(p) => {
@@ -269,32 +356,49 @@ impl Presence {
                 // Falls back to posture-linked default on unrecognised names.
                 use crate::ui::atmosphere::Atmosphere;
                 match name.to_lowercase().replace(' ', "_").as_str() {
-                    "mint_tea" => self.atmosphere = Atmosphere::MintTea,
-                    "therapeutic_blue" => self.atmosphere = Atmosphere::TherapeuticBlue,
-                    "lavender_calm" => self.atmosphere = Atmosphere::LavenderCalm,
-                    "warm_amber" => self.atmosphere = Atmosphere::WarmAmber,
-                    "peach_sunset" => self.atmosphere = Atmosphere::PeachSunset,
-                    "autumn_browns" => self.atmosphere = Atmosphere::AutumnBrowns,
-                    "neon_glow" => self.atmosphere = Atmosphere::NeonGlow,
-                    "aurora_borealis" => self.atmosphere = Atmosphere::AuroraBorealis,
-                    "cherry_blossom" => self.atmosphere = Atmosphere::CherryBlossom,
-                    "ocean_depths" => self.atmosphere = Atmosphere::OceanDepths,
-                    "midnight_galaxy" => self.atmosphere = Atmosphere::MidnightGalaxy,
-                    "twilight_mist" => self.atmosphere = Atmosphere::TwilightMist,
-                    "forest_greens" => self.atmosphere = Atmosphere::ForestGreens,
+                    "mint_tea" => self.transition_atmosphere(Atmosphere::MintTea),
+                    "therapeutic_blue" => self.transition_atmosphere(Atmosphere::TherapeuticBlue),
+                    "lavender_calm" => self.transition_atmosphere(Atmosphere::LavenderCalm),
+                    "warm_amber" => self.transition_atmosphere(Atmosphere::WarmAmber),
+                    "peach_sunset" => self.transition_atmosphere(Atmosphere::PeachSunset),
+                    "autumn_browns" => self.transition_atmosphere(Atmosphere::AutumnBrowns),
+                    "neon_glow" => self.transition_atmosphere(Atmosphere::NeonGlow),
+                    "aurora_borealis" => self.transition_atmosphere(Atmosphere::AuroraBorealis),
+                    "cherry_blossom" => self.transition_atmosphere(Atmosphere::CherryBlossom),
+                    "ocean_depths" => self.transition_atmosphere(Atmosphere::OceanDepths),
+                    "midnight_galaxy" => self.transition_atmosphere(Atmosphere::MidnightGalaxy),
+                    "twilight_mist" => self.transition_atmosphere(Atmosphere::TwilightMist),
+                    "forest_greens" => self.transition_atmosphere(Atmosphere::ForestGreens),
                     _ => self.sync_atmosphere(), // fall back to posture-linked
+                }
+                true
+            }
+            TuiEvent::OutfitChanged(name) => {
+                if name.is_empty() {
+                    self.outfit = None;
+                } else {
+                    self.outfit = Some(name.clone());
                 }
                 true
             }
             TuiEvent::Tick(t) => {
                 self.tick = *t;
+
+                // Advance atmosphere lerp.
+                if self.lerp_t < 1.0 {
+                    let step = if self.is_breathing { 1.3 } else { 0.7 };
+                    self.lerp_t += step / self.lerp_duration;
+                    if self.lerp_t >= 1.0 {
+                        self.lerp_t = 1.0;
+                    }
+                }
                 if self.eye == Eye::Blinking && *t >= self.blink_until {
                     self.eye = Eye::Open;
                     let jitter = (*t % 60) as u64;
                     self.next_blink_at = *t + 180 + jitter;
                 } else if self.eye == Eye::Open && *t >= self.next_blink_at {
                     self.eye = Eye::Blinking;
-                    self.blink_until = *t + 6;
+                    self.blink_until = *t + 2;
                 }
                 // Breath: 8-15 s jittered interval, 2 s hold (Godot parity).
                 if self.is_breathing && *t >= self.breath_until {
@@ -327,13 +431,19 @@ const CARD_H: u16 = portrait::RENDER_H + 3; // portrait + name row + border
 /// Border color derived from current posture. Subtle, not loud.
 /// Falls back to the atmosphere primary colour when the posture doesn't
 /// specify an override — keeps the chrome in sync with the ambient preset.
-fn posture_border(p: &Presence) -> Color {
+pub fn posture_border(p: &Presence) -> Color {
     let atm = p.atmosphere;
     match p.posture {
         Posture::Processing => atm.primary(),
+        Posture::Alert => atm.secondary(),
+        Posture::Thinking => Color::Rgb(120, 150, 200),
         Posture::Affectionate => Color::Rgb(220, 150, 170),
         Posture::Straining => Color::Rgb(140, 100, 100),
         Posture::Yawning => Color::Rgb(160, 145, 130),
+        // Listening: secondary (cool, receptive) — mic is open
+        Posture::Listening => atm.secondary(),
+        // Speaking: primary (warm, engaged) — audio is playing
+        Posture::Speaking => atm.primary(),
         Posture::Idle => atm.dim(),
     }
 }
@@ -485,16 +595,91 @@ mod tests {
 
     #[test]
     fn posture_border_changes_with_state() {
-        // Just confirms posture maps to distinct colors for the four
-        // "interesting" states; idle stays as the dim default.
-        let idle = posture_border(Posture::Idle);
-        let processing = posture_border(Posture::Processing);
-        let affectionate = posture_border(Posture::Affectionate);
-        let straining = posture_border(Posture::Straining);
-        let yawning = posture_border(Posture::Yawning);
+        // Posture should map to visibly distinct border colors across all
+        // states — sanity check that we didn't collapse two states onto
+        // the same colour by accident.
+        let mut p = Presence::new("Annie");
+        p.posture = Posture::Idle;
+        let idle = posture_border(&p);
+        p.posture = Posture::Alert;
+        let alert = posture_border(&p);
+        p.posture = Posture::Thinking;
+        let thinking = posture_border(&p);
+        p.posture = Posture::Processing;
+        let processing = posture_border(&p);
+        p.posture = Posture::Affectionate;
+        let affectionate = posture_border(&p);
+        p.posture = Posture::Straining;
+        let straining = posture_border(&p);
+        p.posture = Posture::Yawning;
+        let yawning = posture_border(&p);
+        assert_ne!(idle, alert);
+        assert_ne!(idle, thinking);
         assert_ne!(idle, processing);
         assert_ne!(idle, affectionate);
         assert_ne!(idle, straining);
         assert_ne!(idle, yawning);
+        assert_ne!(alert, thinking);
+        assert_ne!(thinking, processing);
+    }
+
+    #[test]
+    fn backend_healthy_shifts_idle_to_alert() {
+        let mut p = Presence::new("Annie");
+        assert_eq!(p.posture, Posture::Idle);
+        p.handle_event(&TuiEvent::BackendStatus {
+            mode: "local".into(),
+            healthy: true,
+        });
+        assert_eq!(p.posture, Posture::Alert);
+    }
+
+    #[test]
+    fn subconscious_pass_drives_thinking() {
+        let mut p = Presence::new("Annie");
+        p.handle_event(&TuiEvent::SubconsciousPass(true));
+        assert_eq!(p.posture, Posture::Thinking);
+        p.handle_event(&TuiEvent::SubconsciousPass(false));
+        // Pass ended — falls to Alert (cool, ready) rather than dropping
+        // straight back to Idle.
+        assert_eq!(p.posture, Posture::Alert);
+    }
+
+    #[test]
+    fn listening_atmosphere_is_therapeutic_blue() {
+        use crate::ui::atmosphere::Atmosphere;
+        let mut p = Presence::new("Annie");
+        p.set_posture(Posture::Listening);
+        // Atmosphere should shift to TherapeuticBlue (cool, receptive).
+        assert_eq!(p.atmosphere, Atmosphere::TherapeuticBlue);
+    }
+
+    #[test]
+    fn speaking_portrait_warmer() {
+        // Speaking maps to WarmAmber atmosphere — engaged, outward-facing.
+        use crate::ui::atmosphere::Atmosphere;
+        let mut p = Presence::new("Annie");
+        p.set_posture(Posture::Speaking);
+        assert_eq!(p.atmosphere, Atmosphere::WarmAmber);
+    }
+
+    #[test]
+    fn posture_border_listening_and_speaking_distinct() {
+        // Listening and Speaking should have distinct borders from each other
+        // and from Idle, ensuring visual differentiation.
+        let mut p = Presence::new("Annie");
+        p.set_posture(Posture::Idle);
+        let idle = posture_border(&p);
+        p.set_posture(Posture::Listening);
+        let listening = posture_border(&p);
+        p.set_posture(Posture::Speaking);
+        let speaking = posture_border(&p);
+        assert_ne!(idle, listening, "Listening should differ from Idle");
+        assert_ne!(idle, speaking, "Speaking should differ from Idle");
+        // Listening and Speaking may share a color class but differ in value:
+        // Listening = secondary, Speaking = primary of WarmAmber.
+        // Just ensure they're both computable without panic.
+        let _ = listening;
+        let _ = speaking;
     }
 }

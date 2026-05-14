@@ -733,11 +733,12 @@ pub async fn execute_memory_command_with_context(
                 }
                 None => Ok(
                     "I can compact my context window using one of these strategies:\n\
-                     - summary (LLM-summarize oldest messages)\n\
-                     - key-value (extract key facts to memory)\n\
-                     - quote (preserve important verbatim quotes)\n\
-                     - cull (drop greetings and acknowledgments)\n\n\
-                     Use: memory compact --strategy <strategy>"
+                     - sliding_window (keep first + last N messages, drop the middle — fast, no LLM)\n\
+                     - summary (LLM-summarize oldest messages into a compact block)\n\
+                     - microcompact (replace old tool results with placeholders — drop-in, no LLM)\n\
+                     - cull (drop greetings and acknowledgments — cheapest)\n\n\
+                     Usage: memory compact --strategy <strategy>\n\
+                     Each agent type has its own default: primary=sliding_window, subconscious=sliding_window, subagent=cull"
                         .to_string(),
                 ),
             }
@@ -890,8 +891,8 @@ Paths are relative to my memory directory. Frontmatter description is required o
                 },
                 "strategy": {
                     "type": "string",
-                    "enum": ["microcompact", "micro", "sliding_window", "sliding-window", "summary", "cull"],
-                    "description": "Compaction strategy (for compact subcommand)"
+                    "enum": ["microcompact", "sliding_window", "summary", "cull"],
+                    "description": "Compaction strategy (for compact subcommand). sliding_window (fast, drops middle), summary (LLM), microcompact (tool-result placeholder), cull (greetings)"
                 }
             },
             "required": ["command"]

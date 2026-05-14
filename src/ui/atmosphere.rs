@@ -46,12 +46,12 @@ pub enum Atmosphere {
 }
 
 /// Helper: blend two u8 channels by `t ∈ [0, 1]`.
-fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
+pub(crate) fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
     (a as f32 + (b as f32 - a as f32) * t) as u8
 }
 
 /// Helper: blend two colors channel-wise.
-fn lerp_color(a: Color, b: Color, t: f32) -> Color {
+pub(crate) fn lerp_color(a: Color, b: Color, t: f32) -> Color {
     let (ar, ag, ab) = into_rgb(a);
     let (br, bg, bb) = into_rgb(b);
     Color::Rgb(lerp_u8(ar, br, t), lerp_u8(ag, bg, t), lerp_u8(ab, bb, t))
@@ -60,7 +60,7 @@ fn lerp_color(a: Color, b: Color, t: f32) -> Color {
 fn into_rgb(c: Color) -> (u8, u8, u8) {
     match c {
         Color::Rgb(r, g, b) => (r, g, b),
-        _ => (255, 140, 66), // fallback to ANI_PRIMARY
+        _ => (255, 140, 66), // fallback: Default primary
     }
 }
 
@@ -150,10 +150,18 @@ impl Atmosphere {
         use crate::ui::presence::Posture;
         match posture {
             Posture::Idle => Atmosphere::Default,
+            // Alert stays warm — present and ready, not doing anything cool.
+            Posture::Alert => Atmosphere::Default,
+            // Thinking pulls the room cool — Aster's inward pass.
+            Posture::Thinking => Atmosphere::TherapeuticBlue,
             Posture::Processing => Atmosphere::WarmAmber,
             Posture::Affectionate => Atmosphere::CherryBlossom,
             Posture::Straining => Atmosphere::TwilightMist,
             Posture::Yawning => Atmosphere::OceanDepths,
+            // Listening: cool cyan tilt — alert and receptive.
+            Posture::Listening => Atmosphere::TherapeuticBlue,
+            // Speaking: warm amber — engaged, outward-facing.
+            Posture::Speaking => Atmosphere::WarmAmber,
         }
     }
 

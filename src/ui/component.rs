@@ -72,6 +72,11 @@ pub enum TuiEvent {
     InferenceStrain { attempt: u32, status: u16 },
     /// Agent set an atmospheric colour preset for the UI chrome.
     AtmosphereChanged(String),
+    /// N+1 subconscious pass started (`true`) or finished (`false`).
+    SubconsciousPass(bool),
+    /// Agent changed her outfit. String is the outfit name (subdirectory
+    /// in expressions/), empty string clears to default.
+    OutfitChanged(String),
 
     // ── Animation tick ─────────────────────────────────────────
     /// Monotonic tick counter, increments every frame.
@@ -110,8 +115,6 @@ pub enum SceneLayout {
         /// Whether the sidebar is currently visible.
         sidebar_open: bool,
     },
-    /// 2×2 grid for system overview (Dashboard).
-    Dashboard,
     /// Full-screen agent picker overlay.
     AgentPicker,
 }
@@ -176,17 +179,6 @@ impl SceneLayout {
                 }
 
                 zones
-            }
-            Self::Dashboard => {
-                // 2×2 grid
-                let half_w = area.width / 2;
-                let half_h = area.height / 2;
-                vec![
-                    Rect::new(area.x, area.y, half_w, half_h),
-                    Rect::new(area.x + half_w, area.y, area.width - half_w, half_h),
-                    Rect::new(area.x, area.y + half_h, half_w, area.height - half_h),
-                    Rect::new(area.x + half_w, area.y + half_h, area.width - half_w, area.height - half_h),
-                ]
             }
             Self::AgentPicker => {
                 if component_count == 0 { return Vec::new(); }

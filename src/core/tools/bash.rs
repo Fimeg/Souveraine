@@ -144,6 +144,12 @@ I don't use echo or cat for files — that's what `read` and `write` are for. Th
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
         });
 
+        // Body-knowledge env vars from ToolContext — MEMORY/MEMORY_DIR (and
+        // anything else the caller seeded) need to reach the subprocess so
+        // commands like `ls $MEMORY/journal/` resolve. Inherits the parent's
+        // environment for everything not overridden.
+        let ctx_env: Vec<(String, String)> = ctx.env.clone();
+
         let agent_key = ctx.agent_id.as_deref().unwrap_or("_default").to_string();
 
         if run_bg {
@@ -163,11 +169,13 @@ I don't use echo or cat for files — that's what `read` and `write` are for. Th
             let tid = task_id.clone();
             let cwd_c = cwd.clone();
             let ak = agent_key.clone();
+            let env_c = ctx_env.clone();
             tokio::spawn(async move {
                 let output = tokio::process::Command::new("bash")
                     .arg("-c")
                     .arg(&cmd)
                     .current_dir(&cwd_c)
+                    .envs(env_c.iter().map(|(k, v)| (k.as_str(), v.as_str())))
                     .kill_on_drop(true)
                     .output()
                     .await;
@@ -201,6 +209,7 @@ I don't use echo or cat for files — that's what `read` and `write` are for. Th
                 .arg("-c")
                 .arg(command)
                 .current_dir(&cwd)
+                .envs(ctx_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
                 .kill_on_drop(true)
                 .output(),
         )

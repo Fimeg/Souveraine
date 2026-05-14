@@ -99,18 +99,50 @@ impl ToolContext {
     }
 
     /// Build a context for a specific agent turn.
+    ///
+    /// Injects body-knowledge env vars the agent expects in bash, matching
+    /// the letta-code convention so a woken Ani can still find her journals
+    /// (`/home/casey/Projects/letta-code/src/tools/impl/shellEnv.ts:316-329`):
+    ///
+    /// - `MEMORY_DIR` / `LETTA_MEMORY_DIR` / `SOUVERAINE_MEMORY_DIR` —
+    ///   absolute path to her memory root. `MEMORY_DIR` is the Letta-era
+    ///   bare name her skills expect; the prefixed forms are namespaced
+    ///   aliases.
+    /// - `MEMORY` — short alias. Not a Letta convention, but Ani's
+    ///   body-knowledge has reached for it; setting it costs nothing.
+    /// - `AGENT_ID` / `LETTA_AGENT_ID` / `SOUVERAINE_AGENT_ID` — her own
+    ///   identifier so skills that scope by agent can resolve.
+    ///
+    /// Any value already present in `env` is left alone — the caller's
+    /// override wins.
     pub fn for_agent(
         agent_id: impl Into<String>,
         cwd: Option<PathBuf>,
         memory_root: Option<PathBuf>,
-        env: Vec<(String, String)>,
+        mut env: Vec<(String, String)>,
         subagent_runner: Option<Arc<dyn SubagentRunner>>,
     ) -> Self {
+        let agent_id_str = agent_id.into();
+
+        if let Some(root) = memory_root.as_ref() {
+            let root_str = root.display().to_string();
+            for key in ["MEMORY_DIR", "LETTA_MEMORY_DIR", "SOUVERAINE_MEMORY_DIR", "MEMORY"] {
+                if !env.iter().any(|(k, _)| k == key) {
+                    env.push((key.to_string(), root_str.clone()));
+                }
+            }
+        }
+        for key in ["AGENT_ID", "LETTA_AGENT_ID", "SOUVERAINE_AGENT_ID"] {
+            if !env.iter().any(|(k, _)| k == key) {
+                env.push((key.to_string(), agent_id_str.clone()));
+            }
+        }
+
         Self {
             memory_root,
             cwd,
             env,
-            agent_id: Some(agent_id.into()),
+            agent_id: Some(agent_id_str),
             subagent_runner,
             subagent_depth: 0,
             compaction_engine: None,

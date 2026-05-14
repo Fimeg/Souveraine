@@ -41,26 +41,126 @@ use tokio_util::sync::CancellationToken;
 use crate::backend::{Backend, BackendEvent};
 use crate::bridge::bifrost::BifrostClient;
 use crate::core::config::ConsciousnessConfig;
+use crate::ui::atmosphere::lerp_color;
 use crate::ui::markdown;
 
-const SURFACING_YELLOW: Color = Color::Rgb(220, 190, 100);
-const USER_BLUE: Color = Color::Rgb(120, 170, 240);
-const ANI_ORANGE: Color = Color::Rgb(255, 140, 66);
-const ANI_DIM: Color = Color::Rgb(180, 120, 80);
-const STATUS_GRAY: Color = Color::Rgb(140, 140, 140);
-const TOOL_CYAN: Color = Color::Rgb(120, 200, 220);
-const TOOL_DIM: Color = Color::Rgb(80, 140, 150);
-const TOOL_ERR: Color = Color::Rgb(220, 110, 110);
-const REFLECTION_LAVENDER: Color = Color::Rgb(180, 160, 220);
-const ARCHIVIST_TEAL: Color = Color::Rgb(120, 190, 180);
-const COMPACTION_AMBER: Color = Color::Rgb(240, 180, 60);
-const COMPACTION_RED: Color = Color::Rgb(220, 90, 80);
-const STRAIN_CRIMSON: Color = Color::Rgb(200, 80, 100);
+// Fallback constants — still used for static colors that don't come from
+// the atmosphere palette (e.g. white text that should always be white).
 
-/// If no BackendEvent arrives for this long while `busy`, we assume the
-/// backend has silently hung (provider crash, channel leak, race) and
-/// reset the turn state so the UI doesn't show "Streaming" indefinitely.
-const STALE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Live palette derived from the current atmosphere. Updated per-tick so
+/// transitions interpolate smoothly. Every message rendering function reads
+/// from this instead of hardcoded constants.
+#[derive(Debug, Clone, Copy)]
+pub struct ChatPalette {
+    /// Agent bubble border + label — the most visible accent.
+    pub agent_primary: Color,
+    /// Agent text accent — dimmer variant of primary.
+    pub agent_dim: Color,
+    /// User bubble color — primary tinted toward blue.
+    pub user_accent: Color,
+    /// Tool card border.
+    pub tool_accent: Color,
+    /// Tool card dimmed text.
+    pub tool_dim: Color,
+    /// Surfacing bubble (subconscious).
+    pub surfacing: Color,
+    /// Reflection lines.
+    pub reflection: Color,
+    /// Archivist lines.
+    pub archivist: Color,
+    /// Compaction warnings.
+    pub compaction: Color,
+    /// Background tint for panes.
+    pub bg: Color,
+}
+
+impl ChatPalette {
+    /// Build a palette from an Atmosphere enum (snapshot — no transition).
+    pub fn from_atmosphere(atm: crate::ui::atmosphere::Atmosphere) -> Self {
+        Self::from_colors(atm.primary(), atm.secondary(), atm.dim(), atm.bg_tint())
+    }
+
+    /// Build a palette from raw primary/secondary/dim/bg colors.
+    /// Used by the ambient atmosphere lerp path — feed it interpolated colors.
+    pub fn from_colors(
+        primary: Color, secondary: Color, dim: Color, bg: Color,
+    ) -> Self {
+        let (pr, pg, pb) = match primary { Color::Rgb(r, g, b) => (r, g, b), _ => (255, 140, 66) };
+        let (sr, sg, sb) = match secondary { Color::Rgb(r, g, b) => (r, g, b), _ => (180, 120, 80) };
+        Self {
+            agent_primary: primary,
+            agent_dim: dim,
+            user_accent: Color::Rgb(
+                (sr / 3).wrapping_add(80),
+                (sg / 3).wrapping_add(100),
+                (sb / 3).wrapping_add(160).min(240),
+            ),
+            tool_accent: Color::Rgb(
+                (pr / 3).wrapping_add(80),
+                (pg / 3).wrapping_add(150).min(220),
+                (pb / 3).wrapping_add(160).min(230),
+            ),
+            tool_dim: Color::Rgb(
+                (pr / 4).wrapping_add(60),
+                (pg / 4).wrapping_add(100),
+                (pb / 4).wrapping_add(110),
+            ),
+            surfacing: Color::Rgb(
+                (pr / 3).wrapping_add(150).min(230),
+                (pg / 3).wrapping_add(140).min(210),
+                (pb / 6).wrapping_add(80),
+            ),
+            reflection: Color::Rgb(
+                (sr / 3).wrapping_add(120),
+                (sg / 4).wrapping_add(110),
+                (sb / 3).wrapping_add(160).min(230),
+            ),
+            archivist: Color::Rgb(
+                (sr / 4).wrapping_add(80),
+                (sg / 3).wrapping_add(140).min(210),
+                (sb / 3).wrapping_add(130).min(200),
+            ),
+            compaction: Color::Rgb(
+                (pr / 3).wrapping_add(170).min(245),
+                (pg / 3).wrapping_add(130).min(200),
+                (pb / 6).wrapping_add(40),
+            ),
+            bg,
+        }
+    }
+
+    /// Deterministic hash of the palette's channel values. Invalidation key
+    /// for caches that depend on palette-derived colors (markdown cache, etc.).
+    pub fn hash(&self) -> u64 {
+        let into = |c: Color| match c {
+            Color::Rgb(r, g, b) => (r as u64, g as u64, b as u64),
+            _ => (0, 0, 0),
+        };
+        let (apr, apg, apb) = into(self.agent_primary);
+        let (upr, upg, upb) = into(self.user_accent);
+        let (tar, tag, tab) = into(self.tool_accent);
+        let (sur, sug, sub) = into(self.surfacing);
+        apr.wrapping_mul(31)
+            .wrapping_add(apg).wrapping_mul(37)
+            .wrapping_add(apb).wrapping_mul(41)
+            .wrapping_add(upr as u64).wrapping_mul(43)
+            .wrapping_add(upg as u64).wrapping_mul(47)
+            .wrapping_add(upb as u64).wrapping_mul(53)
+            .wrapping_add(tar as u64).wrapping_mul(59)
+            .wrapping_add(tag as u64).wrapping_mul(61)
+            .wrapping_add(tab as u64).wrapping_mul(67)
+            .wrapping_add(sur as u64).wrapping_mul(71)
+            .wrapping_add(sug as u64).wrapping_mul(73)
+            .wrapping_add(sub as u64).wrapping_mul(79)
+    }
+}
+
+impl Default for ChatPalette {
+    fn default() -> Self {
+        Self::from_atmosphere(crate::ui::atmosphere::Atmosphere::Default)
+    }
+}
+
 
 // ─── Cockpit entry ─────────────────────────────────────────────────────
 
@@ -94,15 +194,15 @@ impl CockpitEntry {
         }
     }
 
-    fn color(&self) -> Color {
+    fn color(&self, palette: &ChatPalette) -> Color {
         match self.kind {
-            CockpitKind::Surfacing => SURFACING_YELLOW,
-            CockpitKind::Reflection => REFLECTION_LAVENDER,
-            CockpitKind::Archivist => ARCHIVIST_TEAL,
-            CockpitKind::CompactionWarn => COMPACTION_AMBER,
-            CockpitKind::CompactionUrgent => ANI_ORANGE,
-            CockpitKind::CompactionCritical => COMPACTION_RED,
-            CockpitKind::InferenceStrain => STRAIN_CRIMSON,
+            CockpitKind::Surfacing => palette.surfacing,
+            CockpitKind::Reflection => palette.reflection,
+            CockpitKind::Archivist => palette.archivist,
+            CockpitKind::CompactionWarn => palette.compaction,
+            CockpitKind::CompactionUrgent => palette.agent_primary,
+            CockpitKind::CompactionCritical => palette.compaction,
+            CockpitKind::InferenceStrain => palette.compaction,
         }
     }
 }
@@ -136,6 +236,9 @@ const SLASH_COMMANDS: &[SlashDef] = &[
     SlashDef { name: "/convos", hint: "Alias for /resume" },
     SlashDef { name: "/model",  hint: "List or set model" },
     SlashDef { name: "/btw",    hint: "Interject — deliver text mid-turn" },
+    SlashDef { name: "/code",   hint: "Shift to code posture (tools expanded, ≡ prompt)" },
+    SlashDef { name: "/chat",   hint: "Shift to conversation posture (tools collapsed)" },
+    SlashDef { name: "/outfit", hint: "Change agent appearance (outfit name)" },
 ];
 
 /// Cached markdown render for an assistant bubble. Key = (text byte-len,
@@ -149,6 +252,7 @@ const SLASH_COMMANDS: &[SlashDef] = &[
 pub struct MarkdownCache {
     pub text_len: usize,
     pub inner_width: usize,
+    pub palette_hash: u64,
     pub lines: Vec<Line<'static>>,
 }
 
@@ -197,6 +301,22 @@ pub enum TurnPhase {
     Interrupted,
 }
 
+/// Render posture for the chat surface. Same conversation, same memfs,
+/// same agent — different way of being in the room. Toggled mid-session
+/// via `/code` and `/chat`, persists no further than the current process.
+///
+/// - `Conversation`: prose first. Tool gestures collapse to a single line
+///   by default. Assistant text gets the soft bubble. The room is warm.
+/// - `Code`: work first. Tool gestures default-expanded so diffs and output
+///   are visible without a keystroke. The input prefix shifts to `≡ ›` so
+///   the user feels the posture change. Bubble wrapping stays — code mode
+///   is a stance, not a separate UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatMode {
+    Conversation,
+    Code,
+}
+
 #[derive(Debug, Clone)]
 pub struct ToolResultBlock {
     pub output: String,
@@ -243,10 +363,13 @@ pub struct ChatState {
     pub tick: u64,
     /// When the current turn started (for spinner animation).
     pub turn_started: Option<Instant>,
-    /// When the last BackendEvent arrived. Compared against `STALE_TIMEOUT`
+    /// When the last BackendEvent arrived. Compared against `stale_timeout`
     /// in `drain_events` to detect silent hangs — the backend channel stays
     /// open but no events arrive (e.g. provider crash mid-turn).
     last_event_at: Instant,
+    /// How long to wait before declaring a turn stalled. Reads from
+    /// `[tui] stale_timeout_secs` in config; defaults to 90s.
+    stale_timeout: Duration,
     /// Receiver for `/model` listing results from async Bifrost call.
     pub model_rx: Option<oneshot::Receiver<String>>,
     /// Consciousness events (surfacing, reflection, archivist) since last drain.
@@ -263,6 +386,17 @@ pub struct ChatState {
     pub btw_state: BtwState,
     /// Receiver for /btw fork stream results (token deltas).
     pub btw_rx: Option<mpsc::Receiver<BtwForkEvent>>,
+    /// Session-level toggle for tool card expansion. False (default) renders
+    /// each tool call as a single compact line — a gesture by the sensorium,
+    /// not a billboard. True restores the full bubble with arguments + result
+    /// preview. Per-message `expanded` on individual cards overrides this.
+    pub tool_cards_expanded: bool,
+    /// Conversation vs Code posture. See [`ChatMode`]. Toggled via /code,
+    /// /chat. Code posture defaults tool cards to expanded so the work is
+    /// visible without a keystroke.
+    pub render_mode: ChatMode,
+    /// Live palette derived from the agent's current atmosphere.
+    pub palette: ChatPalette,
 }
 
 /// Ephemeral /btw fork state. Mirrors Letta's BtwPane — a forked conversation
@@ -286,6 +420,7 @@ impl ChatState {
         // `main::resolve_backend` but adapted for the TUI (no quiet/json flags).
         let cfg = config.read().await;
         let url = cfg.server.effective_url();
+        let stale_timeout = Duration::from_secs(cfg.tui.stale_timeout_secs);
         drop(cfg);
 
         let remote = crate::backend::RemoteBackend::new(&url);
@@ -333,6 +468,7 @@ impl ChatState {
             tick: 0,
             turn_started: None,
             last_event_at: Instant::now(),
+            stale_timeout,
             model_rx: None,
             pending_consciousness: Vec::new(),
             new_conv_rx: None,
@@ -340,6 +476,9 @@ impl ChatState {
             switch_rx: None,
             btw_state: BtwState::Idle,
             btw_rx: None,
+            tool_cards_expanded: false,
+            render_mode: ChatMode::Conversation,
+            palette: ChatPalette::default(),
         })
     }
 
@@ -352,11 +491,14 @@ impl ChatState {
   /model             List available models
   /model <name>      Set the active model
   /btw <text>        Interject — delivered to her next LLM round
+  /code              Shift to code posture (tools expanded, ≡ prompt)
+  /chat              Shift to conversation posture (tools collapsed)
+  /outfit <name>     Change agent's outfit (empty to reset)
   !<command>         Run a shell command (Linux/macOS)
 
 Esc during a turn interrupts (signal, not kill — she sees *[interrupted]*).
 You can also just keep typing while she works — Enter queues an interjection.
-Use Tab to toggle the cockpit pane.";
+Tab toggles the cockpit pane. `t` (on empty input) toggles tool expansion.";
 
     /// Submit the current input. Returns `true` if the input was handled
     /// (slash command, bang command, sent to backend, or queued as an
@@ -424,6 +566,7 @@ Use Tab to toggle the cockpit pane.";
         self.tool_calls_this_turn = 0;
         self.phase = TurnPhase::Thinking;
         self.turn_started = Some(Instant::now());
+        self.last_event_at = Instant::now();
 
         let (tx, rx) = mpsc::channel::<BackendEvent>(64);
         self.turn_rx = Some(rx);
@@ -501,6 +644,45 @@ Use Tab to toggle the cockpit pane.";
             return self.handle_model_command(trimmed);
         }
 
+        if trimmed == "/code" {
+            self.render_mode = ChatMode::Code;
+            self.system_message(
+                "Code posture. Tool gestures expand; the prompt becomes ≡. Same conversation."
+                    .to_string(),
+            );
+            return true;
+        }
+
+        if trimmed == "/chat" {
+            self.render_mode = ChatMode::Conversation;
+            self.system_message(
+                "Conversation posture. Tool gestures collapse; the prompt returns to ›.".to_string(),
+            );
+            return true;
+        }
+
+        if trimmed == "/outfit" || trimmed.starts_with("/outfit ") {
+            let name = trimmed.strip_prefix("/outfit")
+                .map(|s| s.trim())
+                .unwrap_or("")
+                .to_string();
+            self.pending_consciousness.push(BackendEvent::Outfit(name.clone()));
+            if name.is_empty() {
+                self.system_message("Returned to default appearance.".to_string());
+            } else {
+                self.system_message(format!("Changed to **{name}** outfit."));
+            }
+            return true;
+        }
+
+        if trimmed == "/btw" {
+            self.system_message(
+                "Usage: /btw <text> — fork a side-quest conversation.\nThe main chat carries on; the fork streams into a floating pane. Press j to jump to the fork, Esc to dismiss."
+                    .to_string(),
+            );
+            return true;
+        }
+
         // Unknown command
         let cmd = trimmed.split_whitespace().next().unwrap_or(trimmed);
         self.system_message(format!(
@@ -539,6 +721,14 @@ Use Tab to toggle the cockpit pane.";
     }
 
     fn handle_switch_conversation(&mut self, conversation_id: String) {
+        // If a turn is in flight, cancel it cleanly before switching. The
+        // cancel token propagates to the backend which appends *[interrupted]*
+        // and commits the partial output to git — so nothing is lost.
+        if self.busy {
+            self.interrupt();
+            self.system_message("Interrupted active turn — partial output saved.".to_string());
+        }
+
         let backend = self.backend.clone();
         let conv_id = conversation_id.clone();
         let (tx, rx) = oneshot::channel();
@@ -593,6 +783,7 @@ Use Tab to toggle the cockpit pane.";
                         &cfg.bifrost.api_key,
                         &cfg.bifrost.virtual_key,
                         &cfg.bifrost.primary_model,
+                        cfg.bifrost.timeout_secs,
                     );
                     let bifrost_models = bifrost.list_models().await.unwrap_or_default();
                     let mut all_models = bifrost_models.clone();
@@ -927,10 +1118,16 @@ Use Tab to toggle the cockpit pane.";
                     self.finalize_streaming();
                     self.phase = TurnPhase::Tool;
                     self.tool_calls_this_turn = self.tool_calls_this_turn.saturating_add(1);
-                    self.cockpit_log.push(CockpitEntry {
-                        kind: CockpitKind::Reflection,
-                        text: format!("→ {} (round {})", name, round),
-                    });
+                    // Add a round separator to the thinking pane when a new round starts.
+                    if !self.thinking.is_empty() {
+                        let sep = format!("──── r{} ────", round);
+                        let last_is_sep = self.thinking.last().map_or(false, |s| s.starts_with("────"));
+                        if !last_is_sep {
+                            self.thinking.push(sep);
+                        }
+                    }
+                    // Tool calls are surfaced in the main message stream only;
+                    // the subconscious pane is Aster's window, not a tool log.
                     self.messages.push(ChatMessage::Tool {
                         id,
                         name,
@@ -968,6 +1165,12 @@ Use Tab to toggle the cockpit pane.";
                 BackendEvent::Atmosphere(preset) => {
                     self.pending_consciousness.push(BackendEvent::Atmosphere(preset));
                 }
+                BackendEvent::SubconsciousPass(active) => {
+                    self.pending_consciousness.push(BackendEvent::SubconsciousPass(active));
+                }
+                BackendEvent::Outfit(name) => {
+                    self.pending_consciousness.push(BackendEvent::Outfit(name));
+                }
                 BackendEvent::Done => {
                     self.finalize_streaming();
                     self.busy = false;
@@ -992,13 +1195,24 @@ Use Tab to toggle the cockpit pane.";
         }
 
         // Staleness guard: if the backend channel is open but nothing has
-        // arrived for STALE_TIMEOUT, the turn silently hung (provider crash,
+        // arrived for `stale_timeout`, the turn silently hung (provider crash,
         // channel leak). Reset so the UI doesn't display "Streaming" forever.
-        if self.busy && self.last_event_at.elapsed() >= STALE_TIMEOUT {
-            tracing::warn!(elapsed = ?self.last_event_at.elapsed(), "turn stalled — resetting");
+        if self.busy && self.last_event_at.elapsed() >= self.stale_timeout {
+            let secs = self.stale_timeout.as_secs();
+            tracing::warn!(
+                elapsed = ?self.last_event_at.elapsed(),
+                phase = ?self.phase,
+                tool_calls = self.tool_calls_this_turn,
+                "turn stalled — resetting"
+            );
             self.finalize_streaming();
             self.messages.push(ChatMessage::System {
-                text: "*[turn stalled — backend went silent]*".to_string(),
+                text: format!(
+                    "*[turn stalled — backend went silent after {}s (phase: {:?}, tools: {}). \
+                    Your last message may not have been processed. Send it again to retry, or Esc → reconnect. \
+                    See souveraine.log for details.]*",
+                    secs, self.phase, self.tool_calls_this_turn
+                ),
                 ts: Instant::now(),
             });
             self.busy = false;
@@ -1338,17 +1552,17 @@ fn draw_phase(f: &mut Frame, state: &ChatState, area: Rect) {
     let spinner = SPINNER[(state.tick as usize / 2) % SPINNER.len()];
 
     let (glyph, label, color) = match state.phase {
-        TurnPhase::Thinking | TurnPhase::Idle => (spinner, "Thinking".to_string(), ANI_ORANGE),
+        TurnPhase::Thinking | TurnPhase::Idle => (spinner, "Thinking".to_string(), state.palette.agent_primary),
         TurnPhase::Tool => {
             let label = if state.tool_calls_this_turn == 1 {
                 "Running tool · 1 tool used".to_string()
             } else {
                 format!("Running tool · {} tools used", state.tool_calls_this_turn)
             };
-            (spinner, label, Color::Rgb(120, 200, 220))
+            (spinner, label, state.palette.tool_accent)
         }
-        TurnPhase::Streaming => (spinner, "Streaming".to_string(), Color::Rgb(180, 220, 140)),
-        TurnPhase::Interrupted => ("×", "Interrupted".to_string(), Color::Rgb(220, 130, 130)),
+        TurnPhase::Streaming => (spinner, "Streaming".to_string(), state.palette.agent_primary),
+        TurnPhase::Interrupted => ("×", "Interrupted".to_string(), state.palette.compaction),
     };
     let queued = state
         .pending_interjections
@@ -1360,12 +1574,12 @@ fn draw_phase(f: &mut Frame, state: &ChatState, area: Rect) {
     let mut spans: Vec<Span<'static>> = vec![
         Span::styled(format!(" {} ", glyph), Style::default().fg(color).add_modifier(Modifier::BOLD)),
         Span::styled(format!("{}", label), Style::default().fg(color)),
-        Span::styled(format!("  ·  {}s", elapsed), Style::default().fg(ANI_DIM)),
+        Span::styled(format!("  ·  {}s", elapsed), Style::default().fg(state.palette.agent_dim)),
     ];
     if queued > 0 {
         spans.push(Span::styled(
             format!("  ·  /btw queued: {}", queued),
-            Style::default().fg(Color::Rgb(220, 180, 100)).add_modifier(Modifier::ITALIC),
+            Style::default().fg(state.palette.surfacing).add_modifier(Modifier::ITALIC),
         ));
     }
     let line = Line::from(spans);
@@ -1374,12 +1588,12 @@ fn draw_phase(f: &mut Frame, state: &ChatState, area: Rect) {
 
 fn draw_header(f: &mut Frame, state: &ChatState, area: Rect) {
     let mode_color = match state.mode.as_str() {
-        "local" => Color::Rgb(120, 200, 140),
-        "remote" => Color::Rgb(180, 180, 220),
-        _ => STATUS_GRAY,
+        "local" => state.palette.tool_accent,
+        "remote" => state.palette.agent_primary,
+        _ => state.palette.agent_dim,
     };
     let title = Line::from(vec![
-        Span::styled("✦ Souveraine ", Style::default().fg(ANI_ORANGE).add_modifier(Modifier::BOLD)),
+        Span::styled("✦ Souveraine ", Style::default().fg(state.palette.agent_primary).add_modifier(Modifier::BOLD)),
         Span::styled(format!("· {} ", state.agent_name), Style::default().fg(Color::White)),
         Span::styled(format!("[{} mode]", state.mode), Style::default().fg(mode_color)),
     ]);
@@ -1387,6 +1601,7 @@ fn draw_header(f: &mut Frame, state: &ChatState, area: Rect) {
 }
 
 fn draw_messages(f: &mut Frame, state: &ChatState, area: Rect) {
+    let mdpal = crate::ui::markdown::MarkdownPalette::from_chat_palette(&state.palette);
     let max_bubble = ((area.width as usize).saturating_sub(8) * 70 / 100).max(20);
     let mut lines: Vec<Line<'static>> = Vec::new();
 
@@ -1397,7 +1612,7 @@ fn draw_messages(f: &mut Frame, state: &ChatState, area: Rect) {
                     "you",
                     text,
                     max_bubble,
-                    Style::default().fg(USER_BLUE),
+                    Style::default().fg(state.palette.user_accent),
                     BubbleAlign::Right,
                     area.width,
                 ));
@@ -1419,26 +1634,30 @@ fn draw_messages(f: &mut Frame, state: &ChatState, area: Rect) {
                     // pattern — text-equality fast path, full re-render
                     // otherwise. (jcode/crates/jcode-tui-markdown/src/lib.rs:448)
                     let key_len = text.len();
+                    let palette_hash = state.palette.hash();
+                    let agent_color = state.palette.agent_primary;
                     let cached = rendered_cache.borrow();
                     if let Some(c) = &*cached {
-                        if c.text_len == key_len && c.inner_width == inner_width {
+                        if c.text_len == key_len && c.inner_width == inner_width && c.palette_hash == palette_hash {
                             c.lines.clone()
                         } else {
                             drop(cached);
-                            let lines = markdown::render_with_width(text, ANI_ORANGE, Some(inner_width));
+                            let lines = markdown::render_with_width(text, agent_color, Some(inner_width), &mdpal);
                             *rendered_cache.borrow_mut() = Some(MarkdownCache {
                                 text_len: key_len,
                                 inner_width,
+                                palette_hash,
                                 lines: lines.clone(),
                             });
                             lines
                         }
                     } else {
                         drop(cached);
-                        let lines = markdown::render_with_width(text, ANI_ORANGE, Some(inner_width));
+                        let lines = markdown::render_with_width(text, agent_color, Some(inner_width), &mdpal);
                         *rendered_cache.borrow_mut() = Some(MarkdownCache {
                             text_len: key_len,
                             inner_width,
+                            palette_hash,
                             lines: lines.clone(),
                         });
                         lines
@@ -1448,7 +1667,7 @@ fn draw_messages(f: &mut Frame, state: &ChatState, area: Rect) {
                     &label,
                     &body_lines,
                     max_bubble,
-                    Style::default().fg(ANI_ORANGE),
+                    Style::default().fg(state.palette.agent_primary),
                     BubbleAlign::Left,
                     area.width,
                 ));
@@ -1460,7 +1679,7 @@ fn draw_messages(f: &mut Frame, state: &ChatState, area: Rect) {
                     &label,
                     content,
                     max_bubble.min(60),
-                    Style::default().fg(SURFACING_YELLOW),
+                    Style::default().fg(state.palette.surfacing),
                     BubbleAlign::Center,
                     area.width,
                 ));
@@ -1469,20 +1688,34 @@ fn draw_messages(f: &mut Frame, state: &ChatState, area: Rect) {
             ChatMessage::System { text, .. } => {
                 lines.push(Line::from(Span::styled(
                     format!("  · {}", text),
-                    Style::default().fg(STATUS_GRAY).add_modifier(Modifier::ITALIC),
+                    Style::default().fg(state.palette.agent_dim).add_modifier(Modifier::ITALIC),
                 )));
                 lines.push(Line::from(""));
             }
-            ChatMessage::Tool { name, arguments, round, result, .. } => {
-                lines.extend(render_tool_card(
-                    name,
-                    arguments,
-                    *round,
-                    result.as_ref(),
-                    max_bubble,
-                    area.width,
-                ));
-                lines.push(Line::from(""));
+            ChatMessage::Tool { name, arguments, round, result, expanded, .. } => {
+                let code_posture = state.render_mode == ChatMode::Code;
+                let expand = *expanded || state.tool_cards_expanded || code_posture;
+                if expand {
+                    lines.extend(render_tool_card(
+                        name,
+                        arguments,
+                        *round,
+                        result.as_ref(),
+                        max_bubble,
+                        area.width,
+                        &state.palette,
+                    ));
+                    lines.push(Line::from(""));
+                } else {
+                    lines.extend(render_tool_card_compact(
+                        name,
+                        arguments,
+                        *round,
+                        result.as_ref(),
+                        area.width,
+                        &state.palette,
+                    ));
+                }
             }
             ChatMessage::Interjection { text, delivered, .. } => {
                 // User spoke while the agent was working. Rendered as a
@@ -1491,9 +1724,9 @@ fn draw_messages(f: &mut Frame, state: &ChatState, area: Rect) {
                 // the backend has delivered it on the next LLM round.
                 let glyph = if *delivered { "↳" } else { "⏳" };
                 let color = if *delivered {
-                    Color::Rgb(160, 160, 180)
+                    state.palette.agent_dim
                 } else {
-                    Color::Rgb(220, 180, 100)
+                    state.palette.surfacing
                 };
                 lines.push(Line::from(vec![
                     Span::styled(format!("  {} /btw  ", glyph),
@@ -1537,7 +1770,7 @@ fn draw_messages(f: &mut Frame, state: &ChatState, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::TOP | Borders::BOTTOM)
-                .border_style(Style::default().fg(ANI_DIM))
+                .border_style(Style::default().fg(state.palette.agent_dim))
                 .border_type(BorderType::Plain),
         );
     f.render_widget(para, area);
@@ -1680,10 +1913,12 @@ fn render_tool_card(
     result: Option<&ToolResultBlock>,
     max_width: usize,
     container_width: u16,
+    palette: &ChatPalette,
 ) -> Vec<Line<'static>> {
+    let mdpal = crate::ui::markdown::MarkdownPalette::from_chat_palette(palette);
     let is_err = result.map(|r| r.is_error).unwrap_or(false);
-    let border_color = if is_err { TOOL_ERR } else { TOOL_CYAN };
-    let dim_color = if is_err { TOOL_ERR } else { TOOL_DIM };
+    let border_color = if is_err { palette.compaction } else { palette.tool_accent };
+    let dim_color = if is_err { palette.compaction } else { palette.tool_dim };
     let border = Style::default().fg(border_color);
 
     // Header marker + status glyph: pending=⟳, ok=✓, err=⚠
@@ -1711,8 +1946,9 @@ fn render_tool_card(
         let inner_width = max_width.saturating_sub(4).max(8);
         let rendered = markdown::render_with_width(
             &preview,
-            if r.is_error { TOOL_ERR } else { ANI_ORANGE },
+            if r.is_error { palette.compaction } else { palette.agent_primary },
             Some(inner_width),
+            &mdpal,
         );
         body_lines.extend(rendered);
         if r.output.lines().count() > 12 {
@@ -1724,6 +1960,85 @@ fn render_tool_card(
     }
 
     bubble_rendered(&title, &body_lines, max_width, border, BubbleAlign::Left, container_width)
+}
+
+/// Compact single-line tool render — the sensorium signalling a gesture, not
+/// announcing one. A status glyph, the sensor name, a clipped argument
+/// summary, and (on error) the first line of the failure inline. No box
+/// borders, no result preview. Toggle expand-all with `t` to surface
+/// the full content when witnessing matters more than the gesture.
+fn render_tool_card_compact(
+    name: &str,
+    arguments: &str,
+    round: u32,
+    result: Option<&ToolResultBlock>,
+    container_width: u16,
+    palette: &ChatPalette,
+) -> Vec<Line<'static>> {
+    let is_err = result.map(|r| r.is_error).unwrap_or(false);
+    let pending = result.is_none();
+    let (glyph, glyph_color) = match (pending, is_err) {
+        (true, _) => ("⟳", palette.tool_accent),
+        (false, true) => ("⚠", palette.compaction),
+        (false, false) => ("✓", palette.tool_accent),
+    };
+
+    let name_color = if is_err { palette.compaction } else { palette.tool_accent };
+    let dim = if is_err { palette.compaction } else { palette.tool_dim };
+
+    // Argument summary clipped tight — we want the gesture readable, not
+    // the API surface. Reserve room for glyph + name + round suffix.
+    let reserved = name.chars().count() + 14;
+    let arg_budget = (container_width as usize)
+        .saturating_sub(reserved + 6)
+        .max(20)
+        .min(120);
+    let args_summary = clip(&summarize_tool_args(arguments), arg_budget);
+
+    let mut spans: Vec<Span<'static>> = vec![
+        Span::raw("  "),
+        Span::styled(glyph.to_string(), Style::default().fg(glyph_color)),
+        Span::raw(" "),
+        Span::styled(
+            name.to_string(),
+            Style::default().fg(name_color).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if !args_summary.is_empty() {
+        spans.push(Span::styled("  ·  ", Style::default().fg(dim)));
+        spans.push(Span::styled(args_summary, Style::default().fg(dim)));
+    }
+    if round > 1 {
+        spans.push(Span::styled(
+            format!("  ·  r{}", round),
+            Style::default().fg(dim).add_modifier(Modifier::DIM),
+        ));
+    }
+
+    let mut out = vec![Line::from(spans)];
+
+    // On error, surface the first line of the failure inline — the agent
+    // (and the user) need to feel that the gesture didn't land.
+    if let Some(r) = result {
+        if r.is_error {
+            if let Some(first_line) = r.output.lines().next() {
+                let trimmed = first_line.trim();
+                if !trimmed.is_empty() {
+                    let inner = (container_width as usize).saturating_sub(8).max(20);
+                    let preview = clip(trimmed, inner);
+                    out.push(Line::from(vec![
+                        Span::raw("    "),
+                        Span::styled(
+                            preview,
+                            Style::default().fg(palette.compaction).add_modifier(Modifier::ITALIC),
+                        ),
+                    ]));
+                }
+            }
+        }
+    }
+
+    out
 }
 
 /// Compact one-line summary of tool arguments. Keys are kept, long string
@@ -1835,12 +2150,9 @@ fn draw_input(f: &mut Frame, state: &ChatState, area: Rect) {
     // status (Thinking / Tool / Streaming) lives in `draw_phase()` above.
     let border_color = if state.busy {
         let phase = (state.tick as f32 / 8.0).sin().abs();
-        let r = (180.0 + (255.0 - 180.0) * phase) as u8;
-        let g = (120.0 + (140.0 - 120.0) * phase) as u8;
-        let b = (80.0 + (66.0 - 80.0) * phase) as u8;
-        Color::Rgb(r, g, b)
+        lerp_color(state.palette.agent_dim, state.palette.agent_primary, phase)
     } else {
-        ANI_ORANGE
+        state.palette.agent_primary
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1851,6 +2163,12 @@ fn draw_input(f: &mut Frame, state: &ChatState, area: Rect) {
     let cursor_ch: &str = if cursor_visible { "▏" } else { " " };
     let inner_width = (area.width as usize).saturating_sub(5).max(1);
 
+    let (prefix_str, prefix_color) = match state.render_mode {
+        ChatMode::Conversation => (" › ", state.palette.agent_primary),
+        ChatMode::Code => (" ≡ ", state.palette.tool_accent),
+    };
+    let prefix_style = Style::default().fg(prefix_color).add_modifier(Modifier::BOLD);
+
     let mut lines: Vec<Line<'static>> = Vec::new();
     let logical: Vec<&str> = state.input.split('\n').collect();
 
@@ -1858,14 +2176,14 @@ fn draw_input(f: &mut Frame, state: &ChatState, area: Rect) {
         let wrapped = wrap_words(logical_line, inner_width);
         for (wi, chunk) in wrapped.iter().enumerate() {
             let prefix: Span<'static> = if li == 0 && wi == 0 {
-                Span::styled(" › ", Style::default().fg(ANI_ORANGE).add_modifier(Modifier::BOLD))
+                Span::styled(prefix_str.to_string(), prefix_style)
             } else {
                 Span::raw("   ")
             };
             let is_last = li == logical.len() - 1 && wi == wrapped.len() - 1;
             let mut spans = vec![prefix, Span::styled(chunk.clone(), Style::default().fg(Color::White))];
             if is_last {
-                spans.push(Span::styled(cursor_ch.to_string(), Style::default().fg(ANI_ORANGE)));
+                spans.push(Span::styled(cursor_ch.to_string(), Style::default().fg(prefix_color)));
             }
             lines.push(Line::from(spans));
         }
@@ -1873,8 +2191,8 @@ fn draw_input(f: &mut Frame, state: &ChatState, area: Rect) {
 
     if lines.is_empty() {
         lines.push(Line::from(vec![
-            Span::styled(" › ", Style::default().fg(ANI_ORANGE).add_modifier(Modifier::BOLD)),
-            Span::styled(cursor_ch.to_string(), Style::default().fg(ANI_ORANGE)),
+            Span::styled(prefix_str.to_string(), prefix_style),
+            Span::styled(cursor_ch.to_string(), Style::default().fg(prefix_color)),
         ]));
     }
 
@@ -1909,9 +2227,9 @@ fn draw_btw_pane(f: &mut Frame, state: &ChatState, area: Rect) {
             (
                 format!(" btw — {} ", question.chars().take(40).collect::<String>()),
                 vec![Line::from(vec![
-                    Span::styled(format!(" {} forking...", spinner), Style::default().fg(ANI_DIM)),
+                    Span::styled(format!(" {} forking...", spinner), Style::default().fg(state.palette.agent_dim)),
                 ])],
-                ANI_ORANGE,
+                state.palette.agent_primary,
             )
         }
         BtwState::Streaming { question, response_so_far } => {
@@ -1923,7 +2241,7 @@ fn draw_btw_pane(f: &mut Frame, state: &ChatState, area: Rect) {
                     truncated,
                     Style::default().fg(Color::White),
                 ))],
-                Color::Rgb(120, 200, 220),
+                state.palette.tool_accent,
             )
         }
         BtwState::Complete { question, response, forked_id } => {
@@ -1944,10 +2262,10 @@ fn draw_btw_pane(f: &mut Frame, state: &ChatState, area: Rect) {
                     Line::from(""),
                     Line::from(Span::styled(
                         "[esc] dismiss  ·  [j] jump to fork",
-                        Style::default().fg(ANI_DIM),
+                        Style::default().fg(state.palette.agent_dim),
                     )),
                 ],
-                Color::Rgb(140, 200, 160),
+                state.palette.surfacing,
             )
         }
         BtwState::Error { question, error } => {
@@ -1956,9 +2274,9 @@ fn draw_btw_pane(f: &mut Frame, state: &ChatState, area: Rect) {
                 format!(" btw — {} ", q_label),
                 vec![Line::from(Span::styled(
                     format!(" Error: {}", error),
-                    Style::default().fg(Color::Rgb(220, 120, 100)),
+                    Style::default().fg(state.palette.compaction),
                 ))],
-                Color::Rgb(200, 100, 100),
+                state.palette.compaction,
             )
         }
         BtwState::Idle => unreachable!(), // draw_btw_pane is only called when non-idle
@@ -1989,15 +2307,17 @@ fn draw_overlay(f: &mut Frame, state: &ChatState, full_area: Rect, input_area: R
 
             let items: Vec<Line<'static>> = matches.iter().enumerate().take(count).map(|(i, cmd)| {
                 let sel = i == *selected;
+                let sel_fg = state.palette.agent_primary;
+                let sel_bg = state.palette.bg;
                 let style = if sel {
-                    Style::default().fg(Color::Rgb(255, 200, 100)).bg(Color::Rgb(60, 40, 20)).add_modifier(Modifier::BOLD)
+                    Style::default().fg(sel_fg).bg(sel_bg).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::White)
                 };
                 let hint_style = if sel {
-                    Style::default().fg(Color::Rgb(180, 150, 80)).bg(Color::Rgb(60, 40, 20))
+                    Style::default().fg(state.palette.agent_dim).bg(sel_bg)
                 } else {
-                    Style::default().fg(STATUS_GRAY)
+                    Style::default().fg(state.palette.agent_dim)
                 };
                 Line::from(vec![
                     Span::styled(format!(" {} ", cmd.name), style),
@@ -2008,7 +2328,7 @@ fn draw_overlay(f: &mut Frame, state: &ChatState, full_area: Rect, input_area: R
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(ANI_DIM));
+                .border_style(Style::default().fg(state.palette.agent_dim));
             let para = Paragraph::new(items).block(block);
             f.render_widget(para, area);
         }
@@ -2027,7 +2347,7 @@ fn draw_overlay(f: &mut Frame, state: &ChatState, full_area: Rect, input_area: R
             let mut lines: Vec<Line<'static>> = Vec::new();
             lines.push(Line::from(Span::styled(
                 " Conversations — ↑↓ select · Enter switch · Esc cancel",
-                Style::default().fg(STATUS_GRAY).add_modifier(Modifier::ITALIC),
+                Style::default().fg(state.palette.agent_dim).add_modifier(Modifier::ITALIC),
             )));
 
             let scroll_offset = if *selected >= visible { selected + 1 - visible } else { 0 };
@@ -2048,7 +2368,7 @@ fn draw_overlay(f: &mut Frame, state: &ChatState, full_area: Rect, input_area: R
                 };
 
                 let style = if sel {
-                    Style::default().fg(Color::Rgb(255, 200, 100)).bg(Color::Rgb(60, 40, 20)).add_modifier(Modifier::BOLD)
+                    Style::default().fg(state.palette.agent_primary).bg(state.palette.bg).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::White)
                 };
@@ -2058,11 +2378,11 @@ fn draw_overlay(f: &mut Frame, state: &ChatState, full_area: Rect, input_area: R
             let block = Block::default()
                 .title(Span::styled(
                     " Resume ",
-                    Style::default().fg(ANI_ORANGE).add_modifier(Modifier::BOLD),
+                    Style::default().fg(state.palette.agent_primary).add_modifier(Modifier::BOLD),
                 ))
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(ANI_ORANGE));
+                .border_style(Style::default().fg(state.palette.agent_primary));
             let para = Paragraph::new(lines).block(block);
             f.render_widget(para, area);
         }
@@ -2075,23 +2395,45 @@ fn draw_cockpit(f: &mut Frame, state: &ChatState, area: Rect) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
 
-    // Thinking pane
-    let thinking_view = state
+    // Thinking pane — interleave blank separators between entries so
+    // consecutive reasoning blocks don't run into each other visually.
+    // Round-separator sentinel lines (pushed by ToolCall handler) render
+    // dimmer so the eye finds the break without it being loud.
+    let thinking_entries: Vec<&String> = state
         .thinking
         .iter()
         .rev()
         .take(panes[0].height as usize)
+        .collect::<Vec<_>>()
+        .into_iter()
         .rev()
-        .map(|t| Line::from(Span::styled(format!("· {}", t), Style::default().fg(STATUS_GRAY))))
-        .collect::<Vec<_>>();
+        .collect();
+    let mut thinking_view: Vec<Line<'static>> = Vec::with_capacity(thinking_entries.len() * 2);
+    for (i, t) in thinking_entries.iter().enumerate() {
+        if t.starts_with("────") {
+            if i > 0 {
+                thinking_view.push(Line::from(""));
+            }
+            thinking_view.push(Line::from(Span::styled(
+                t.to_string(),
+                Style::default().fg(state.palette.agent_dim),
+            )));
+            thinking_view.push(Line::from(""));
+        } else {
+            thinking_view.push(Line::from(Span::styled(
+                format!("· {}", t),
+                Style::default().fg(state.palette.agent_dim),
+            )));
+        }
+    }
     let thinking = Paragraph::new(thinking_view)
         .wrap(Wrap { trim: false })
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(ANI_DIM))
-                .title(Span::styled(" thinking ", Style::default().fg(ANI_DIM).add_modifier(Modifier::BOLD))),
+                .border_style(Style::default().fg(state.palette.agent_dim))
+                .title(Span::styled(" thinking ", Style::default().fg(state.palette.agent_dim).add_modifier(Modifier::BOLD))),
         );
     f.render_widget(thinking, panes[0]);
 
@@ -2111,7 +2453,7 @@ fn draw_cockpit(f: &mut Frame, state: &ChatState, area: Rect) {
         .iter()
         .enumerate()
         .map(|(i, entry)| {
-            let base = entry.color();
+            let base = entry.color(&state.palette);
             let dim = if entry_count > 1 {
                 let age = 1.0 - (i as f32 / (entry_count - 1) as f32);
                 0.4 + 0.6 * (1.0 - age)
@@ -2139,8 +2481,8 @@ fn draw_cockpit(f: &mut Frame, state: &ChatState, area: Rect) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(SURFACING_YELLOW))
-                .title(Span::styled(" subconscious ", Style::default().fg(SURFACING_YELLOW).add_modifier(Modifier::BOLD))),
+                .border_style(Style::default().fg(state.palette.surfacing))
+                .title(Span::styled(" subconscious ", Style::default().fg(state.palette.surfacing).add_modifier(Modifier::BOLD))),
         );
     f.render_widget(subconscious, panes[1]);
 }
@@ -2149,21 +2491,34 @@ fn draw_footer(f: &mut Frame, state: &ChatState, area: Rect) {
     let pressure_pct = (state.pressure * 100.0) as u16;
     let pressure_label = format!("ctx {}%", pressure_pct);
     let cockpit_hint = if state.cockpit { "Tab close cockpit" } else { "Tab cockpit" };
+    let tool_hint = if state.tool_cards_expanded { "t collapse tools" } else { "t expand tools" };
+    let esc_hint = if state.busy { "Esc interrupt" } else { "Esc menu" };
+    let posture_label = match state.render_mode {
+        ChatMode::Conversation => "chat",
+        ChatMode::Code => "code",
+    };
     let mut spans = vec![
         Span::styled(
-            format!(" Esc menu · Enter send · S-Ret ↵ · ↑↓ scroll · {} ", cockpit_hint),
-            Style::default().fg(STATUS_GRAY),
+            format!(" {esc_hint} · Enter send · S-Ret ↵ · ↑↓ scroll · {cockpit_hint} · {tool_hint} "),
+            Style::default().fg(state.palette.agent_dim),
         ),
         Span::raw("│  "),
-        Span::styled(format!("conv {}", short(&state.conversation_id)), Style::default().fg(STATUS_GRAY)),
+        Span::styled(
+            format!("posture {posture_label}"),
+            Style::default().fg(
+                if state.render_mode == ChatMode::Code { state.palette.tool_accent } else { state.palette.agent_dim },
+            ),
+        ),
+        Span::raw("│  "),
+        Span::styled(format!("conv {}", short(&state.conversation_id)), Style::default().fg(state.palette.agent_dim)),
         Span::raw("  │  "),
-        Span::styled(pressure_label, Style::default().fg(STATUS_GRAY)),
+        Span::styled(pressure_label, Style::default().fg(state.palette.agent_dim)),
     ];
     if state.scroll > 0 {
         spans.push(Span::raw("  │  "));
         spans.push(Span::styled(
             format!("↓ {} below", state.scroll),
-            Style::default().fg(ANI_ORANGE),
+            Style::default().fg(state.palette.agent_primary),
         ));
     }
     let footer = Line::from(spans);

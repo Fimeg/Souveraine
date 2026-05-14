@@ -311,23 +311,19 @@ async fn main() -> anyhow::Result<()> {
     // Load .env file for credential env vars (BIFROST_KEY, etc.)
     let _ = dotenvy::dotenv();
 
-    // Configure tracing to write to a log file by default
-    // Only show in terminal when --verbose is passed
+    // Configure tracing — always writes to souveraine.log (truncated fresh on launch).
+    // Verbose flag additionally mirrors to stderr.
     let log_file = std::fs::File::create("souveraine.log")?;
-    
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter("souveraine=debug")
+        .with_timer(tracing_subscriber::fmt::time::SystemTime)
+        .with_writer(log_file);
     if cli.verbose {
-        // Verbose mode: log to both file AND stderr
-        tracing_subscriber::fmt()
-            .with_env_filter("souveraine=info")
-            .with_writer(log_file)
-            .init();
+        subscriber.with_ansi(false).init();
     } else {
-        // Clean mode: log ONLY to file, not stderr
-        tracing_subscriber::fmt()
-            .with_env_filter("souveraine=info")
-            .with_writer(log_file)
-            .init();
+        subscriber.with_ansi(false).init();
     }
+    info!("souveraine starting — log: souveraine.log");
     
     // Handle completions early — needs no config, no runtime
     if let Some(Commands::Completions { shell }) = &cli.command {
@@ -835,7 +831,8 @@ async fn run_tui(
     config: Arc<RwLock<ConsciousnessConfig>>,
     agent_pref: Option<String>,
 ) -> anyhow::Result<()> {
-    let mut app = App::new(config, agent_pref.unwrap_or_default());
+    let config_path = ConsciousnessConfig::discover_path();
+    let mut app = App::new(config, agent_pref.unwrap_or_default(), config_path);
     app.run().await?;
     Ok(())
 }
@@ -1197,6 +1194,7 @@ async fn load_config() -> anyhow::Result<ConsciousnessConfig> {
         &config.bifrost.api_key,
         &config.bifrost.virtual_key,
         &config.bifrost.primary_model,
+        config.bifrost.timeout_secs,
     );
     match bifrost.list_models().await {
         Ok(models) => {

@@ -82,6 +82,7 @@ async fn bifrost_complete(
 pub struct SummaryStrategy {
     pub client: BifrostClient,
     pub model: String,
+    pub prompt_override: Option<String>,
 }
 
 const SUMMARY_SYSTEM_PROMPT: &str = "Respond with TEXT ONLY. Do not call any tools — you already have all the context you need in the messages above. Your response must be plain text: an <analysis> block followed by a <summary> block.";
@@ -125,7 +126,7 @@ impl CompactionStrategy for SummaryStrategy {
             return Ok(CompactionPlan::empty());
         }
 
-        let preserve_count = config.min_messages.min(messages.len().saturating_sub(2));
+        let preserve_count = config.preserve_recent.min(messages.len().saturating_sub(2));
         let cutoff = messages.len().saturating_sub(preserve_count);
 
         let to_summarize = &messages[1..cutoff];
@@ -141,11 +142,16 @@ impl CompactionStrategy for SummaryStrategy {
             .take(config.max_summary_length * 4)
             .collect();
 
+        let user_prompt = match &self.prompt_override {
+            Some(custom) => format!("{}\n\nConversation to summarize:\n\n{}", custom, truncated),
+            None => format!("{}\n\nConversation to summarize:\n\n{}", SUMMARY_USER_PROMPT, truncated),
+        };
+
         let summary = bifrost_complete(
             &self.client,
             &self.model,
             SUMMARY_SYSTEM_PROMPT,
-            &format!("{}\n\nConversation to summarize:\n\n{}", SUMMARY_USER_PROMPT, truncated),
+            &user_prompt,
             config.max_summary_length as u32,
         )
         .await?;
@@ -362,7 +368,7 @@ impl CompactionStrategy for CullStrategy {
             return Ok(CompactionPlan::empty());
         }
 
-        let preserve_count = config.min_messages.min(messages.len().saturating_sub(2));
+        let preserve_count = config.preserve_recent.min(messages.len().saturating_sub(2));
         let cutoff = messages.len().saturating_sub(preserve_count);
 
         let mut keep_indices: Vec<usize> = vec![0];
@@ -460,7 +466,7 @@ impl CompactionStrategy for SlidingWindowStrategy {
             return Ok(CompactionPlan::empty());
         }
 
-        let preserve_count = config.min_messages.min(messages.len().saturating_sub(1));
+        let preserve_count = config.preserve_recent.min(messages.len().saturating_sub(1));
         if preserve_count + 1 >= messages.len() {
             // Nothing in the middle to drop.
             return Ok(CompactionPlan::empty());
@@ -480,6 +486,122 @@ impl CompactionStrategy for SlidingWindowStrategy {
         Ok(CompactionPlan {
             keep_indices,
             summary_text: None,
+            culled_count: dropped,
+            token_savings: dropped * 100,
+            replacement_messages: None,
+        })
+    }
+}
+
+// ── SlidingReflect Strategy ─────────────────────────────────────────────────
+
+/// SlidingWindow with a preservation pass: before cutting the middle, an LLM
+/// reads the about-to-be-evicted messages and extracts threads worth keeping.
+/// The result is inserted as a system message so the agent carries the gist
+/// even after the originals are gone.
+///
+/// Uses whichever model the engine provides (subconscious model if Aster is
+/// enabled, compaction model / primary otherwise). If no Bifrost client is
+/// available, falls back to plain SlidingWindow (no threads lost is better
+/// than no compaction at all).
+pub struct SlidingReflectStrategy {
+    pub client: BifrostClient,
+    pub model: String,
+    /// User-supplied prompt override from [compaction] reflect_prompt in config.
+    /// When set, replaces the built-in REFLECT_USER_PROMPT entirely.
+    pub prompt_override: Option<String>,
+}
+
+const REFLECT_SYSTEM_PROMPT: &str = "Respond with TEXT ONLY. Do not call any tools. You are reviewing messages that are about to leave the agent's context window. Your job is to catch the threads — not summarize everything, just name what would be lost.";
+
+const REFLECT_USER_PROMPT: &str = r#"The following messages are about to be evicted from context. Read them and extract ONLY what would be lost — threads the agent is carrying that aren't captured in memory files:
+
+- Commitments made (to the user, to herself, to a plan)
+- Decisions reached (and their reasoning if non-obvious)
+- Observations or patterns noticed for the first time
+- Emotional threads or relational context that shaped the conversation
+- Assumptions that haven't been validated yet
+- Anything named for the first time (new concepts, terms, framings)
+
+Skip: tool outputs, file contents, code that's already on disk, anything the agent can re-derive from memory or the filesystem.
+
+Be terse. Bullet points. This note is a lifeline, not a summary.
+
+Messages being evicted:
+
+"#;
+
+#[async_trait]
+impl CompactionStrategy for SlidingReflectStrategy {
+    fn kind(&self) -> CompactionStrategyKind {
+        CompactionStrategyKind::SlidingReflect
+    }
+
+    async fn plan(
+        &self,
+        messages: &[ConversationMessage],
+        config: &AgentCompactionConfig,
+        _counter: &TokenCounter,
+    ) -> anyhow::Result<CompactionPlan> {
+        if messages.len() < 3 {
+            return Ok(CompactionPlan::empty());
+        }
+
+        let preserve_count = config.preserve_recent.min(messages.len().saturating_sub(1));
+        if preserve_count + 1 >= messages.len() {
+            return Ok(CompactionPlan::empty());
+        }
+        let raw_cutoff = messages.len() - preserve_count;
+        let cutoff = adjust_cutoff_for_tool_pair(messages, raw_cutoff);
+
+        let evicted = &messages[1..cutoff];
+        if evicted.is_empty() {
+            return Ok(CompactionPlan::empty());
+        }
+
+        // Run the preservation pass on the about-to-be-evicted segment.
+        let transcript = render_segment_for_summary(evicted);
+        let truncated: String = transcript.chars().take(config.max_summary_length * 4).collect();
+
+        let user_prompt = match &self.prompt_override {
+            Some(custom) => format!("{}\n\n{}", custom, truncated),
+            None => format!("{}{}", REFLECT_USER_PROMPT, truncated),
+        };
+
+        let reflection = bifrost_complete(
+            &self.client,
+            &self.model,
+            REFLECT_SYSTEM_PROMPT,
+            &user_prompt,
+            2048,
+        )
+        .await;
+
+        // Preservation note becomes a system message. If the LLM call fails,
+        // fall back to plain sliding window — compaction shouldn't break
+        // because the preservation pass errored.
+        let summary_text = match reflection {
+            Ok(text) if !text.trim().is_empty() => {
+                Some(format!("[Threads preserved before compaction]\n{}", text.trim()))
+            }
+            Ok(_) => None,
+            Err(e) => {
+                tracing::warn!("[sliding_reflect] preservation pass failed, falling back to plain slide: {}", e);
+                None
+            }
+        };
+
+        let mut keep_indices: Vec<usize> = vec![0];
+        for i in cutoff..messages.len() {
+            keep_indices.push(i);
+        }
+        keep_indices.sort();
+        keep_indices.dedup();
+
+        let dropped = cutoff.saturating_sub(1);
+        Ok(CompactionPlan {
+            keep_indices,
+            summary_text,
             culled_count: dropped,
             token_savings: dropped * 100,
             replacement_messages: None,
@@ -513,7 +635,7 @@ mod tests {
         ];
 
         let config = AgentCompactionConfig {
-            min_messages: 2,
+            preserve_recent: 2,
             ..Default::default()
         };
         let counter = TokenCounter::new();
@@ -533,7 +655,7 @@ mod tests {
         ];
 
         let config = AgentCompactionConfig {
-            min_messages: 1,
+            preserve_recent: 1,
             ..Default::default()
         };
         let counter = TokenCounter::new();
@@ -572,7 +694,7 @@ mod tests {
             text_msg(MessageRole::Assistant, "A substantive reply about something."),
         ];
         let config = AgentCompactionConfig {
-            min_messages: 1,
+            preserve_recent: 1,
             ..Default::default()
         };
         let counter = TokenCounter::new();
@@ -598,7 +720,7 @@ mod tests {
             text_msg(MessageRole::Assistant, "Substantive narrative continuation."),
         ];
         let config = AgentCompactionConfig {
-            min_messages: 1,
+            preserve_recent: 1,
             ..Default::default()
         };
         let counter = TokenCounter::new();
@@ -618,7 +740,7 @@ mod tests {
             text_msg(MessageRole::Assistant, "recent assistant reply"),
         ];
         let config = AgentCompactionConfig {
-            min_messages: 2,
+            preserve_recent: 2,
             ..Default::default()
         };
         let counter = TokenCounter::new();
@@ -665,7 +787,7 @@ mod tests {
         ];
         let config = AgentCompactionConfig {
             // Force cut to land on index 3 (the tool result) before adjustment.
-            min_messages: 4,
+            preserve_recent: 4,
             ..Default::default()
         };
         let counter = TokenCounter::new();

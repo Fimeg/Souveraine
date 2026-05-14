@@ -113,6 +113,7 @@ impl SouveraineServer {
             &config.bifrost.api_key,
             &config.bifrost.virtual_key,
             primary,
+            config.bifrost.timeout_secs,
         ).with_fallbacks(fallbacks));
 
         let rate_delay = Arc::new(AtomicU64::new(1000));
@@ -123,6 +124,7 @@ impl SouveraineServer {
             sessions.clone(),
             bifrost.clone(),
             config.subconscious.model.clone(),
+            config.reflection.model.clone(),
             config.subconscious.max_tokens,
             rate_delay.clone(),
         ));
@@ -162,7 +164,7 @@ impl SouveraineServer {
             config: app_cfg,
             counter: crate::bridge::model_router::TokenCounter::new(),
             bifrost: Some((*bifrost).clone()),
-            model: config.subconscious.model.clone(),
+            model: config.compaction.model.clone().or_else(|| config.subconscious.model.clone()),
             clock: Arc::new(UtcClock),
             get_messages,
             replace_messages,
