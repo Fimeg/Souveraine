@@ -156,6 +156,83 @@ pub async fn require_token(
     Ok(next.run(req).await)
 }
 
+/// Verify a bearer token against a given agent_id, respecting config and loopback.
+///
+/// Shared by all middleware variants. Returns `Ok(())` on pass, `Err(401)` on fail.
+pub async fn verify_token(
+    server: &SouveraineServer,
+    agent_id: &str,
+    headers: &HeaderMap,
+    remote: Option<IpAddr>,
+) -> Result<(), StatusCode> {
+    let cfg = server.app_config.read().await;
+    let auth_required = cfg.server.auth.required;
+    let allow_loopback = cfg.server.auth.allow_loopback;
+    drop(cfg);
+
+    if !auth_required {
+        return Ok(());
+    }
+
+    if allow_loopback && is_loopback(remote) {
+        return Ok(());
+    }
+
+    let presented = extract_bearer(headers).ok_or(StatusCode::UNAUTHORIZED)?;
+    let server_data_dir = {
+        let cfg = server.config.read().await;
+        cfg.data_dir.clone()
+    };
+
+    let expected = match read_token(&server_data_dir, agent_id).await {
+        Ok(t) => t,
+        Err(_) => return Err(StatusCode::UNAUTHORIZED),
+    };
+    if !ct_eq(&presented, &expected) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(())
+}
+
+/// Auth middleware for agent CRUD routes (PATCH/DELETE /v1/agents/:id).
+///
+/// Uses the same per-agent token as the memory routes. Applied as a
+/// route_layer on agent update/delete so only the agent owner can modify
+/// or remove an agent.
+pub async fn require_agent_token(
+    State(server): State<Arc<SouveraineServer>>,
+    Path(agent_id): Path<String>,
+    headers: HeaderMap,
+    remote: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    req: axum::http::Request<Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    verify_token(&server, &agent_id, &headers, remote.map(|ci| ci.0.ip())).await?;
+    Ok(next.run(req).await)
+}
+
+/// Auth middleware for conversation routes (GET /v1/conversations/:id,
+/// POST /v1/conversations/:id/messages).
+///
+/// Resolves the agent_id from the conversation session, then applies
+/// the same per-agent token check.
+pub async fn require_conversation_token(
+    State(server): State<Arc<SouveraineServer>>,
+    Path(conversation_id): Path<String>,
+    headers: HeaderMap,
+    remote: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    req: axum::http::Request<Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let agent_id = {
+        let session = server.sessions.get(&conversation_id)
+            .ok_or(StatusCode::NOT_FOUND)?;
+        session.agent_id.clone()
+    };
+    verify_token(&server, &agent_id, &headers, remote.map(|ci| ci.0.ip())).await?;
+    Ok(next.run(req).await)
+}
+
 /// Lightweight in-memory cache for tokens that have been verified recently.
 /// Optional optimization; the on-disk read is fast enough for now, but this
 /// is the seam if/when we need it.

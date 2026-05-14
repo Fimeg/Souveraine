@@ -29,6 +29,9 @@ pub struct AgentInventory {
     subconscious_dir: PathBuf,
     db: SqlitePool,
     cache: DashMap<String, AgentState>,
+    /// Public key (hex) of this Souveraine instance, loaded at startup.
+    /// Used as `owner_seed_id` on newly created agents.
+    instance_seed_id: Option<String>,
 }
 
 impl AgentInventory {
@@ -49,7 +52,23 @@ impl AgentInventory {
             subconscious_dir,
             db,
             cache: DashMap::new(),
+            instance_seed_id: Self::load_instance_seed_id(&souveraine_root),
         })
+    }
+
+    /// Load the instance-level seed identity. This is the owner identity for
+    /// all agents created by this Souveraine instance. Falls back to None
+    /// silently — agents created without an owner can still be managed via
+    /// per-agent tokens.
+    fn load_instance_seed_id(souveraine_root: &PathBuf) -> Option<String> {
+        let seed_dir = crate::core::identity::SeedId::default_dir(souveraine_root);
+        match crate::core::identity::SeedId::load_or_generate(&seed_dir) {
+            Ok(seed) => Some(seed.public_key_hex()),
+            Err(e) => {
+                tracing::warn!(error = %e, "instance seed not available — agent ownership disabled");
+                None
+            }
+        }
     }
 
     /// Return a [`MemoryRepo`] rooted at the primary agent's canonical user-side
@@ -270,6 +289,7 @@ impl AgentInventory {
             memory_blocks: blocks,
             tools: request.tools,
             tags: request.tags,
+            owner_seed_id: self.instance_seed_id.clone(),
             souveraine: SouveraineConfig {
                 n1_enabled: true,
                 reflection_enabled: true,
@@ -288,7 +308,7 @@ impl AgentInventory {
         let config_json = serde_json::to_string(&agent.souveraine)?;
 
         sqlx::query(
-            "INSERT INTO agents (id, name, description, llm_model, context_window, tags, config_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+            "INSERT INTO agents (id, name, description, llm_model, context_window, tags, config_json, owner_seed_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
         )
         .bind(&uuid)
         .bind(&agent.name)
@@ -297,6 +317,7 @@ impl AgentInventory {
         .bind(agent.llm_config.context_window as i64)
         .bind(&tags_json)
         .bind(&config_json)
+        .bind(&self.instance_seed_id)
         .execute(&self.db)
         .await?;
 

@@ -99,6 +99,7 @@ pub async fn init_database(db_path: &Path) -> anyhow::Result<SqlitePool> {
     // one running instance. Incremented by the heartbeat tick. Drives the
     // uptime % on the manager card (capped at 99 in the UI).
     add_column_if_missing(&pool, "agents", "lifetime_active_seconds", "INTEGER NOT NULL DEFAULT 0").await?;
+    add_column_if_missing(&pool, "agents", "owner_seed_id", "TEXT").await?;
 
     Ok(pool)
 }

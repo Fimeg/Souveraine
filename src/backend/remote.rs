@@ -15,6 +15,10 @@ use super::{AgentInfo, Backend, BackendEvent, ConversationInfo};
 pub struct RemoteBackend {
     base_url: String,
     client: reqwest::Client,
+    /// Optional bearer token. When set, sent as `Authorization: Bearer <token>`
+    /// on all requests. Loaded from the per-agent token file at construction
+    /// when the agent_id is known.
+    token: Option<String>,
 }
 
 impl RemoteBackend {
@@ -28,7 +32,40 @@ impl RemoteBackend {
             .connect_timeout(Duration::from_secs(2))
             .build()
             .expect("reqwest client");
-        Self { base_url: url, client }
+        Self { base_url: url, client, token: None }
+    }
+
+    /// Create a RemoteBackend that sends bearer tokens for the given agent_id.
+    /// Loads the token from the standard on-disk location.
+    pub fn with_agent(base_url: impl Into<String>, agent_id: &str) -> Self {
+        let mut this = Self::new(base_url);
+        this.load_token(agent_id);
+        this
+    }
+
+    /// Try to load the per-agent bearer token from disk. Silently leaves
+    /// `token` as None if the token file doesn't exist or is unreadable —
+    /// loopback bypass will handle the common case.
+    fn load_token(&mut self, agent_id: &str) {
+        let token_path = dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".souveraine")
+            .join("server")
+            .join("agents")
+            .join(agent_id)
+            .join("api_token");
+        if let Ok(content) = std::fs::read_to_string(&token_path) {
+            self.token = Some(content.trim().to_string());
+        }
+    }
+
+    /// Apply the Authorization header if a token is stored.
+    fn auth_req(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if let Some(ref token) = self.token {
+            req.bearer_auth(token)
+        } else {
+            req
+        }
     }
 
     fn url(&self, path: &str) -> String {
@@ -123,8 +160,10 @@ impl Backend for RemoteBackend {
             "stream": true,
         });
         let resp = self
-            .client
-            .post(self.url(&format!("/v1/conversations/{}/messages", conversation_id)))
+            .auth_req(
+                self.client
+                    .post(self.url(&format!("/v1/conversations/{}/messages", conversation_id))),
+            )
             .json(&body)
             .send()
             .await

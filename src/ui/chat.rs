@@ -442,6 +442,13 @@ impl ChatState {
 
         let conversation_id = backend.ensure_conversation(&agent.id).await?;
 
+        // Recreate the backend with per-agent token if we're remote
+        let backend: Arc<dyn Backend> = if mode == "remote" {
+            Arc::new(crate::backend::RemoteBackend::with_agent(&url, &agent.id))
+        } else {
+            backend
+        };
+
         Ok(Self {
             backend,
             mode: mode.to_string(),

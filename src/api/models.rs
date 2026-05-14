@@ -23,6 +23,9 @@ pub struct AgentState {
     pub memory_blocks: Vec<MemoryBlock>,
     pub tools: Vec<String>,
     pub tags: Vec<String>,
+    /// Public key (hex) of the instance that created this agent.
+    /// `None` for agents created before this field existed.
+    pub owner_seed_id: Option<String>,
     #[serde(rename = "_souveraine")]
     pub souveraine: SouveraineConfig,
 }

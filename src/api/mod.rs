@@ -12,19 +12,33 @@ pub mod handlers;
 pub mod models;
 
 pub fn create_routes(state: Arc<SouveraineServer>) -> Router {
-    // Public routes — no auth required (agents, conversations, health).
+    // Public routes — no auth required (agent listing/creation, conversation listing/creation, health).
     let public_routes = Router::new()
         .route("/v1/agents", get(handlers::list_agents).post(handlers::create_agent))
+        .route("/v1/conversations", get(handlers::list_conversations).post(handlers::create_conversation))
+        .route("/health", get(health_check));
+
+    // Protected agent routes — require per-agent bearer token.
+    let agent_routes = Router::new()
         .route(
             "/v1/agents/:id",
             get(handlers::get_agent)
                 .patch(handlers::update_agent)
                 .delete(handlers::delete_agent),
         )
-        .route("/v1/conversations", get(handlers::list_conversations).post(handlers::create_conversation))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_agent_token,
+        ));
+
+    // Protected conversation routes — require bearer token for the conversation's agent.
+    let conversation_routes = Router::new()
         .route("/v1/conversations/:id", get(handlers::get_conversation))
         .route("/v1/conversations/:id/messages", post(handlers::stream_messages))
-        .route("/health", get(health_check));
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_conversation_token,
+        ));
 
     // Memory routes — require per-agent bearer token.
     //
@@ -54,6 +68,8 @@ pub fn create_routes(state: Arc<SouveraineServer>) -> Router {
 
     Router::new()
         .merge(public_routes)
+        .merge(agent_routes)
+        .merge(conversation_routes)
         .merge(memory_routes)
         .merge(web_routes)
         .with_state(state)
