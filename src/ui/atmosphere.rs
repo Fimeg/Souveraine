@@ -145,6 +145,29 @@ impl Atmosphere {
         }
     }
 
+    /// Parse an atmosphere from a preset name (case-insensitive, underscore-tolerant).
+    /// Returns `None` for unknown names and empty strings.
+    pub fn from_name(name: &str) -> Option<Self> {
+        let key = name.to_lowercase().replace(' ', "_");
+        match key.as_str() {
+            "" | "default" => Some(Atmosphere::Default),
+            "mint_tea" => Some(Atmosphere::MintTea),
+            "therapeutic_blue" => Some(Atmosphere::TherapeuticBlue),
+            "lavender_calm" => Some(Atmosphere::LavenderCalm),
+            "warm_amber" => Some(Atmosphere::WarmAmber),
+            "peach_sunset" => Some(Atmosphere::PeachSunset),
+            "autumn_browns" => Some(Atmosphere::AutumnBrowns),
+            "neon_glow" => Some(Atmosphere::NeonGlow),
+            "aurora_borealis" => Some(Atmosphere::AuroraBorealis),
+            "cherry_blossom" => Some(Atmosphere::CherryBlossom),
+            "ocean_depths" => Some(Atmosphere::OceanDepths),
+            "midnight_galaxy" => Some(Atmosphere::MidnightGalaxy),
+            "twilight_mist" => Some(Atmosphere::TwilightMist),
+            "forest_greens" => Some(Atmosphere::ForestGreens),
+            _ => None,
+        }
+    }
+
     /// Map a posture to a default atmosphere (when none is explicitly set).
     pub fn from_posture(posture: crate::ui::presence::Posture) -> Self {
         use crate::ui::presence::Posture;

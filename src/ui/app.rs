@@ -1431,6 +1431,29 @@ impl App {
                 self.rgp_portrait = crate::ui::rgp::load_portrait_glb(&assets);
             }
 
+            // Read the agent's last explicit atmosphere from
+            // system/preferences/visual.md and restore the chrome. The agent
+            // writes this when she uses the atmosphere tool; the TUI reads it
+            // at conversation start so her choice survives restarts.
+            let pref_path = repo.root().join("system").join("preferences").join("visual.md");
+            if let Ok(content) = std::fs::read_to_string(&pref_path) {
+                if let Some(body) = content.strip_prefix("---\n") {
+                    if let Some(end) = body.find("\n---\n") {
+                        for line in body[..end].lines() {
+                            if let Some((key, val)) = line.split_once(':') {
+                                let key = key.trim();
+                                let val = val.trim().trim_matches('"');
+                                if key == "atmosphere" {
+                                    if let Some(atm) = crate::ui::atmosphere::Atmosphere::from_name(val) {
+                                        self.presence.transition_atmosphere(atm);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // Read energy balance from the agent's memfs. The file is written
             // by the backend after every turn (write_energy_balance in local.rs).
             // Parse the YAML frontmatter for generative/consumptive counts and
