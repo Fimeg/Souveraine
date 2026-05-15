@@ -677,8 +677,10 @@ pub struct FederationConfig {
     /// permissive; richer per-arena gating is the agent's memfs concern.
     #[serde(default)]
     pub authorized_summoners: Vec<String>,
-    /// When running as a lite listener, spawn the full engine on an
-    /// authorized summon rather than only parking it.
+    /// An authorized summon may wake the target agent. In lite-listener mode
+    /// this spawns the full engine; in the full engine it injects a background
+    /// turn so she picks the request up now rather than on her next turn.
+    /// Sovereign default: off — a summon otherwise just lands in her inbox.
     #[serde(default)]
     pub auto_wake: bool,
 }

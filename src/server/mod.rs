@@ -258,6 +258,7 @@ impl SouveraineServer {
                         event_bus.clone(),
                         seed.clone(),
                         souveraine_base.clone(),
+                        config.federation.auto_wake,
                     ),
                 );
                 handler.spawn_listener();

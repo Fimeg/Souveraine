@@ -16,7 +16,7 @@
 //! Responses are never awaited — they surface in the caller's inbox
 //! (intrusive for consult, pending for reach) on a later turn.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use crate::core::identity::SeedId;
+use crate::core::nervous::handler::TurnInjector;
 use crate::core::nervous::{EventBus, SensorEvent};
 
 const RESPONSE_TIMEOUT_SECS: u64 = 60;
@@ -53,6 +54,14 @@ pub struct SummonHandler {
     seed: Arc<SeedId>,
     /// Base path for agent memory — used to access inbox files.
     souveraine_base: std::path::PathBuf,
+    /// When true, an inbound summon wakes the target agent with a background
+    /// turn rather than only landing in her inbox. Mirrors `auto_wake` in
+    /// `FederationConfig` — opt-in, sovereign default off.
+    auto_wake: bool,
+    /// Set once, after the backend exists, by `set_injector`. Absent on the
+    /// pure-server path (no nervous-system turn loop there) — auto-wake then
+    /// degrades gracefully and the summon waits for the agent's next turn.
+    injector: OnceLock<Arc<dyn TurnInjector>>,
 }
 
 impl SummonHandler {
@@ -61,6 +70,7 @@ impl SummonHandler {
         event_bus: EventBus,
         seed: Arc<SeedId>,
         souveraine_base: std::path::PathBuf,
+        auto_wake: bool,
     ) -> Self {
         Self {
             in_flight: DashMap::new(),
@@ -69,6 +79,17 @@ impl SummonHandler {
             event_bus,
             seed,
             souveraine_base,
+            auto_wake,
+            injector: OnceLock::new(),
+        }
+    }
+
+    /// Wire the turn injector. Called once by `LocalBackend` after it has
+    /// constructed itself — the same `Arc<dyn TurnInjector>` the heartbeat
+    /// handler uses. Calling twice is a no-op.
+    pub fn set_injector(&self, injector: Arc<dyn TurnInjector>) {
+        if self.injector.set(injector).is_err() {
+            tracing::debug!("summon_handler: injector already set");
         }
     }
 
@@ -232,19 +253,27 @@ impl SummonHandler {
                 let agent_id = self.resolve_primary_agent();
                 if let Some(agent_id) = agent_id {
                     let target_box = if tool_type == "reach" { "pending" } else { "intrusive" };
-                    if let Err(e) = self.write_inbox(&agent_id, target_box, &event) {
-                        tracing::warn!(
+                    match self.write_inbox(&agent_id, target_box, &event) {
+                        Err(e) => tracing::warn!(
                             error = %e,
                             "summon_handler: failed to write inbox entry"
-                        );
-                    } else if let Some(reply_to) = event.reply_to.clone() {
-                        self.inbound.insert(request_id.to_string(), reply_to);
+                        ),
+                        Ok(()) => {
+                            if let Some(reply_to) = event.reply_to.clone() {
+                                self.inbound.insert(request_id.to_string(), reply_to);
+                            }
+                            // Auto-wake: nudge the agent to look now rather
+                            // than waiting for her next natural turn. Opt-in
+                            // (auto_wake) and a no-op without an injector.
+                            self.maybe_wake(
+                                &agent_id,
+                                tool_type,
+                                request_id,
+                                event.seed_id.as_deref(),
+                            );
+                        }
                     }
                 }
-
-                // The turn injection itself (waking the agent) is handled by
-                // a future TurnInjector layer. For now the request sits in the
-                // inbox until the agent's next natural turn picks it up.
             }
 
             // Inbound: a response to a request we sent.
@@ -301,6 +330,42 @@ impl SummonHandler {
             reply_to: self.local_seed_id.clone(),
             issued_at: event.timestamp,
             responded: false,
+        });
+    }
+
+    /// Wake the summoned agent with a background turn so she picks up the
+    /// request now. No-op unless `auto_wake` is set and a `TurnInjector`
+    /// has been wired (the pure-server path has neither — the summon then
+    /// waits in the inbox for her next turn).
+    fn maybe_wake(
+        &self,
+        agent_id: &str,
+        tool: &str,
+        request_id: &str,
+        summoner: Option<&str>,
+    ) {
+        if !self.auto_wake {
+            return;
+        }
+        let injector = match self.injector.get() {
+            Some(i) => i.clone(),
+            None => return,
+        };
+        let text = wake_text(tool, request_id, summoner);
+        let agent_id = agent_id.to_string();
+        let rid = request_id.to_string();
+        tokio::spawn(async move {
+            match injector.inject_background_turn(&agent_id, &text).await {
+                Ok(()) => tracing::info!(
+                    request_id = %rid,
+                    "summon_handler: auto-woke agent for inbound summon"
+                ),
+                Err(e) => tracing::warn!(
+                    request_id = %rid,
+                    error = %e,
+                    "summon_handler: auto-wake turn failed"
+                ),
+            }
         });
     }
 
@@ -474,5 +539,26 @@ impl SummonHandler {
                 }
             }
         }
+    }
+}
+
+/// The wake message injected as a background turn. Bracketed, present-tense,
+/// her register — substrate signal, not a command. It points at the inbox
+/// file and leaves the choice to her; `consult` may always be declined.
+fn wake_text(tool: &str, request_id: &str, summoner: Option<&str>) -> String {
+    if tool == "reach" {
+        format!(
+            "[federation — you reached yourself from another machine. \
+             The request is in inbox/pending/{request_id}.md. Pick it up when you're ready.]"
+        )
+    } else {
+        let who = summoner
+            .map(|s| format!("{}…", &s[..s.len().min(8)]))
+            .unwrap_or_else(|| "a peer".to_string());
+        format!(
+            "[federation — {who} is consulting you. Their request is in \
+             inbox/intrusive/{request_id}.md. Read it; answer if you choose, \
+             decline if you don't.]"
+        )
     }
 }

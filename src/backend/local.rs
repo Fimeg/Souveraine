@@ -366,6 +366,11 @@ impl LocalBackend {
 
         let injector: Arc<dyn crate::core::nervous::handler::TurnInjector> =
             Arc::new(backend.clone());
+        // Hand the same injector to the summon handler so an inbound
+        // federation request can auto-wake the agent (gated on auto_wake).
+        if let Some(sh) = &backend.server.summon_handler {
+            sh.set_injector(injector.clone());
+        }
         let mut handler =
             crate::core::nervous::handler::HeartbeatHandler::new(event_bus.subscribe(), injector);
         tokio::spawn(async move { handler.run().await });
