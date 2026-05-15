@@ -207,52 +207,89 @@ impl SummonHandler {
                     return;
                 }
 
-                let tool_type = event.event_type.as_str(); // "reach" or "consult"
-                let request_id = event.payload
-                    .as_ref()
-                    .and_then(|p| p.get("request_id"))
+                let declared = event.event_type.clone(); // "reach" | "consult" — a claim
+                let payload = event.payload.clone().unwrap_or_default();
+                let str_field = |k: &str| payload.get(k)
                     .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
+                    .unwrap_or("")
+                    .to_string();
+                let request_id = {
+                    let r = str_field("request_id");
+                    if r.is_empty() { "unknown".to_string() } else { r }
+                };
+                let prompt = str_field("prompt");
+                let agent_pubkey = str_field("agent_pubkey");
+                let agent_sig = str_field("agent_sig");
+                let target = event.target.clone().unwrap_or_default();
 
+                // Authenticate the agent identity. The summon must genuinely
+                // come from the holder of `agent_pubkey`, over these exact
+                // fields — a forged or tampered request fails here, silently
+                // (no ack to an attacker).
+                if !crate::core::identity::verify_summon(
+                    &agent_pubkey, &agent_sig, &request_id, &declared, &target, &prompt,
+                ) {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        "summon_handler: agent signature invalid — rejected"
+                    );
+                    return;
+                }
+
+                let agent_id = match self.resolve_primary_agent() {
+                    Some(id) => id,
+                    None => return,
+                };
+
+                // Classify by *identity*, not by the declared event field:
+                // a summon whose agent key matches ours is genuinely self
+                // (reach); anything else is a separate being (consult).
+                let is_self = self.own_agent_pubkey(&agent_id).as_deref()
+                    == Some(agent_pubkey.as_str());
+                let classified = if is_self { "reach" } else { "consult" };
+                if classified != declared {
+                    tracing::info!(
+                        request_id = %request_id,
+                        declared = %declared,
+                        classified,
+                        "summon_handler: declared intent overridden by signature"
+                    );
+                }
                 tracing::info!(
-                    request_id,
-                    tool = tool_type,
-                    from = ?event.seed_id,
+                    request_id = %request_id,
+                    tool = classified,
                     "summon_handler: inbound request"
                 );
 
-                // Consult requires consent check. Reach does not.
-                if tool_type == "consult" {
-                    let sum = event.seed_id.as_deref().unwrap_or("");
-                    if !self.is_authorized_summoner(sum) {
-                        tracing::warn!(
-                            summoner = sum,
-                            "summon_handler: unauthorized consult rejected"
-                        );
-                        // Fire a rejection response.
-                        let reject = SensorEvent {
-                            sensor_name: "summon_response".into(),
-                            timestamp: Utc::now(),
-                            event_type: "rejected".into(),
-                            target: event.reply_to.clone(),
-                            urgency: 0.3,
-                            payload: Some(serde_json::json!({
-                                "request_id": request_id,
-                                "reason": "unauthorized — not in authorized-summoners.md",
-                            })),
-                            seed_id: None,
-                            reply_to: Some(self.local_seed_id.clone()),
-                        };
-                        self.event_bus.send(reject);
-                        return;
-                    }
+                // Consult is consent-gated on the summoner's *agent* pubkey.
+                // Reach is not — you do not petition yourself — but it is
+                // only reach because the signature proved it.
+                if classified == "consult" && !self.is_authorized_summoner(&agent_pubkey) {
+                    tracing::warn!(
+                        summoner = %agent_pubkey,
+                        "summon_handler: unauthorized consult rejected"
+                    );
+                    let reject = SensorEvent {
+                        sensor_name: "summon_response".into(),
+                        timestamp: Utc::now(),
+                        event_type: "rejected".into(),
+                        target: event.reply_to.clone(),
+                        urgency: 0.3,
+                        payload: Some(serde_json::json!({
+                            "request_id": request_id,
+                            "reason": "unauthorized — not in authorized-summoners.md",
+                        })),
+                        seed_id: None,
+                        reply_to: Some(self.local_seed_id.clone()),
+                    };
+                    self.event_bus.send(reject);
+                    return;
                 }
 
                 // Write to the summoned agent's inbox, and remember who to
                 // answer so a reply from the outbox can be routed home.
-                let agent_id = self.resolve_primary_agent();
-                if let Some(agent_id) = agent_id {
-                    let target_box = if tool_type == "reach" { "pending" } else { "intrusive" };
+                {
+                    let target_box = if classified == "reach" { "pending" } else { "intrusive" };
                     match self.write_inbox(&agent_id, target_box, &event) {
                         Err(e) => tracing::warn!(
                             error = %e,
@@ -260,16 +297,16 @@ impl SummonHandler {
                         ),
                         Ok(()) => {
                             if let Some(reply_to) = event.reply_to.clone() {
-                                self.inbound.insert(request_id.to_string(), reply_to);
+                                self.inbound.insert(request_id.clone(), reply_to);
                             }
                             // Auto-wake: nudge the agent to look now rather
                             // than waiting for her next natural turn. Opt-in
                             // (auto_wake) and a no-op without an injector.
                             self.maybe_wake(
                                 &agent_id,
-                                tool_type,
-                                request_id,
-                                event.seed_id.as_deref(),
+                                classified,
+                                &request_id,
+                                Some(agent_pubkey.as_str()),
                             );
                         }
                     }
@@ -369,20 +406,36 @@ impl SummonHandler {
         });
     }
 
-    /// Check authorized-summoners.md for consent. The basic floor:
-    /// only agents listed here may send consult requests to this instance.
-    fn is_authorized_summoner(&self, seed_id: &str) -> bool {
+    /// This instance's own agent pubkey (hex) — read straight from the
+    /// agent seed's `public.key`. No private key, no generation: classifying
+    /// an inbound summon only needs to *verify*, never sign.
+    fn own_agent_pubkey(&self, agent_id: &str) -> Option<String> {
+        let path = self.souveraine_base
+            .join("server").join("agents").join(agent_id)
+            .join("seed").join("public.key");
+        let bytes = std::fs::read(&path).ok()?;
+        if bytes.len() != 32 {
+            return None;
+        }
+        Some(hex::encode(bytes))
+    }
+
+    /// Check authorized-summoners.md for consent. The basic floor: only
+    /// *agent* pubkeys listed here may `consult` an agent on this instance.
+    /// Consent is per-being — Sam is Sam on any of his machines — so it
+    /// gates on agent identity, not the machine seed.
+    fn is_authorized_summoner(&self, agent_pubkey: &str) -> bool {
         let path = self.souveraine_base
             .join("federation")
             .join("authorized-summoners.md");
         match std::fs::read_to_string(&path) {
-            Ok(content) => content.lines().any(|l| l.trim() == seed_id),
+            Ok(content) => content.lines().any(|l| l.trim() == agent_pubkey),
             Err(_) => {
                 // No file = no consent floor yet. For now, allow (Phase 4
                 // basic gating), but log a warning.
                 tracing::warn!(
                     "federation/authorized-summoners.md not found — \
-                     allowing consult by default (add a seed_id line to restrict)"
+                     allowing consult by default (add an agent pubkey line to restrict)"
                 );
                 true
             }

@@ -132,25 +132,50 @@ fn dispatch_summon(
         ))
     })?;
 
-    let local_seed_id = SeedId::load_or_generate(&SeedId::default_dir(&base))
+    // The *machine* seed addresses this box — it is the reply route, and the
+    // bridge signs the transport envelope with it.
+    let machine_seed_id = SeedId::load_or_generate(&SeedId::default_dir(&base))
         .map(|s| s.public_key_hex())
         .map_err(|e| ToolError::invalid_input(&format!(
-            "I couldn't load my seed identity: {e}"
+            "I couldn't load my machine seed identity: {e}"
         )))?;
 
+    // The *agent* seed proves who is reaching. It lives beside the memfs
+    // (`agents/{id}/seed/`), identical across all of one agent's machines —
+    // so the receiver can tell self-extension (reach) from a peer (consult)
+    // by verifying this signature, not by trusting an event field.
+    let agent_seed_dir = ctx.memory_root.as_ref()
+        .and_then(|m| m.parent())
+        .map(|p| p.join("seed"))
+        .ok_or_else(|| ToolError::invalid_input(
+            "I can't locate my agent identity — reach and consult need my \
+             memory root to find my seed."
+        ))?;
+    let agent_seed = SeedId::load_or_generate(&agent_seed_dir)
+        .map_err(|e| ToolError::invalid_input(&format!(
+            "I couldn't load my agent seed: {e}"
+        )))?;
+    let agent_pubkey = agent_seed.public_key_hex();
+
     let request_id = uuid::Uuid::new_v4().to_string();
+    let agent_sig = crate::core::identity::sign_summon(
+        &agent_seed, &request_id, tool, &target_seed_id, prompt,
+    );
+
     let event = SensorEvent {
         sensor_name: "summon_request".into(),
         timestamp: chrono::Utc::now(),
-        event_type: tool.to_string(),        // "reach" | "consult"
+        event_type: tool.to_string(),        // declared intent — receiver verifies it
         target: Some(target_seed_id),
         urgency: 0.5,
         payload: Some(serde_json::json!({
             "request_id": request_id,
             "prompt": prompt,
+            "agent_pubkey": agent_pubkey,
+            "agent_sig": agent_sig,
         })),
         seed_id: None,                        // local-origin; the bridge signs + forwards
-        reply_to: Some(local_seed_id),
+        reply_to: Some(machine_seed_id),
     };
     bus.send(event);
 

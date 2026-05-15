@@ -20,7 +20,7 @@ use axum::{
 };
 
 use crate::core::config::FederationConfig;
-use crate::core::identity::SeedId;
+use crate::core::identity::{verify_summon, SeedId};
 use crate::core::nervous::{EventBus, SensorEvent};
 use crate::server::federation::{FederationBridge, SignedEvent};
 
@@ -29,8 +29,31 @@ use crate::server::federation::{FederationBridge, SignedEvent};
 pub struct LiteListener {
     pub event_bus: EventBus,
     pub local_seed_id: String,
+    /// Agent pubkeys (hex) permitted to `consult` here — the consent floor.
     pub authorized_summoners: Vec<String>,
+    /// Agent pubkeys (hex) this device hosts. A summon signed by one of these
+    /// is a genuine self-extension (`reach`) and bypasses the consent floor.
+    /// Read from each agent's `seed/public.key` — no engine, no memfs load.
+    pub hosted_agent_pubkeys: Vec<String>,
     pub auto_wake: bool,
+}
+
+/// Read the agent pubkeys this device hosts from `server/agents/*/seed/public.key`.
+/// Cheap enough for the lite path — a handful of 32-byte files, no DB.
+fn load_hosted_agent_pubkeys(base: &Path) -> Vec<String> {
+    let agents_dir = base.join("server").join("agents");
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&agents_dir) {
+        for entry in entries.flatten() {
+            let pk = entry.path().join("seed").join("public.key");
+            if let Ok(bytes) = std::fs::read(&pk) {
+                if bytes.len() == 32 {
+                    out.push(hex::encode(bytes));
+                }
+            }
+        }
+    }
+    out
 }
 
 impl LiteListener {
@@ -45,6 +68,7 @@ impl LiteListener {
             event_bus: event_bus.clone(),
             local_seed_id,
             authorized_summoners: config.authorized_summoners.clone(),
+            hosted_agent_pubkeys: load_hosted_agent_pubkeys(&base),
             auto_wake: config.auto_wake,
         });
 
@@ -74,13 +98,40 @@ impl LiteListener {
                 if event.target.as_deref() != Some(&self.local_seed_id) {
                     continue;
                 }
-                // reach is self-extension (no consent gate); consult must be
-                // from an authorized summoner.
-                let summoner = event.seed_id.as_deref().unwrap_or("");
-                let authorized = event.event_type == "reach"
-                    || self.authorized_summoners.iter().any(|s| s == summoner);
+                // Authenticate by the agent signature — never by trusting the
+                // event's `event_type`. A summon signed by an agent we host is
+                // a genuine self-extension (reach) and bypasses the consent
+                // floor; anything else must be an authorized summoner (consult).
+                let field = |k: &str| event.payload.as_ref()
+                    .and_then(|p| p.get(k))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let request_id = field("request_id");
+                let prompt = field("prompt");
+                let agent_pubkey = field("agent_pubkey");
+                let agent_sig = field("agent_sig");
+                let target = event.target.clone().unwrap_or_default();
+
+                if !verify_summon(
+                    &agent_pubkey, &agent_sig, &request_id,
+                    &event.event_type, &target, &prompt,
+                ) {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        "lite listener: invalid agent signature — summon ignored"
+                    );
+                    continue;
+                }
+
+                let is_self = self.hosted_agent_pubkeys.iter().any(|p| p == &agent_pubkey);
+                let authorized = is_self
+                    || self.authorized_summoners.iter().any(|s| s == &agent_pubkey);
                 if !authorized {
-                    tracing::warn!(summoner, "lite listener: unauthorized summon ignored");
+                    tracing::warn!(
+                        summoner = %agent_pubkey,
+                        "lite listener: unauthorized summon ignored"
+                    );
                     continue;
                 }
                 if let Err(e) = park_summon(&base, &event) {
