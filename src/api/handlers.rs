@@ -2,7 +2,7 @@ use crate::api::models::*;
 use crate::server::SouveraineServer;
 use crate::core::session::ConversationMessage;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, Query, State, WebSocketUpgrade, ws::WebSocket},
     response::{Json, Sse},
     http::StatusCode,
     body::Bytes,
@@ -403,4 +403,92 @@ pub async fn delete_memory(
     repo.delete(&path).await
         .map_err(|e| memory_err(StatusCode::NOT_FOUND, "delete_failed", e))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// WebSocket firehose — streams every SensorEvent from the nervous
+/// system as JSON. A second machine subscribes here and sees the
+/// agent's energy, schedules, tool calls, posture changes in real time.
+pub async fn firehose(
+    State(server): State<Arc<SouveraineServer>>,
+    ws: WebSocketUpgrade,
+) -> impl axum::response::IntoResponse {
+    ws.on_upgrade(move |socket| firehose_stream(server, socket))
+}
+
+async fn firehose_stream(
+    server: Arc<SouveraineServer>,
+    mut socket: WebSocket,
+) {
+    use axum::extract::ws::Message;
+
+    let mut rx = server.event_bus.subscribe();
+    tracing::info!("firehose client connected");
+
+    loop {
+        match rx.recv().await {
+            Ok(event) => {
+                let json = match serde_json::to_string(&event) {
+                    Ok(j) => j,
+                    Err(_) => continue,
+                };
+                if socket.send(Message::Text(json.into())).await.is_err() {
+                    break;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                tracing::debug!(skipped = n, "firehose client lagged");
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        }
+    }
+
+    tracing::info!("firehose client disconnected");
+}
+
+/// Inbound federation endpoint. Remote bridges connect here as WebSocket
+/// clients and push Ed25519-signed SensorEvents. Each event's signature is
+/// verified against its claimed signer pubkey; valid events are stamped
+/// peer-originated and injected into the local EventBus. Invalid or
+/// unparseable payloads are dropped. Authentication *is* the signature —
+/// there is no bearer token on this route.
+pub async fn federation_events(
+    State(server): State<Arc<SouveraineServer>>,
+    ws: WebSocketUpgrade,
+) -> impl axum::response::IntoResponse {
+    ws.on_upgrade(move |socket| federation_events_stream(server, socket))
+}
+
+async fn federation_events_stream(server: Arc<SouveraineServer>, mut socket: WebSocket) {
+    use axum::extract::ws::Message;
+
+    tracing::info!("federation: peer bridge connected to inbound endpoint");
+
+    while let Some(msg) = socket.recv().await {
+        let text = match msg {
+            Ok(Message::Text(t)) => t,
+            Ok(Message::Close(_)) | Err(_) => break,
+            Ok(_) => continue,
+        };
+        let signed: crate::server::federation::SignedEvent = match serde_json::from_str(&text) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(error = %e, "federation: unparseable inbound payload — dropped");
+                continue;
+            }
+        };
+        match signed.verify() {
+            Some(event) => {
+                tracing::debug!(sensor = %event.sensor_name, "federation: inbound event verified");
+                server.event_bus.send(event);
+            }
+            None => {
+                tracing::warn!(
+                    signer = %signed.signer_pubkey_hex,
+                    "federation: signature verification failed — event dropped"
+                );
+            }
+        }
+    }
+
+    tracing::info!("federation: peer bridge disconnected from inbound endpoint");
 }

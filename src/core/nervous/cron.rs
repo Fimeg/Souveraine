@@ -257,6 +257,7 @@ impl CronSensor {
                         "source": entry.source,
                     })),
                     seed_id: None,
+                    reply_to: None,
                 });
 
                 debug!(schedule = %entry.name, "fired schedule event");

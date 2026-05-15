@@ -643,11 +643,18 @@ pub struct TuiConfig {
     /// Kept for config backwards compatibility.
     #[serde(default = "default_stale_timeout_secs")]
     pub stale_timeout_secs: u64,
+    /// When the model produces text alongside tool calls, surface it in the
+    /// chat stream as italic interstitial narration. Off = silent tool chains.
+    #[serde(default = "default_true")]
+    pub show_interstitial: bool,
 }
 
 impl Default for TuiConfig {
     fn default() -> Self {
-        Self { stale_timeout_secs: default_stale_timeout_secs() }
+        Self {
+            stale_timeout_secs: default_stale_timeout_secs(),
+            show_interstitial: true,
+        }
     }
 }
 
@@ -661,6 +668,10 @@ pub struct FederationConfig {
     pub enabled: bool,
     #[serde(default)]
     pub instance_label: Option<String>,
+    /// Peers this instance federates with. Each peer connection is a signed
+    /// WS stream to the peer's federation endpoint.
+    #[serde(default)]
+    pub peers: Vec<PeerConfig>,
 }
 
 impl Default for FederationConfig {
@@ -668,8 +679,23 @@ impl Default for FederationConfig {
         Self {
             enabled: false,
             instance_label: None,
+            peers: Vec::new(),
         }
     }
+}
+
+/// A federated peer. `pubkey` is the peer's Ed25519 public key (hex) — the
+/// trust root for verifying every event the peer sends.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerConfig {
+    /// Peer's federation endpoint, e.g. `ws://10.10.20.50:8484`.
+    pub url: String,
+    /// Peer's Ed25519 public key, hex-encoded.
+    pub pubkey: String,
+    /// Sensor-name subscriptions — which events this peer should receive.
+    /// `*` = all; a bare name = exact; `name*` = prefix. Empty = none.
+    #[serde(default)]
+    pub subscriptions: Vec<String>,
 }
 
 // ── Voice channel ──

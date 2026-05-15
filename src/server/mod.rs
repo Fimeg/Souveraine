@@ -11,6 +11,7 @@ pub mod agent_inventory;
 pub mod consciousness_engine;
 pub mod conversation;
 pub mod db;
+pub mod federation;
 pub mod gitea_client;
 pub mod gitea_memory;
 pub mod session_manager;
@@ -41,6 +42,10 @@ pub struct SouveraineServer {
     /// Stable identifier for this process — used to register/heartbeat
     /// agent instances so the manager card shows running counts.
     pub instance_id: String,
+    /// Nervous system bus. Every sensor event flows through here — cron,
+    /// todo, energy, posture. Firehose subscribers (EventLog, WebSocket
+    /// bridge, desktop overlay) listen on this bus.
+    pub event_bus: crate::core::nervous::EventBus,
 }
 
 pub struct ServerConfig {
@@ -198,6 +203,7 @@ impl SouveraineServer {
             app_config: Arc::new(RwLock::new(config)),
             rate_delay,
             instance_id,
+            event_bus: crate::core::nervous::EventBus::default(),
         })
     }
 
@@ -209,6 +215,36 @@ impl SouveraineServer {
         let config = self.config.read().await;
         let addr = format!("{}:{}", config.bind, config.port);
         drop(config);
+
+        // ── Federation bridge ──
+        // When federation is enabled, spawn an outbound signed-event stream
+        // to each configured peer. Inbound events arrive symmetrically on
+        // this server's own /v1/federation/events handler.
+        {
+            let fed = self.app_config.read().await.federation.clone();
+            if fed.enabled && !fed.peers.is_empty() {
+                let peer_count = fed.peers.len();
+                let base = dirs::home_dir().unwrap_or_default().join(".souveraine");
+                match crate::core::identity::SeedId::load_or_generate(
+                    &crate::core::identity::SeedId::default_dir(&base),
+                ) {
+                    Ok(seed) => {
+                        let mut bridge = federation::FederationBridge::new(
+                            self.event_bus.clone(),
+                            Arc::new(seed),
+                        );
+                        for peer in fed.peers {
+                            bridge.add_peer(peer);
+                        }
+                        bridge.run();
+                        tracing::info!("federation bridge started ({peer_count} peer(s))");
+                    }
+                    Err(e) => {
+                        tracing::error!("federation: failed to load seed identity: {}", e);
+                    }
+                }
+            }
+        }
 
         println!("Souveraine server listening on http://{}", addr);
 

@@ -12,10 +12,12 @@ pub mod handlers;
 pub mod models;
 
 pub fn create_routes(state: Arc<SouveraineServer>) -> Router {
-    // Public routes — no auth required (agent listing/creation, conversation listing/creation, health).
+    // Public routes — no auth required (agent listing/creation, conversation listing/creation, health, firehose).
     let public_routes = Router::new()
         .route("/v1/agents", get(handlers::list_agents).post(handlers::create_agent))
         .route("/v1/conversations", get(handlers::list_conversations).post(handlers::create_conversation))
+        .route("/v1/firehose", get(handlers::firehose))
+        .route("/v1/federation/events", get(handlers::federation_events))
         .route("/health", get(health_check));
 
     // Protected agent routes — require per-agent bearer token.

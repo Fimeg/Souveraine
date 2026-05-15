@@ -81,6 +81,7 @@ impl Tool for Atmosphere {
                     urgency: 0.0,
                     payload: Some(serde_json::json!({"atmosphere": normalized})),
                     seed_id: None,
+                    reply_to: None,
                 }
             );
         }

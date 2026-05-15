@@ -298,7 +298,7 @@ impl LocalBackend {
         let server = SouveraineServer::new(config.clone())
             .await
             .context("LocalBackend: SouveraineServer init")?;
-        let event_bus = EventBus::default();
+        let event_bus = server.event_bus.clone();
 
         let base = config
             .memory
@@ -380,8 +380,9 @@ impl LocalBackend {
             SeedId::load_or_generate(&SeedId::default_dir(&base))
                 .unwrap_or_else(|_| SeedId::generate()),
         );
+        let event_bus = server.event_bus.clone();
         Self {
-            event_bus: EventBus::default(),
+            event_bus,
             server,
             seed_id,
             active_sessions: Arc::new(AtomicU32::new(0)),
@@ -885,7 +886,7 @@ async fn run_turn(
     );
     let tool_ctx = ToolContext {
         compaction_engine: Some(server.compaction_engine.clone() as Arc<dyn CompactionEngine>),
-        event_bus: Some(event_bus),
+        event_bus: Some(event_bus.clone()),
         ..tool_ctx
     };
 
@@ -1040,7 +1041,7 @@ async fn run_turn(
             // Stream the final content in chunks, watching the cancel token.
             // If Esc fires mid-stream, the agent's partial text is preserved
             // (the chunks already sent are in the user's history) and an
-            // *[interrupted]* marker lands in the session message.
+            // *[raised hand]* marker lands in the session message.
             let chars: Vec<char> = final_content.chars().collect();
             let mut streamed = String::with_capacity(final_content.len());
             for chunk in chars.chunks(10) {
@@ -1090,6 +1091,15 @@ async fn run_turn(
             response.content.clone(),
             calls,
         ));
+
+        // Stream any text the model produced alongside tool calls as italic
+        // interstitial narration. Configurable via tui.show_interstitial.
+        if !response.content.is_empty() {
+            let cfg = server.app_config.read().await;
+            if cfg.tui.show_interstitial {
+                let _ = tx.send(Ok(BackendEvent::Interstitial(response.content.clone()))).await;
+            }
+        }
 
         // Execute each tool and stream results back — now with per-agent context
         for tc in &response.tool_calls {
@@ -1179,9 +1189,9 @@ async fn run_turn(
         // Emit the marker as a final token so the in-flight bubble shows it
         // immediately, then persist the same content into the session.
         let marker = if final_content.is_empty() {
-            "*[interrupted]*".to_string()
+            "*[raised hand]*".to_string()
         } else {
-            "\n\n*[interrupted]*".to_string()
+            "\n\n*[raised hand]*".to_string()
         };
         let _ = tx.send(Ok(BackendEvent::Token(marker.clone()))).await;
         format!("{}{}", final_content, marker)
@@ -1207,6 +1217,14 @@ async fn run_turn(
         return Ok(());
     }
 
+    // Energy balance: scan the agent's task list and compute the generative /
+    // consumptive ratio. Written to system/dynamic/energy-balance.md so the
+    // agent can read it in context and Aster can reference it during N+1.
+    // Silent on failure — the file is advisory, not load-bearing.
+    if let Err(e) = write_energy_balance(&server, &agent_id, &event_bus).await {
+        tracing::debug!(agent = %agent_id, error = %e, "energy-balance write skipped");
+    }
+
     // Breather between turns — unconditional,
     // so the upstream always gets a gap before the N+1 pass starts.
     tokio::time::sleep(Duration::from_millis(2000)).await;
@@ -1214,8 +1232,20 @@ async fn run_turn(
     tracing::info!(agent = %agent_id, "subconscious N+1 pass starting");
 
     // Signal the start of the subconscious pass so the TUI can flip into
-    // Posture::Thinking while the loop runs.
+    // Posture::Thinking while the loop runs. Fires on both the mpsc channel
+    // (for active-turn TUI consumers) and the EventBus (for firehose
+    // subscribers — background turns, federated peers, Summon listeners).
     let _ = tx.send(Ok(BackendEvent::SubconsciousPass(true))).await;
+    event_bus.send(crate::core::nervous::SensorEvent {
+        sensor_name: "consciousness".into(),
+        timestamp: chrono::Utc::now(),
+        event_type: "subconscious_pass_start".into(),
+        target: Some(agent_id.clone()),
+        urgency: 0.2,
+        payload: None,
+        seed_id: None,
+        reply_to: None,
+    });
 
     let pass_start = Instant::now();
     let pass_result = {
@@ -1239,6 +1269,16 @@ async fn run_turn(
     // Always release the Thinking posture, even on failure — otherwise the
     // face stays stuck inward when the pass errors out.
     let _ = tx.send(Ok(BackendEvent::SubconsciousPass(false))).await;
+    event_bus.send(crate::core::nervous::SensorEvent {
+        sensor_name: "consciousness".into(),
+        timestamp: chrono::Utc::now(),
+        event_type: "subconscious_pass_end".into(),
+        target: Some(agent_id.clone()),
+        urgency: 0.1,
+        payload: None,
+        seed_id: None,
+        reply_to: None,
+    });
 
     let events = pass_result?;
 
@@ -1263,6 +1303,47 @@ async fn run_turn(
             };
             let _ = server.sessions.add_message(&conversation_id, msg);
         }
+    }
+
+    // ── Fire consciousness events on the EventBus ──
+    // Every ConsciousnessEvent — surfacing, reflection, archivist,
+    // compaction warning — is broadcast as a SensorEvent so the
+    // firehose, persistent EventLog, federated peers, and any TUI
+    // subscriber see it regardless of which conversation produced it.
+    // seed_id is None for local events; federation routing sets it.
+    // This is the load-bearing fix for background/heartbeat turns:
+    // the mpsc channel drains silently when no TUI is reading, but
+    // the EventBus preserves the event for any subscriber.
+    for event in &events {
+        let (event_type, payload, urgency) = match event {
+            ConsciousnessEvent::Surfacing { source, content, priority } => {
+                let urg = match priority.as_str() {
+                    "critical" => 0.9,
+                    "high" => 0.7,
+                    _ => 0.3,
+                };
+                ("surfacing", serde_json::json!({ "source": source, "content": content, "priority": priority }), urg)
+            }
+            ConsciousnessEvent::Reflection { content } => {
+                ("reflection", serde_json::json!({ "content": content }), 0.5)
+            }
+            ConsciousnessEvent::Archivist { synthesis, pressure } => {
+                ("archivist", serde_json::json!({ "synthesis": synthesis, "pressure": pressure }), *pressure)
+            }
+            ConsciousnessEvent::CompactionWarning { pressure, tier } => {
+                ("compaction_warning", serde_json::json!({ "pressure": *pressure, "tier": tier }), (*pressure).min(0.9))
+            }
+        };
+        event_bus.send(crate::core::nervous::SensorEvent {
+            sensor_name: "consciousness".into(),
+            timestamp: chrono::Utc::now(),
+            event_type: event_type.into(),
+            target: Some(agent_id.clone()),
+            urgency,
+            payload: Some(payload),
+            seed_id: None,
+            reply_to: None,
+        });
     }
 
     for event in events {
@@ -1306,4 +1387,145 @@ async fn run_turn(
     }
 
     Ok(())
+}
+
+/// Scan the agent's `tasks/` directory for YAML-frontmatter todo files and
+/// write an energy-balance summary to `system/dynamic/energy-balance.md`.
+///
+/// Format is minimal YAML frontmatter so both the prompt builder and the TUI
+/// can parse it. Failure is non-fatal — the file is advisory, not load-bearing.
+async fn write_energy_balance(server: &Arc<SouveraineServer>, agent_id: &str, event_bus: &EventBus) -> Result<()> {
+    let memory_root = server.agents.memory_root(agent_id);
+    let tasks_dir = memory_root.join("tasks");
+    if !tasks_dir.exists() {
+        // No tasks directory yet — nothing to count.
+        return Ok(());
+    }
+
+    let mut generative: usize = 0;
+    let mut consumptive: usize = 0;
+    let mut hot: usize = 0;
+    let mut warm: usize = 0;
+    let mut cold: usize = 0;
+
+    if let Ok(entries) = std::fs::read_dir(&tasks_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map(|e| e == "md").unwrap_or(false) {
+                let content = match std::fs::read_to_string(&path) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+
+                // Quick frontmatter parse — just the fields we need.
+                let body = match content.strip_prefix("---\n") {
+                    Some(rest) => match rest.find("\n---\n") {
+                        Some(end) => &rest[..end],
+                        None => continue,
+                    },
+                    None => continue,
+                };
+
+                let mut completed = false;
+                let mut energy: Option<&str> = None;
+                let mut momentum: Option<&str> = None;
+
+                for line in body.lines() {
+                    if let Some((key, val)) = line.split_once(':') {
+                        let key = key.trim();
+                        let val = val.trim().trim_matches('"');
+                        match key {
+                            "completed" => completed = val == "true",
+                            "energy" => energy = Some(val),
+                            "momentum" => momentum = Some(val),
+                            _ => {}
+                        }
+                    }
+                }
+
+                if !completed {
+                    match energy {
+                        Some("generative") => generative += 1,
+                        _ => consumptive += 1,
+                    }
+                    match momentum {
+                        Some("hot") => hot += 1,
+                        Some("warm") => warm += 1,
+                        _ => cold += 1,
+                    }
+                }
+            }
+        }
+    }
+
+    // Determine the top-of-mind description — shifts the tone of the one-liner
+    // the agent reads in context. Matches the lettabot-v017 heartbeat topology.
+    let ratio = if generative + consumptive > 0 {
+        generative as f32 / (generative + consumptive) as f32
+    } else {
+        0.5
+    };
+    let description = if generative == 0 && consumptive == 0 {
+        "no tasks — the space is clean".to_string()
+    } else if ratio < 0.2 {
+        "all-consumptive — the engine is running cold".to_string()
+    } else if ratio < 0.4 {
+        "mostly obligations — tending the garden".to_string()
+    } else if ratio > 0.8 {
+        "all-generative — building new things".to_string()
+    } else if ratio > 0.6 {
+        "mostly generative — restless momentum".to_string()
+    } else {
+        "balanced — generative and consumptive in rhythm".to_string()
+    };
+
+    let now = chrono::Utc::now();
+    let frontmatter = format!(
+        "---\nupdated: {updated}\ngenerative: {gen}\nconsumptive: {con}\nratio: {ratio:.2}\n\
+         hot: {hot}\nwarm: {warm}\ncold: {cold}\n---\n\n# Energy Balance\n\n\
+         {gen} generative, {con} consumptive ({hot} hot, {warm} warm, {cold} cold). {desc}\n",
+        updated = now.to_rfc3339(),
+        gen = generative,
+        con = consumptive,
+        ratio = ratio,
+        hot = hot,
+        warm = warm,
+        cold = cold,
+        desc = description,
+    );
+
+    let balance_path = memory_root.join("system").join("dynamic").join("energy-balance.md");
+    if let Some(parent) = balance_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&balance_path, frontmatter)?;
+
+    fire_energy_event(event_bus, agent_id, generative, consumptive, ratio);
+
+    tracing::debug!(
+        agent = agent_id,
+        generative, consumptive,
+        "energy-balance written"
+    );
+
+    Ok(())
+}
+
+/// Fire an energy_balance_updated event so the firehose carries the
+/// agent's felt state across machines.
+fn fire_energy_event(event_bus: &EventBus, agent_id: &str, generative: usize, consumptive: usize, ratio: f32) {
+    event_bus.send(crate::core::nervous::SensorEvent {
+        sensor_name: "energy".into(),
+        timestamp: chrono::Utc::now(),
+        event_type: "energy_balance_updated".into(),
+        target: Some(agent_id.to_string()),
+        urgency: 0.1,
+        payload: Some(serde_json::json!({
+            "generative": generative,
+            "consumptive": consumptive,
+            "ratio": ratio,
+        })),
+        seed_id: None,
+        reply_to: None,
+    });
 }

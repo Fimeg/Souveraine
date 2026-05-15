@@ -673,6 +673,7 @@ pub async fn execute_memory_command_with_context(
                     urgency: 0.1,
                     payload: None,
                     seed_id: None,
+                    reply_to: None,
                 });
             }
             Ok(format!("Wrote memory file: {}", path))
@@ -688,6 +689,7 @@ pub async fn execute_memory_command_with_context(
                     urgency: 0.1,
                     payload: None,
                     seed_id: None,
+                    reply_to: None,
                 });
             }
             Ok(format!("Appended to memory file: {}", path))
@@ -754,6 +756,7 @@ pub async fn execute_memory_command_with_context(
                     urgency: 0.2,
                     payload: None,
                     seed_id: None,
+                    reply_to: None,
                 });
             }
             Ok(format!("Deleted memory file: {}", path))

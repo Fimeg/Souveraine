@@ -156,6 +156,7 @@ impl Tool for Schedule {
                     urgency: 0.2,
                     payload: Some(serde_json::json!({ "kind": kind_str, "schedule": schedule })),
                     seed_id: None,
+                    reply_to: None,
                 });
                 ok(format!("Schedule '{name}' planted."))
             }
@@ -203,6 +204,7 @@ impl Tool for Schedule {
                     urgency: 0.1,
                     payload: None,
                     seed_id: None,
+                    reply_to: None,
                 });
                 ok(format!("Schedule '{name}' updated."))
             }
@@ -227,6 +229,7 @@ impl Tool for Schedule {
                     urgency: 0.1,
                     payload: None,
                     seed_id: None,
+                    reply_to: None,
                 });
                 ok(format!("Schedule '{name}' released."))
             }
@@ -252,6 +255,7 @@ impl Tool for Schedule {
                     urgency: 0.4,
                     payload: None,
                     seed_id: None,
+                    reply_to: None,
                 });
                 ok(format!("Schedule '{name}' triggered — will fire on next tick."))
             }

@@ -22,6 +22,11 @@ pub struct SensorEvent {
     /// None = local event. Some(...) = originated from a federated peer.
     /// When federation lands, this becomes the peer's public key / DID.
     pub seed_id: Option<String>,
+    /// Return address for directed routing. None = broadcast.
+    /// A request sets this to the caller's seed_id; the federation bridge
+    /// reads it to route the reply (carried in `target`) back to the asker.
+    #[serde(default)]
+    pub reply_to: Option<String>,
 }
 
 // ── SensorConfig ────────────────────────────────────────────────

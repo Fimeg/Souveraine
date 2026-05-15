@@ -16,6 +16,7 @@ pub mod outfit;
 pub mod read;
 pub mod schedule;
 pub mod subagent;
+pub mod todo;
 pub mod write;
 
 use std::sync::{Arc, OnceLock};
@@ -36,6 +37,7 @@ use self::subagent::Subagent;
 use self::agent::Agent;
 use self::atmosphere::Atmosphere;
 use self::schedule::Schedule;
+use self::todo::Todo;
 use self::write::Write;
 
 // ── Re-export for backward compat ───────────────────────────────
@@ -87,6 +89,7 @@ impl Sensorium {
                 Box::new(Subagent),
                 Box::new(Atmosphere),
                 Box::new(Agent),
+                Box::new(Todo),
                 Box::new(Schedule),
             ],
             bash,
