@@ -93,7 +93,11 @@ async fn peer_outbound_task(peer: PeerConfig, event_bus: EventBus, seed: Arc<See
                             if event.seed_id.is_some() {
                                 continue;
                             }
-                            if !subscription_matches(&peer.subscriptions, &event.sensor_name) {
+                            // Control-plane events (discovery, summons) always
+                            // cross; data events respect the peer's subscriptions.
+                            if !is_control_event(&event.sensor_name)
+                                && !subscription_matches(&peer.subscriptions, &event.sensor_name)
+                            {
                                 continue;
                             }
                             let signed = SignedEvent::sign(&event, &seed);
@@ -150,6 +154,13 @@ fn subscription_matches(subscriptions: &[String], sensor_name: &str) -> bool {
             s == sensor_name
         }
     })
+}
+
+/// Control-plane events always cross the federation regardless of a peer's
+/// data subscriptions — discovery and directed summons must arrive. The
+/// receiving side filters by `target`, so a broadcast is safe.
+fn is_control_event(sensor_name: &str) -> bool {
+    matches!(sensor_name, "federation" | "summon_request" | "summon_response")
 }
 
 /// Exponential backoff — 1s, 2s, 4s … capped at 60s, plus up to 1s jitter.

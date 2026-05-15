@@ -672,6 +672,15 @@ pub struct FederationConfig {
     /// WS stream to the peer's federation endpoint.
     #[serde(default)]
     pub peers: Vec<PeerConfig>,
+    /// Seed_ids permitted to `consult` an agent on this instance. The basic
+    /// consent floor — empty plus a missing `authorized-summoners.md` means
+    /// permissive; richer per-arena gating is the agent's memfs concern.
+    #[serde(default)]
+    pub authorized_summoners: Vec<String>,
+    /// When running as a lite listener, spawn the full engine on an
+    /// authorized summon rather than only parking it.
+    #[serde(default)]
+    pub auto_wake: bool,
 }
 
 impl Default for FederationConfig {
@@ -680,6 +689,8 @@ impl Default for FederationConfig {
             enabled: false,
             instance_label: None,
             peers: Vec::new(),
+            authorized_summoners: Vec::new(),
+            auto_wake: false,
         }
     }
 }

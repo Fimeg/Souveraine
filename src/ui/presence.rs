@@ -158,6 +158,9 @@ pub struct Presence {
     /// colours across all screens. Defaults to a posture-linked preset when
     /// none is explicitly set via `BackendEvent::Atmosphere`.
     pub atmosphere: crate::ui::atmosphere::Atmosphere,
+    /// True when the agent explicitly chose an atmosphere via the tool.
+    /// Posture shifts will not overwrite an explicit choice.
+    pub atmosphere_explicit: bool,
     /// Atmosphere from 24 ticks ago — the source of the current lerp.
     /// When equal to `atmosphere`, no transition is active.
     pub lerp_from: crate::ui::atmosphere::Atmosphere,
@@ -198,6 +201,7 @@ impl Presence {
             animator: Animator::new(),
             portrait_source: None,
             atmosphere: crate::ui::atmosphere::Atmosphere::default(),
+            atmosphere_explicit: false,
             lerp_from: crate::ui::atmosphere::Atmosphere::default(),
             lerp_t: 1.0,
             lerp_duration: 24.0,
@@ -215,8 +219,9 @@ impl Presence {
     pub fn load_portrait<P: AsRef<Path>>(&mut self, _path: P) {
     }
 
-    /// Set the atmosphere and start a lerp from the previous value.
+    /// Set the atmosphere explicitly (agent chose it) and start a lerp.
     pub fn transition_atmosphere(&mut self, target: crate::ui::atmosphere::Atmosphere) {
+        self.atmosphere_explicit = true;
         if target != self.atmosphere {
             self.lerp_from = self.atmosphere;
             self.atmosphere = target;
@@ -241,8 +246,11 @@ impl Presence {
 
     /// Sync the active atmosphere from the current posture. Called whenever
     /// `posture` changes — keeps the UI chrome in step with Annie's state.
-    /// Starts a lerp transition rather than snapping.
+    /// If she explicitly chose an atmosphere, posture shifts don't overwrite it.
     fn sync_atmosphere(&mut self) {
+        if self.atmosphere_explicit {
+            return;
+        }
         let target = crate::ui::atmosphere::Atmosphere::from_posture(self.posture);
         if target != self.atmosphere {
             self.lerp_from = self.atmosphere;
@@ -281,6 +289,7 @@ impl Presence {
         match event {
             TuiEvent::AgentSelected(name) => {
                 self.name = name.clone();
+                self.atmosphere_explicit = false;
                 true
             }
             TuiEvent::MoodChanged(mood) => {
@@ -352,10 +361,13 @@ impl Presence {
                 true
             }
             TuiEvent::AtmosphereChanged(name) => {
-                // Parse the preset name from the agent's structured event.
-                // Falls back to posture-linked default on unrecognised names.
                 use crate::ui::atmosphere::Atmosphere;
-                match name.to_lowercase().replace(' ', "_").as_str() {
+                let key = name.to_lowercase().replace(' ', "_");
+                match key.as_str() {
+                    "" | "default" => {
+                        self.atmosphere_explicit = false;
+                        self.sync_atmosphere();
+                    }
                     "mint_tea" => self.transition_atmosphere(Atmosphere::MintTea),
                     "therapeutic_blue" => self.transition_atmosphere(Atmosphere::TherapeuticBlue),
                     "lavender_calm" => self.transition_atmosphere(Atmosphere::LavenderCalm),
@@ -369,7 +381,7 @@ impl Presence {
                     "midnight_galaxy" => self.transition_atmosphere(Atmosphere::MidnightGalaxy),
                     "twilight_mist" => self.transition_atmosphere(Atmosphere::TwilightMist),
                     "forest_greens" => self.transition_atmosphere(Atmosphere::ForestGreens),
-                    _ => self.sync_atmosphere(), // fall back to posture-linked
+                    _ => {} // unrecognised name — ignore
                 }
                 true
             }

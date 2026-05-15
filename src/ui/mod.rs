@@ -12,6 +12,7 @@ pub mod presence;
 pub mod rgp;
 pub mod schedules;
 pub mod settings;
+pub mod setup;
 pub mod voice;
 
 pub use app::App;

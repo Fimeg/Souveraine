@@ -1,6 +1,7 @@
 use crate::bridge::BifrostClient;
 use crate::core::compact::{CompactionEngine, CompactionConfig, DefaultCompactionEngine, UtcClock};
 use crate::core::config::ConsciousnessConfig;
+use crate::core::identity::SeedId;
 use crate::server::gitea_memory::GiteaMemory;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,7 +16,9 @@ pub mod device_registry;
 pub mod federation;
 pub mod gitea_client;
 pub mod gitea_memory;
+pub mod listener;
 pub mod session_manager;
+pub mod summon_handler;
 
 pub use agent_inventory::AgentInventory;
 pub use consciousness_engine::{ConsciousnessEngine, ConsciousnessEvent};
@@ -51,6 +54,9 @@ pub struct SouveraineServer {
     /// Tracks known federated peers. Updated by `device_announce`/`device_leave`
     /// events on the bus. Persisted to disk for CLI access.
     pub device_registry: Option<Arc<DeviceRegistry>>,
+    /// Manages cross-instance Reach & Consult requests. Present when
+    /// federation is enabled and a seed identity is available.
+    pub summon_handler: Option<Arc<summon_handler::SummonHandler>>,
     /// This instance's Ed25519 public key hex — used to filter self-announcements
     /// from the device registry. Loaded at construction; None if seed unavailable.
     pub local_seed_id: Option<String>,
@@ -213,8 +219,9 @@ impl SouveraineServer {
             }
             Err(_) => None,
         };
+        let sb_for_device_reg = souveraine_base.clone();
         let device_registry = local_seed_id.clone().map(|seed_id| {
-            let reg = Arc::new(DeviceRegistry::new(souveraine_base, seed_id));
+            let reg = Arc::new(DeviceRegistry::new(sb_for_device_reg, seed_id));
             // Subscribe the registry to the event bus for live updates.
             let reg_clone = reg.clone();
             let mut rx = event_bus.subscribe();
@@ -223,8 +230,41 @@ impl SouveraineServer {
                     reg_clone.handle_event(&event);
                 }
             });
+            // Prune peers unheard-from for 3 minutes.
+            let reg_prune = reg.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+                tick.tick().await;
+                loop {
+                    tick.tick().await;
+                    reg_prune.prune_stale(180);
+                }
+            });
             reg
         });
+
+        // ── Summon handler ──
+        let sb_for_seed = souveraine_base.clone();
+        let local_seed: Option<Arc<SeedId>> = local_seed_id.as_ref().and_then(|_| {
+            crate::core::identity::SeedId::load_or_generate(
+                &crate::core::identity::SeedId::default_dir(&sb_for_seed),
+            ).ok().map(Arc::new)
+        });
+        let summon_handler = match (&local_seed_id, &local_seed) {
+            (Some(seed_id), Some(seed)) => {
+                let handler = Arc::new(
+                    summon_handler::SummonHandler::new(
+                        seed_id.clone(),
+                        event_bus.clone(),
+                        seed.clone(),
+                        souveraine_base.clone(),
+                    ),
+                );
+                handler.spawn_listener();
+                Some(handler)
+            }
+            _ => None,
+        };
 
         Ok(Self {
             agents,
@@ -240,6 +280,7 @@ impl SouveraineServer {
             instance_id,
             event_bus,
             device_registry,
+            summon_handler,
             local_seed_id,
         })
     }
@@ -278,6 +319,30 @@ impl SouveraineServer {
                     }
                     Err(e) => {
                         tracing::error!("federation: failed to load seed identity: {}", e);
+                    }
+                }
+            }
+        }
+
+        // ── Drain parked summons ──
+        // A lite listener parks summons it couldn't answer to
+        // ~/.souveraine/.summon-pending/. Re-fire them onto the bus so the
+        // full engine's SummonHandler picks them up, then clear the files.
+        {
+            let pending_dir = dirs::home_dir().unwrap_or_default()
+                .join(".souveraine").join(".summon-pending");
+            if let Ok(entries) = std::fs::read_dir(&pending_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                        continue;
+                    }
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        if let Ok(event) = serde_json::from_str::<crate::core::nervous::SensorEvent>(&content) {
+                            self.event_bus.send(event);
+                            let _ = std::fs::remove_file(&path);
+                            tracing::info!(file = ?path, "drained parked summon");
+                        }
                     }
                 }
             }

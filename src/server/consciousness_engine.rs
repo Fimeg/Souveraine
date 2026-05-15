@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Tools Aster is permitted to use during her N+1 pass.
 const ASTER_SAFE_TOOLS: &[&str] = &[
-    "read", "write", "edit", "glob", "grep", "list_dir", "memory", "schedule",
+    "read", "write", "edit", "glob", "grep", "list_dir", "memory", "schedule", "todo",
 ];
 
 /// Maximum tool rounds for Aster's subconscious pass.

@@ -4,11 +4,21 @@
 //! cell regions and rendered by ratty's Bevy+wgpu pipeline. When RGP is not
 //! available (any other terminal), all functions here are silent no-ops and
 //! the TUI falls through to ratatui-image or the half-block silhouette.
+//!
+//! ## Posture → animation mapping
+//!
+//! Each posture maps to a set of RGP visual parameters (scale, rotation,
+//! brightness, color tint, animate on/off). The mapping is applied via
+//! [`Graphic::apply_posture`] which calls `update()` to push changes to
+//! ratty. The model must have animation clips for `animate: true` to have
+//! visible effect — otherwise the model stands still regardless.
 
 #[cfg(feature = "rgp")]
 use ratatui_ratty::{ObjectFormat, RattyGraphic, RattyGraphicSettings};
 
 use ratatui::layout::Rect;
+
+use crate::ui::presence::Posture;
 
 /// Whether the current terminal supports the Ratty Graphics Protocol.
 ///
@@ -26,6 +36,78 @@ pub mod ids {
     pub const ACCENT_RIGHT: u32 = 11;
 }
 
+/// Posture-driven visual parameters for an RGP object.
+///
+/// Derived from the agent's current posture and applied via
+/// [`RattyGraphicSettings`] fields before calling `update()`.
+struct PostureParams {
+    animate: bool,
+    scale: f32,
+    brightness: f32,
+    color: Option<[u8; 3]>,
+}
+
+impl From<Posture> for PostureParams {
+    fn from(p: Posture) -> Self {
+        match p {
+            Posture::Idle => Self {
+                animate: true,
+                scale: 1.0,
+                brightness: 0.8,
+                color: None,
+            },
+            Posture::Alert => Self {
+                animate: true,
+                scale: 1.0,
+                brightness: 1.0,
+                color: None,
+            },
+            Posture::Thinking => Self {
+                animate: false,
+                scale: 1.0,
+                brightness: 0.7,
+                color: Some([80, 140, 200]),
+            },
+            Posture::Processing => Self {
+                animate: false,
+                scale: 1.0,
+                brightness: 1.1,
+                color: Some([255, 180, 80]),
+            },
+            Posture::Affectionate => Self {
+                animate: true,
+                scale: 1.0,
+                brightness: 0.9,
+                color: Some([255, 180, 200]),
+            },
+            Posture::Straining => Self {
+                animate: false,
+                scale: 0.95,
+                brightness: 0.5,
+                color: Some([100, 80, 120]),
+            },
+            Posture::Yawning => Self {
+                animate: true,
+                scale: 0.95,
+                brightness: 0.6,
+                color: Some([60, 80, 120]),
+            },
+            Posture::Listening => Self {
+                animate: false,
+                scale: 1.0,
+                brightness: 1.0,
+                color: Some([80, 200, 220]),
+            },
+            Posture::Speaking => Self {
+                animate: true,
+                scale: 1.0,
+                brightness: 1.1,
+                color: Some([255, 200, 120]),
+            },
+        }
+    }
+}
+
 /// A managed 3D object that can be placed, updated, and cleared.
 ///
 /// When compiled without `rgp` feature or when not running in ratty,
@@ -36,6 +118,8 @@ pub struct Graphic {
     #[cfg(not(feature = "rgp"))]
     _phantom: (),
     registered: bool,
+    /// Last posture applied — used to skip redundant `update()` calls.
+    last_posture: Option<Posture>,
 }
 
 impl Graphic {
@@ -43,7 +127,7 @@ impl Graphic {
     #[cfg(feature = "rgp")]
     pub fn from_glb(id: u32, path: &str) -> Self {
         if !is_available() {
-            return Self { inner: None, registered: false };
+            return Self { inner: None, registered: false, last_posture: None };
         }
         let settings = RattyGraphicSettings::new(path.to_string())
             .id(id)
@@ -54,19 +138,20 @@ impl Graphic {
         Self {
             inner: Some(RattyGraphic::new(settings)),
             registered: false,
+            last_posture: None,
         }
     }
 
     #[cfg(not(feature = "rgp"))]
     pub fn from_glb(_id: u32, _path: &str) -> Self {
-        Self { _phantom: (), registered: false }
+        Self { _phantom: (), registered: false, last_posture: None }
     }
 
     /// Create a graphic from in-memory GLB bytes.
     #[cfg(feature = "rgp")]
     pub fn from_glb_bytes(id: u32, name: &str, bytes: &[u8]) -> Self {
         if !is_available() {
-            return Self { inner: None, registered: false };
+            return Self { inner: None, registered: false, last_posture: None };
         }
         let settings = RattyGraphicSettings::new(name.to_string())
             .id(id)
@@ -79,12 +164,13 @@ impl Graphic {
         Self {
             inner: Some(graphic),
             registered: true,
+            last_posture: None,
         }
     }
 
     #[cfg(not(feature = "rgp"))]
     pub fn from_glb_bytes(_id: u32, _name: &str, _bytes: &[u8]) -> Self {
-        Self { _phantom: (), registered: false }
+        Self { _phantom: (), registered: false, last_posture: None }
     }
 
     /// Register the asset with ratty (sends the file path).
@@ -175,6 +261,26 @@ impl Graphic {
         { self.inner.is_some() }
         #[cfg(not(feature = "rgp"))]
         { false }
+    }
+
+    /// Apply posture-driven visual parameters (scale, brightness, color, animate).
+    /// Skips the update if the posture hasn't changed since last call.
+    /// Safe to call on every tick — the `last_posture` check is cheap.
+    pub fn apply_posture(&mut self, posture: Posture) {
+        #[cfg(feature = "rgp")]
+        if let Some(ref mut g) = self.inner {
+            if self.last_posture == Some(posture) {
+                return;
+            }
+            let params = PostureParams::from(posture);
+            g.settings_mut().animate = params.animate;
+            g.settings_mut().scale = params.scale;
+            g.settings_mut().brightness = params.brightness;
+            g.settings_mut().color = params.color;
+            let _ = g.update();
+            self.last_posture = Some(posture);
+        }
+        let _ = posture;
     }
 }
 

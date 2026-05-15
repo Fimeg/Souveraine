@@ -25,7 +25,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::core::config::ConsciousnessConfig;
 use crate::ui::chat::{ChatState, draw as draw_chat};
@@ -33,6 +33,7 @@ use crate::ui::cockpit_panel::CockpitPane;
 use crate::ui::presence::{Posture, Presence, draw_overlay as draw_presence_overlay};
 use crate::ui::color_support::rgb;
 use crate::ui::component::{Component, Scene, SceneLayout, TuiEvent};
+use crate::ui::setup::{SetupFlow, SetupState};
 use crate::backend::BackendEvent;
 use crate::ui::settings::SettingsAction;
 
@@ -45,6 +46,10 @@ pub struct App {
     current_screen: Screen,
     splash_start: Instant,
     menu_selected: usize,
+    /// Setup wizard state (None = wizard not active).
+    setup_state: Option<SetupState>,
+    /// Advisory hint shown on the Welcome screen (from BootstrapPlan).
+    welcome_hint: Option<String>,
     agent_status: AgentStatus,
     should_quit: bool,
     config: Arc<RwLock<ConsciousnessConfig>>,
@@ -145,6 +150,8 @@ pub struct App {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Screen {
     Splash,
+    /// First-run setup wizard — parameterized by which flow we're in.
+    Setup,
     /// Home screen — dashboard data, portrait, and menu in one place.
     Welcome,
     Chat,
@@ -218,6 +225,8 @@ impl App {
             current_screen: Screen::Splash,
             splash_start: Instant::now(),
             menu_selected: 0,
+            setup_state: None,
+            welcome_hint: None,
             agent_status: AgentStatus { name: agent_pref.clone(), ..AgentStatus::default() },
             should_quit: false,
             config,
@@ -306,10 +315,34 @@ impl App {
         }
     }
 
-    /// Select an agent as the primary companion
+    /// Detach the UI from the current agent and attach to another.
+    /// The agent itself keeps running — this only tears down the view
+    /// layer so each subsystem reconnects fresh on next entry.
     pub fn select_agent(&mut self, agent_name: &str) {
+        let changed = self.agent_pref != agent_name;
         self.agent_pref = agent_name.to_string();
         self.agent_status.name = agent_name.to_string();
+
+        if changed {
+            self.chat = None;
+            self.chat_error = None;
+            self.settings = None;
+            self.schedules = None;
+            self.presence = Presence::new(agent_name);
+            self.image_protocol = None;
+            self.rgp_portrait = None;
+
+            self.voice_capture = None;
+            self.voice_tts_rx = None;
+            self.voice_stt_rx = None;
+            self.voice_last_synthesized = None;
+            self.voice_waveform.clear();
+            self.voice_last_tts_text = None;
+            self.voice_last_tts_bytes = None;
+            self.voice_last_transcript = None;
+            self.tts_last_text = None;
+        }
+
         self.dispatch(TuiEvent::AgentSelected(agent_name.to_string()));
     }
 
@@ -482,6 +515,13 @@ impl App {
                 self.advance_voice_pipeline().await;
             }
 
+            // ── Setup wizard model fetch ────────────────────────────────
+            if self.current_screen == Screen::Setup {
+                if let Some(ref mut setup) = self.setup_state {
+                    setup.poll_models();
+                }
+            }
+
             // ── Settings model fetch ─────────────────────────────────────
             if self.current_screen == Screen::Settings {
                 if let Some(view) = self.settings.as_mut() {
@@ -491,9 +531,7 @@ impl App {
 
             if self.current_screen == Screen::Splash {
                 if self.splash_start.elapsed() > Duration::from_secs(8) {
-                    self.refresh_dashboard().await;
-                    self.current_screen = Screen::Welcome;
-                    self.dispatch(TuiEvent::ScreenChanged(Screen::Welcome));
+                    self.transition_from_splash().await;
                 }
             }
         }
@@ -512,9 +550,27 @@ impl App {
     async fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
         match self.current_screen {
             Screen::Splash => {
-                self.refresh_dashboard().await;
-                self.current_screen = Screen::Welcome;
-                self.dispatch(TuiEvent::ScreenChanged(Screen::Welcome));
+                self.transition_from_splash().await;
+            }
+            Screen::Setup => {
+                // Capture the setup_complete and step_was_welcome flags before
+                // calling any method that borrows self.setup_state, to avoid a
+                // borrow conflict with finish_setup() taking &mut self.
+                let should_skip = matches!(key.code, KeyCode::Esc);
+                let step_is_welcome = self.setup_state.as_ref()
+                    .map(|s| s.step == crate::ui::setup::SetupStep::Welcome)
+                    .unwrap_or(false);
+
+                if should_skip && step_is_welcome {
+                    self.finish_setup().await;
+                    return;
+                }
+                if let Some(ref mut setup) = self.setup_state {
+                    setup.handle_key(key);
+                }
+                if self.setup_state.as_ref().map(|s| s.complete).unwrap_or(false) {
+                    self.finish_setup().await;
+                }
             }
             Screen::Welcome => {
                 match key.code {
@@ -1033,15 +1089,33 @@ impl App {
             }
         }
 
+        // ── Esc overlay (interrupt-or-leave) ──────────────
+        if chat.show_esc_overlay && chat.busy {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('c') => {
+                    // Hide overlay, stay in chat, turn keeps running.
+                    chat.show_esc_overlay = false;
+                    return;
+                }
+                KeyCode::Char('i') => {
+                    chat.raise_hand();
+                    chat.show_esc_overlay = false;
+                    return;
+                }
+                KeyCode::Char('m') => {
+                    chat.show_esc_overlay = false;
+                    self.current_screen = Screen::Welcome;
+                    return;
+                }
+                _ => return, // block all other keys while overlay is up
+            }
+        }
+
         // Normal chat key handling.
         match key.code {
             KeyCode::Esc => {
-                // Esc during a turn → interrupt the agent (substrate signal,
-                // not a hard kill — current tool completes, partial text is
-                // preserved with *[interrupted]*). Esc when idle → back to
-                // Welcome as before.
                 if chat.busy {
-                    chat.interrupt();
+                    chat.show_esc_overlay = !chat.show_esc_overlay;
                 } else {
                     self.current_screen = Screen::Welcome;
                 }
@@ -1085,11 +1159,9 @@ impl App {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true;
             }
-            // `t` when the input is empty toggles whether tool cards render
-            // collapsed (compact gestures) or expanded (full witness). When
-            // input has content, `t` falls through to the printable-char
-            // branch so the user can type the letter normally.
-            KeyCode::Char('t') if chat.input.is_empty() => {
+            // `Ctrl+t` toggles whether tool cards render collapsed or expanded.
+            // Not plain `t` — that would block starting sentences with "t".
+            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 chat.tool_cards_expanded = !chat.tool_cards_expanded;
             }
             KeyCode::Char(c) => {
@@ -1206,6 +1278,78 @@ impl App {
         crate::ui::schedules::SchedulesView::new(self.agent_pref.clone(), dir)
     }
 
+    /// Detect what state the installation is in using the BootstrapPlan.
+    async fn transition_from_splash(&mut self) {
+        let home = dirs::home_dir().unwrap_or_default();
+        let probe = crate::core::bootstrap::gather_probe(&home);
+        let plan = crate::core::bootstrap::BootstrapPlan::plan(&probe);
+
+        for phase in &plan.phases {
+            match phase {
+                crate::core::bootstrap::BootstrapPhase::SetupWizard(flow) => {
+                    // No default model — let user type or fetch from Bifrost.
+                    self.setup_state = Some(SetupState::new(*flow, ""));
+                    self.current_screen = Screen::Setup;
+                    self.dispatch(TuiEvent::ScreenChanged(Screen::Setup));
+                    return;
+                }
+                crate::core::bootstrap::BootstrapPhase::ShowHint(hint) => {
+                    // Store the hint for display on the Welcome screen.
+                    // The dashboard reads it from a field we'll add below.
+                    self.welcome_hint = Some(hint.clone());
+                }
+                _ => {}
+            }
+        }
+
+        // Default: go to Welcome dashboard
+        self.refresh_dashboard().await;
+        self.current_screen = Screen::Welcome;
+        self.dispatch(TuiEvent::ScreenChanged(Screen::Welcome));
+    }
+
+    /// Called when the setup wizard completes or user skips to dashboard.
+    /// If the wizard collected an agent name, creates the agent via LocalBackend.
+    async fn finish_setup(&mut self) {
+        use crate::backend::LocalBackend;
+
+        if let Some(ref mut setup) = self.setup_state.take() {
+            // If the wizard got far enough to name an agent, create it.
+            if !setup.agent_name.is_empty() && !setup.complete {
+                // Agent was configured but setup was skipped mid-way (Esc from Welcome)
+                // — don't create, just go to dashboard.
+            } else if setup.complete && !setup.agent_name.is_empty() && setup.created_agent_id.is_none() {
+                // Create the agent via LocalBackend
+                match LocalBackend::new(self.config.read().await.clone()).await {
+                    Ok(backend) => {
+                        let request = setup.build_create_request();
+                        match backend.server_agents().create(request).await {
+                            Ok(agent) => {
+                                setup.created_agent_id = Some(agent.id.clone());
+                                self.agent_pref = agent.name.clone();
+                                info!("setup wizard created agent {} ({})", agent.name, agent.id);
+                            }
+                            Err(e) => {
+                                setup.creation_error = Some(e.to_string());
+                                warn!("setup wizard agent creation failed: {}", e);
+                                // Still continue to dashboard — user can retry there
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("setup wizard backend init failed: {}", e);
+                    }
+                }
+            }
+        }
+
+        self.setup_state = None;
+        self.welcome_hint = None;
+        self.refresh_dashboard().await;
+        self.current_screen = Screen::Welcome;
+        self.dispatch(TuiEvent::ScreenChanged(Screen::Welcome));
+    }
+
     /// Best-effort fetch of dashboard data from whichever backend is reachable.
     /// Local mode also pulls recent git commits from the agent's memory repo.
     async fn refresh_dashboard(&mut self) {
@@ -1285,6 +1429,41 @@ impl App {
             if self.rgp_available {
                 let assets = repo.root().join("assets");
                 self.rgp_portrait = crate::ui::rgp::load_portrait_glb(&assets);
+            }
+
+            // Read energy balance from the agent's memfs. The file is written
+            // by the backend after every turn (write_energy_balance in local.rs).
+            // Parse the YAML frontmatter for generative/consumptive counts and
+            // seed the presence gauge so the TUI reflects real agent state.
+            let balance_path = repo.root().join("system").join("dynamic").join("energy-balance.md");
+            if let Ok(content) = std::fs::read_to_string(&balance_path) {
+                let mut gen: u32 = 0;
+                let mut con: u32 = 0;
+                let mut hot: u32 = 0;
+                let mut cold: u32 = 0;
+                if let Some(body) = content.strip_prefix("---\n") {
+                    if let Some(end) = body.find("\n---\n") {
+                        for line in body[..end].lines() {
+                            if let Some((key, val)) = line.split_once(':') {
+                                let key = key.trim();
+                                let val = val.trim().trim_matches('"');
+                                match key {
+                                    "generative" => gen = val.parse().unwrap_or(0),
+                                    "consumptive" => con = val.parse().unwrap_or(0),
+                                    "hot" => hot = val.parse().unwrap_or(0),
+                                    "cold" => cold = val.parse().unwrap_or(0),
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+                self.presence.volition = crate::ui::presence::VolitionGauge {
+                    generative: gen,
+                    consumptive: con,
+                    hot_desires: hot,
+                    cold_obligations: cold,
+                };
             }
         } else {
             self.agent_status.recent_activity = vec![
@@ -1457,6 +1636,7 @@ impl App {
         if self.voice_player.is_none() {
             match crate::ui::voice::VoicePlayer::new() {
                 Ok(player) => {
+                    tracing::info!("VoicePlayer opened — audio output ready");
                     self.voice_player = Some(player);
                 }
                 Err(e) => {
@@ -1647,6 +1827,7 @@ impl App {
 
             match result {
                 Ok(mp3_bytes) => {
+                    tracing::info!(bytes = mp3_bytes.len(), "TTS bytes received — attempting playback");
                     // Stash for replay/save
                     if let Some(text) = tts_text {
                         self.voice_last_tts_text = Some(text.clone());
@@ -1661,11 +1842,12 @@ impl App {
                             self.presence.set_posture(crate::ui::presence::Posture::Idle);
                         }
                     } else {
+                        tracing::warn!("TTS bytes ready but no VoicePlayer — audio device unavailable");
                         self.presence.set_posture(crate::ui::presence::Posture::Idle);
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("TTS failed: {}", e);
+                    tracing::warn!("TTS synthesis failed: {}", e);
                     self.presence.set_posture(crate::ui::presence::Posture::Idle);
                 }
             }
@@ -1745,6 +1927,8 @@ impl App {
                 // Guard: skip if we already synthesized this exact reply text.
                 let already_synthesized = self.voice_last_synthesized.as_deref() == Some(&reply);
                 if !already_synthesized {
+                    let preview = if reply.len() > 80 { &reply[..80] } else { &reply };
+                    tracing::info!(text = %preview, "TTS trigger — synthesizing reply");
                     self.voice_last_synthesized = Some(reply.clone());
 
                     let tts_url = self.voice_client.as_ref()
@@ -1814,6 +1998,13 @@ impl App {
             }
             Screen::Presence => self.draw_presence_mode_mut(frame),
             Screen::AgentsManager => self.draw_agent_cards_mut(frame),
+            Screen::Setup => {
+                if let Some(ref setup) = self.setup_state {
+                    setup.draw(frame);
+                } else {
+                    self.draw_placeholder(frame);
+                }
+            }
             _ => self.draw_placeholder(frame),
         }
 
@@ -2216,33 +2407,44 @@ impl App {
 
         let active_id = self.agent_id_by_name(&self.presence.name)
             .or_else(|| self.agent_id_by_name(&self.agent_pref));
-        let rendered = active_id.as_ref().and_then(|id| {
-            let picker = self.image_picker.as_ref()?;
 
-            // Tier 1: cover-fill (scale-to-fill + top-crop). Always fills
-            // the portrait area regardless of aspect ratio. Cached per area.
-            if self.raw_card_images.contains_key(id) {
-                self.render_card_image_cover(frame, id, portrait_area);
-                return Some(true);
-            }
+        // Tier 0: RGP 3D portrait (ratty terminal only).
+        let rgp_rendered = if let Some(ref mut g) = self.rgp_portrait {
+            if g.is_active() {
+                g.apply_posture(self.presence.posture);
+                g.render(portrait_area, frame.buffer_mut());
+                true
+            } else { false }
+        } else { false };
 
-            // Tier 2: expression/animated frames. Only hits if expressions/
-            // directory exists. Use Scale (proportional fit with upscale)
-            // rather than Crop (native-resolution clip).
-            let assets_dir = Self::agent_assets_dir(id)?;
-            let key = crate::ui::expressions::ExpressionKey::from_presence(&self.presence);
-            if let Some(proto) = self.expression_cache.resolve(id, key, picker, &assets_dir) {
-                frame.render_stateful_widget(
-                    StatefulImage::default().resize(Resize::Scale(None)),
-                    portrait_area,
-                    proto,
-                );
-                return Some(true);
-            }
+        let rendered = if rgp_rendered {
+            true
+        } else {
+            active_id.as_ref().and_then(|id| {
+                let picker = self.image_picker.as_ref()?;
 
-            None
-        });
-        if rendered.is_none() {
+                // Tier 1: cover-fill (scale-to-fill + top-crop).
+                if self.raw_card_images.contains_key(id) {
+                    self.render_card_image_cover(frame, id, portrait_area);
+                    return Some(true);
+                }
+
+                // Tier 2: expression/animated frames.
+                let assets_dir = Self::agent_assets_dir(id)?;
+                let key = crate::ui::expressions::ExpressionKey::from_presence(&self.presence);
+                if let Some(proto) = self.expression_cache.resolve(id, key, picker, &assets_dir) {
+                    frame.render_stateful_widget(
+                        StatefulImage::default().resize(Resize::Scale(None)),
+                        portrait_area,
+                        proto,
+                    );
+                    return Some(true);
+                }
+
+                None
+            }).is_some()
+        };
+        if !rendered {
             let scale = (portrait_area.width / portrait::PORTRAIT_W)
                 .min((2 * portrait_area.height) / portrait::PORTRAIT_H)
                 .max(1);
@@ -2524,8 +2726,9 @@ impl App {
         frame.render_widget(double_block, portrait_chunk);
 
         // Tier 0: RGP 3D portrait (ratty terminal only).
-        let rgp_rendered = if let Some(ref g) = self.rgp_portrait {
+        let rgp_rendered = if let Some(ref mut g) = self.rgp_portrait {
             if g.is_active() {
+                g.apply_posture(self.presence.posture);
                 g.render(photo_area, frame.buffer_mut());
                 true
             } else { false }

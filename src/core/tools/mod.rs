@@ -34,7 +34,7 @@ use self::list_dir::ListDir;
 use self::outfit::Outfit;
 use self::read::Read;
 use self::subagent::Subagent;
-use self::agent::Agent;
+use self::agent::{Reach, Consult};
 use self::atmosphere::Atmosphere;
 use self::schedule::Schedule;
 use self::todo::Todo;
@@ -88,7 +88,8 @@ impl Sensorium {
                 Box::new(ListDir),
                 Box::new(Subagent),
                 Box::new(Atmosphere),
-                Box::new(Agent),
+                Box::new(Reach),
+                Box::new(Consult),
                 Box::new(Todo),
                 Box::new(Schedule),
             ],

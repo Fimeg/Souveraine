@@ -184,6 +184,19 @@ enum Commands {
         port: Option<u16>,
     },
 
+    /// Run as a lite listener — minimal presence, wakes the full engine on summon
+    #[command(long_about = "Start a lightweight listener: federation transport and the \
+summon endpoint only, no agents or database loaded. It receives reach/consult requests \
+and — with [federation].auto_wake — spawns the full server to answer them.")]
+    Listen {
+        /// Bind address (overrides [server].bind)
+        #[arg(short, long)]
+        bind: Option<String>,
+        /// Port to listen on (overrides [server].port)
+        #[arg(short, long)]
+        port: Option<u16>,
+    },
+
     /// Manage stored credentials
     Auth {
         #[command(subcommand)]
@@ -383,6 +396,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Status => run_status(config, cli.json).await?,
         Commands::Server { bind, port } => run_server(bind.clone(), *port, config).await?,
+        Commands::Listen { bind, port } => run_listen(bind.clone(), *port, config).await?,
         Commands::Reflect { conversation } => {
             run_reflect(config, cli.agent.clone(), conversation.clone(), cli.json).await?
         }
@@ -1190,6 +1204,27 @@ async fn run_status(config: Arc<RwLock<ConsciousnessConfig>>, json: bool) -> any
         println!("  Models known:  {}", cfg.models.len());
         println!();
     }
+    Ok(())
+}
+
+async fn run_listen(
+    bind_override: Option<String>,
+    port_override: Option<u16>,
+    config: Arc<RwLock<ConsciousnessConfig>>,
+) -> anyhow::Result<()> {
+    let cfg = config.read().await.clone();
+    let bind = bind_override.unwrap_or_else(|| cfg.server.bind.clone());
+    let port = port_override.unwrap_or(cfg.server.port);
+    let base = dirs::home_dir().unwrap_or_default().join(".souveraine");
+
+    let listener = server::listener::LiteListener::new(&cfg.federation, base)?;
+    let app = server::listener::create_routes_lite(listener);
+
+    let addr = format!("{bind}:{port}");
+    println!("Souveraine lite listener on http://{addr}");
+    info!("lite listener starting on {addr}");
+    let tcp = tokio::net::TcpListener::bind(&addr).await?;
+    axum::serve(tcp, app.into_make_service()).await?;
     Ok(())
 }
 

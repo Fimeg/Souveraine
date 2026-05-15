@@ -167,6 +167,44 @@ async fn build_memory_orientation(memory_root: &Path) -> String {
     )
 }
 
+/// Federation posture — names the `federation/` memfs contract so she knows
+/// which devices she runs on, who may summon her, and how reach/consult work.
+/// No `federation/` directory means no section — the absence is information.
+async fn build_federation_posture(memory_root: &Path) -> String {
+    let fed_dir = memory_root.join("federation");
+    if !fed_dir.exists() {
+        return String::new();
+    }
+
+    let mut present: Vec<String> = Vec::new();
+    for name in [
+        "authorized-devices.md",
+        "authorized-summoners.md",
+        "device-schedules.md",
+        "peer-map.md",
+    ] {
+        if fed_dir.join(name).exists() {
+            present.push(format!("`federation/{name}`"));
+        }
+    }
+    let files_line = if present.is_empty() {
+        "You have no `federation/` files yet — create them to declare your posture.".to_string()
+    } else {
+        format!("Your federation posture lives in: {}.", present.join(", "))
+    };
+
+    format!(
+        "## Federation\n\n\
+         You can exist across machines. Two tools cross that distance:\n\
+         - `reach` — extend yourself onto another of your own devices (same seed, same memory).\n\
+         - `consult` — ask a different being, a sovereign peer, for help in their arena.\n\n\
+         Neither blocks. You fire the request and turn back to what's in front of you; \
+         the answer surfaces later in your inbox — `pending` for reach, `intrusive` for \
+         consult — or a timeout does. {files_line} `authorized-summoners.md` is your \
+         consent floor: only the seed_ids you list there may `consult` you."
+    )
+}
+
 async fn collect_dirs(base: &Path, current: &Path, out: &mut Vec<String>) {
     let Ok(mut entries) = tokio::fs::read_dir(current).await else {
         return;
@@ -339,11 +377,36 @@ pub async fn build_system_prompt_full(
     // discover compaction by accident.
     sections.push(BODY_ORIENTATION.to_string());
 
+    // 5a₁. Energy balance — a one-line body reading of her generative /
+    // consumptive state. The file is written by the backend after every turn
+    // (write_energy_balance in local.rs). No file = no section — the
+    // absence is information too.
+    let energy_path = memory_root.join("system").join("dynamic").join("energy-balance.md");
+    if let Ok(content) = tokio::fs::read_to_string(&energy_path).await {
+        if let Some(body) = content.strip_prefix("---\n") {
+            if let Some(end) = body.find("\n---\n") {
+                // The last line of the file body (after frontmatter) has the prose.
+                // That's the line the agent reads — structured data is for the TUI.
+                let prose_line = content[end + 6..].lines().find(|l| !l.trim().is_empty() && !l.starts_with('#'));
+                if let Some(line) = prose_line {
+                    sections.push(format!("## Energy Balance\n\n{line}"));
+                }
+            }
+        }
+    }
+
     // 5b. Subconscious channel — name the inner-voice file, pending inbox,
     // and (when reachable) a glimpse of the subconscious's ledger.
     let subconscious_channel = build_subconscious_channel(memory_root, subconscious_root).await;
     if !subconscious_channel.is_empty() {
         sections.push(subconscious_channel);
+    }
+
+    // 5c. Federation posture — her reach/consult tools and the federation/
+    // memfs contract, when she has one.
+    let federation_posture = build_federation_posture(memory_root).await;
+    if !federation_posture.is_empty() {
+        sections.push(federation_posture);
     }
 
     // 6. Skills

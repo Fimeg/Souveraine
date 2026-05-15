@@ -82,6 +82,10 @@ impl DeviceRegistry {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
                 let now = Utc::now();
+                // Preserve the original first_seen across re-announces.
+                let first_seen = self.peers.get(&seed_id)
+                    .map(|e| e.first_seen)
+                    .unwrap_or(now);
                 let was_new = !self.peers.contains_key(&seed_id);
                 self.peers.insert(
                     seed_id.clone(),
@@ -89,7 +93,7 @@ impl DeviceRegistry {
                         seed_id: seed_id.clone(),
                         label,
                         url,
-                        first_seen: now,
+                        first_seen,
                         last_seen: now,
                         alive: true,
                     },
@@ -121,6 +125,21 @@ impl DeviceRegistry {
         let mut entries: Vec<PeerEntry> = self.peers.iter().map(|e| e.value().clone()).collect();
         entries.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
         entries
+    }
+
+    /// Mark peers not heard from within `max_age_secs` as offline.
+    pub fn prune_stale(&self, max_age_secs: i64) {
+        let cutoff = Utc::now() - chrono::Duration::seconds(max_age_secs);
+        let mut changed = false;
+        for mut entry in self.peers.iter_mut() {
+            if entry.alive && entry.last_seen < cutoff {
+                entry.alive = false;
+                changed = true;
+            }
+        }
+        if changed {
+            self.persist();
+        }
     }
 
     /// Persist known peers to disk (for CLI access).

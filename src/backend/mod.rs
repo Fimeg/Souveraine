@@ -101,6 +101,9 @@ pub enum BackendEvent {
     /// Agent changed her outfit. The string is the outfit name (a subdirectory
     /// under `expressions/`). Empty string clears to default expressions.
     Outfit(String),
+    /// Text the model produced alongside tool calls — her narration between
+    /// gestures. Rendered in italics, quieter than a full assistant message.
+    Interstitial(String),
     /// The backend is alive but producing no content (waiting on provider,
     /// between tool rounds, processing). The TUI resets `last_event_at`
     /// on this the same way it does for `Token` — it's a liveness signal.
@@ -148,7 +151,7 @@ pub trait Backend: Send + Sync {
 
     /// Send with a cancellation token. The token is a signal, not enforcement —
     /// when fired, the backend lets the current tool finish, stops making new
-    /// LLM calls, and commits any partial assistant text with a `*[interrupted]*`
+    /// LLM calls, and commits any partial assistant text with a `*[raised hand]*`
     /// marker so the agent reads the interrupt in her own history on the next
     /// turn. Default impl ignores the token (used by RemoteBackend until SSE
     /// cancellation lands); LocalBackend overrides.

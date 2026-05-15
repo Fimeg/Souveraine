@@ -274,6 +274,9 @@ pub enum ChatMessage {
     /// distinct chevron so the user sees their interjection landed in
     /// the stream, separate from a normal /user turn.
     Interjection { text: String, ts: Instant, delivered: bool },
+    /// Text the model produced alongside tool calls — her narration between
+    /// gestures. Rendered in italics, quieter than a full assistant message.
+    Interstitial(String),
     /// Tool invocation card — name, arguments, round, plus an attached result
     /// once it streams back. `expanded` is reserved for click-to-expand (UI
     /// interactivity lands as part of message-click work).
@@ -336,9 +339,12 @@ pub struct ChatState {
     /// Cancellation handle for the current in-flight turn. Esc fires this;
     /// the backend treats it as a signal (Constitution VI.1 — substrate, not
     /// harness) — the current tool completes, no further LLM calls, partial
-    /// text is preserved with `*[interrupted]*` appended.
+    /// text is preserved with `*[raised hand]*` appended.
     pub cancel_token: Option<CancellationToken>,
     pub busy: bool,
+    /// When busy and user presses Esc once: shows dialog asking whether to
+    /// raise hand or leave running in the background.
+    pub show_esc_overlay: bool,
     /// Number of tool calls in the active turn — drives the phase strip's
     /// "N tools used" counter. Reset to zero at every `submit()`.
     pub tool_calls_this_turn: u32,
@@ -377,6 +383,8 @@ pub struct ChatState {
     pub convos_rx: Option<oneshot::Receiver<Result<Vec<crate::backend::ConversationInfo>>>>,
     /// Pending conversation switch result (conv_id, messages).
     pub switch_rx: Option<oneshot::Receiver<Result<(String, Vec<crate::core::session::ConversationMessage>)>>>,
+    /// Conversation ID waiting for the current turn to finalize before loading.
+    pub switch_pending: Option<String>,
     /// `/btw` fork state — an ephemeral side-quest conversation running
     /// in parallel to the main chat. Rendered as a floating bordered pane.
     pub btw_state: BtwState,
@@ -475,9 +483,11 @@ impl ChatState {
             new_conv_rx: None,
             convos_rx: None,
             switch_rx: None,
+            switch_pending: None,
             btw_state: BtwState::Idle,
             btw_rx: None,
             tool_cards_expanded: false,
+            show_esc_overlay: false,
             render_mode: ChatMode::Conversation,
             palette: ChatPalette::default(),
         })
@@ -497,7 +507,7 @@ impl ChatState {
   /outfit <name>     Change agent's outfit (empty to reset)
   !<command>         Run a shell command (Linux/macOS)
 
-Esc during a turn interrupts (signal, not kill — she sees *[interrupted]*).
+Esc during a turn shows the raise-hand dialog (signal, not kill — she sees *[raised hand]*).
 You can also type while she works — Enter raises your hand (she sees it next round).
 Tab toggles the cockpit pane. `t` (on empty input) toggles tool expansion.";
 
@@ -722,14 +732,16 @@ Tab toggles the cockpit pane. `t` (on empty input) toggles tool expansion.";
     }
 
     fn handle_switch_conversation(&mut self, conversation_id: String) {
-        // If a turn is in flight, cancel it cleanly before switching. The
-        // cancel token propagates to the backend which appends *[interrupted]*
-        // and commits the partial output to git — so nothing is lost.
         if self.busy {
-            self.interrupt();
-            self.system_message("Interrupted active turn — partial output saved.".to_string());
+            self.raise_hand();
+            self.system_message("Signalled active turn — switching when it finalizes.".to_string());
+            self.switch_pending = Some(conversation_id);
+            return;
         }
+        self.initiate_switch_load(conversation_id);
+    }
 
+    fn initiate_switch_load(&mut self, conversation_id: String) {
         let backend = self.backend.clone();
         let conv_id = conversation_id.clone();
         let (tx, rx) = oneshot::channel();
@@ -864,7 +876,7 @@ Tab toggles the cockpit pane. `t` (on empty input) toggles tool expansion.";
     /// Walk the message list and mark any interjections as `delivered`
     /// once the shared queue has been drained by the backend. Called at
     /// the top of `drain_events` so the UI flips from `✋ hand raised`
-    /// to `✋ noticed` as soon as the agent has read the interruption.
+    /// to `✋ noticed` as soon as the agent has read the signal.
     fn flush_delivered_interjections(&mut self) {
         let queue_empty = self
             .pending_interjections
@@ -1172,6 +1184,9 @@ Tab toggles the cockpit pane. `t` (on empty input) toggles tool expansion.";
                 BackendEvent::Outfit(name) => {
                     self.pending_consciousness.push(BackendEvent::Outfit(name));
                 }
+                BackendEvent::Interstitial(text) => {
+                    self.messages.push(ChatMessage::Interstitial(text));
+                }
                 BackendEvent::Keepalive => {
                     // Liveness signal — no visual change, just resets the
                     // event timer so the liveness label stays calm.
@@ -1184,6 +1199,9 @@ Tab toggles the cockpit pane. `t` (on empty input) toggles tool expansion.";
                     self.cancel_token = None;
                     self.phase = TurnPhase::Idle;
                     self.tool_calls_this_turn = 0;
+                    if let Some(conv_id) = self.switch_pending.take() {
+                        self.initiate_switch_load(conv_id);
+                    }
                     return;
                 }
             }
@@ -1197,15 +1215,18 @@ Tab toggles the cockpit pane. `t` (on empty input) toggles tool expansion.";
             self.cancel_token = None;
             self.phase = TurnPhase::Idle;
             self.tool_calls_this_turn = 0;
+            if let Some(conv_id) = self.switch_pending.take() {
+                self.initiate_switch_load(conv_id);
+            }
         }
 
     }
 
-    /// User pressed Esc during a turn. Fire the cancel token — the backend
-    /// reads it as a signal, lets the current tool complete, stops making
-    /// new LLM calls, and commits partial text with `*[interrupted]*` so
-    /// the agent reads it on her next turn. Not a hard kill.
-    pub fn interrupt(&mut self) {
+    /// User pressed `i` on the Esc overlay during a turn. Fire the cancel
+    /// token — the backend reads it as a signal, lets the current tool
+    /// complete, stops making new LLM calls, and commits partial text with
+    /// `*[raised hand]*` so the agent reads it on her next turn. Not a hard kill.
+    pub fn raise_hand(&mut self) {
         if let Some(token) = &self.cancel_token {
             if !token.is_cancelled() {
                 token.cancel();
@@ -1451,8 +1472,13 @@ Tab toggles the cockpit pane. `t` (on empty input) toggles tool expansion.";
     }
 
     fn finalize_streaming(&mut self) {
-        if let Some(ChatMessage::Assistant { streaming, .. }) = self.messages.last_mut() {
-            *streaming = false;
+        for msg in self.messages.iter_mut().rev() {
+            if let ChatMessage::Assistant { streaming, .. } = msg {
+                if *streaming {
+                    *streaming = false;
+                    return;
+                }
+            }
         }
     }
 }
@@ -1511,6 +1537,11 @@ pub fn draw(f: &mut Frame, state: &ChatState) {
     // /btw fork pane renders on top of everything, floating over the body.
     if !matches!(state.btw_state, BtwState::Idle) {
         draw_btw_pane(f, state, area);
+    }
+
+    // Esc overlay — shows when user presses Esc during a busy turn.
+    if state.show_esc_overlay {
+        draw_esc_overlay(f, state, area);
     }
 }
 
@@ -1666,16 +1697,29 @@ fn draw_messages(f: &mut Frame, state: &ChatState, area: Rect) {
                 lines.push(Line::from(""));
             }
             ChatMessage::Surfacing { source, content, priority, .. } => {
-                let label = format!("surfacing · {} · {}", source, priority);
-                lines.extend(bubble(
-                    &label,
-                    content,
-                    max_bubble.min(60),
-                    Style::default().fg(state.palette.surfacing),
-                    BubbleAlign::Center,
-                    area.width,
-                ));
-                lines.push(Line::from(""));
+                if priority == "low" {
+                    let brief = if content.len() > 90 {
+                        format!("{}…", &content[..content.floor_char_boundary(87)])
+                    } else {
+                        content.clone()
+                    };
+                    lines.push(Line::from(Span::styled(
+                        format!("  · [{}] {}", source, brief),
+                        Style::default().fg(state.palette.surfacing).add_modifier(Modifier::ITALIC),
+                    )));
+                    lines.push(Line::from(""));
+                } else {
+                    let label = format!("surfacing · {} · {}", source, priority);
+                    lines.extend(bubble(
+                        &label,
+                        content,
+                        max_bubble.min(60),
+                        Style::default().fg(state.palette.surfacing),
+                        BubbleAlign::Center,
+                        area.width,
+                    ));
+                    lines.push(Line::from(""));
+                }
             }
             ChatMessage::System { text, .. } => {
                 lines.push(Line::from(Span::styled(
@@ -1720,6 +1764,15 @@ fn draw_messages(f: &mut Frame, state: &ChatState, area: Rect) {
                         Style::default().fg(color).add_modifier(Modifier::BOLD)),
                     Span::styled(text.clone(), Style::default().fg(color).add_modifier(Modifier::ITALIC)),
                 ]));
+                lines.push(Line::from(""));
+            }
+            ChatMessage::Interstitial(text) => {
+                lines.push(Line::from(
+                    Span::styled(
+                        format!("  ⟡ {} ", text),
+                        Style::default().fg(state.palette.agent_dim).add_modifier(Modifier::ITALIC),
+                    ),
+                ));
                 lines.push(Line::from(""));
             }
         }
@@ -2478,8 +2531,8 @@ fn draw_footer(f: &mut Frame, state: &ChatState, area: Rect) {
     let pressure_pct = (state.pressure * 100.0) as u16;
     let pressure_label = format!("ctx {}%", pressure_pct);
     let cockpit_hint = if state.cockpit { "Tab close cockpit" } else { "Tab cockpit" };
-    let tool_hint = if state.tool_cards_expanded { "t collapse tools" } else { "t expand tools" };
-    let esc_hint = if state.busy { "Esc interrupt" } else { "Esc menu" };
+    let tool_hint = if state.tool_cards_expanded { "^T collapse tools" } else { "^T expand tools" };
+    let esc_hint = "Esc menu";
     let posture_label = match state.render_mode {
         ChatMode::Conversation => "chat",
         ChatMode::Code => "code",
@@ -2514,4 +2567,38 @@ fn draw_footer(f: &mut Frame, state: &ChatState, area: Rect) {
 
 fn short(s: &str) -> String {
     if s.len() <= 8 { s.to_string() } else { s[..8].to_string() }
+}
+
+/// Floating dialog when user presses Esc during a busy turn.
+/// Lets them raise hand, go to Welcome while turn keeps running, or dismiss.
+fn draw_esc_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
+
+    let overlay_w = 28.min(area.width.saturating_sub(4));
+    let overlay_h = 7;
+    let ox = area.x + (area.width - overlay_w) / 2;
+    let oy = area.y + (area.height.saturating_sub(overlay_h)) / 2;
+    let overlay_area = Rect { x: ox, y: oy, width: overlay_w, height: overlay_h };
+
+    // Clear the area underneath
+    f.render_widget(Clear, overlay_area);
+
+    let pal = &state.palette;
+    let lines = vec![
+        Line::from(Span::styled(
+            " Turn in progress ",
+            Style::default().fg(pal.surfacing).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled("  [i]  Raise hand", Style::default().fg(pal.agent_primary))),
+        Line::from(Span::styled("  [m]  Menu", Style::default().fg(pal.user_accent))),
+        Line::from(Span::styled("  [c]  Cancel", Style::default().fg(pal.agent_dim))),
+    ];
+
+    let para = Paragraph::new(lines)
+        .alignment(Alignment::Left)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(pal.agent_dim)));
+    f.render_widget(para, overlay_area);
 }

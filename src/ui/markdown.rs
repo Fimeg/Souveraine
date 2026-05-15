@@ -799,9 +799,21 @@ impl<'a> Renderer<'a> {
 mod tests {
     use super::*;
 
+    fn test_palette() -> MarkdownPalette {
+        MarkdownPalette {
+            code_bg: Color::Rgb(30, 30, 40),
+            code_fg: Color::Rgb(200, 200, 200),
+            link_dim: Color::Rgb(100, 100, 140),
+            quote_bar: Color::Rgb(80, 80, 80),
+            heading: Color::Rgb(255, 200, 100),
+            bullet: Color::Rgb(150, 150, 150),
+        }
+    }
+
     #[test]
     fn renders_plain_paragraph() {
-        let lines = render("hello world", Color::White);
+        let mdpal = test_palette();
+        let lines = render("hello world", Color::White, &mdpal);
         assert!(!lines.is_empty());
         let joined: String = lines
             .iter()
@@ -812,7 +824,8 @@ mod tests {
 
     #[test]
     fn renders_inline_code() {
-        let lines = render("call `foo()` then", Color::White);
+        let mdpal = test_palette();
+        let lines = render("call `foo()` then", Color::White, &mdpal);
         let joined: String = lines
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
@@ -822,8 +835,9 @@ mod tests {
 
     #[test]
     fn renders_fenced_code_block_with_lang() {
+        let mdpal = test_palette();
         let md = "```rust\nfn main() {}\n```";
-        let lines = render(md, Color::White);
+        let lines = render(md, Color::White, &mdpal);
         let joined: String = lines
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
@@ -834,7 +848,8 @@ mod tests {
 
     #[test]
     fn renders_heading() {
-        let lines = render("# Big\n\nbody", Color::White);
+        let mdpal = test_palette();
+        let lines = render("# Big\n\nbody", Color::White, &mdpal);
         let joined: String = lines
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
@@ -845,7 +860,8 @@ mod tests {
 
     #[test]
     fn renders_bullet_list() {
-        let lines = render("- one\n- two", Color::White);
+        let mdpal = test_palette();
+        let lines = render("- one\n- two", Color::White, &mdpal);
         let joined: String = lines
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
