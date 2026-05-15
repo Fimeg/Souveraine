@@ -662,12 +662,41 @@ fn default_stale_timeout_secs() -> u64 { 90 }
 
 // ── Federation ──
 
+/// A machine's role in the federation.
+///
+/// - `Hearth` — where the agent lives. Full engine always up, the autonomous
+///   rhythm runs here, the memfs HEAD is authoritative. One per agent.
+/// - `Limb`   — a place she can reach to. At rest it's the lite listener; an
+///   authorized summon wakes the full engine, it acts, reports up, and rests.
+///   A limb does not run the general autonomous rhythm — that keeps one
+///   heartbeat at the hearth and no split-brain across machines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum FederationRole {
+    #[default]
+    Hearth,
+    Limb,
+}
+
+impl FederationRole {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Hearth => "hearth",
+            Self::Limb => "limb",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FederationConfig {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
     pub instance_label: Option<String>,
+    /// This machine's role — hearth (the agent's home) or limb (a place she
+    /// reaches to). Defaults to hearth: a standalone machine is its own home.
+    #[serde(default)]
+    pub role: FederationRole,
     /// Peers this instance federates with. Each peer connection is a signed
     /// WS stream to the peer's federation endpoint.
     #[serde(default)]
@@ -690,6 +719,7 @@ impl Default for FederationConfig {
         Self {
             enabled: false,
             instance_label: None,
+            role: FederationRole::Hearth,
             peers: Vec::new(),
             authorized_summoners: Vec::new(),
             auto_wake: false,

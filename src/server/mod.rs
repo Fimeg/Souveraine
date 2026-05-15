@@ -220,8 +220,9 @@ impl SouveraineServer {
             Err(_) => None,
         };
         let sb_for_device_reg = souveraine_base.clone();
+        let local_role = config.federation.role;
         let device_registry = local_seed_id.clone().map(|seed_id| {
-            let reg = Arc::new(DeviceRegistry::new(sb_for_device_reg, seed_id));
+            let reg = Arc::new(DeviceRegistry::new(sb_for_device_reg, seed_id, local_role));
             // Subscribe the registry to the event bus for live updates.
             let reg_clone = reg.clone();
             let mut rx = event_bus.subscribe();
@@ -311,6 +312,7 @@ impl SouveraineServer {
                         let mut bridge = federation::FederationBridge::new(
                             self.event_bus.clone(),
                             Arc::new(seed),
+                            fed.role,
                         );
                         for peer in fed.peers {
                             bridge.add_peer(peer);

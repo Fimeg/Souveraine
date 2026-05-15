@@ -6,7 +6,7 @@ use std::time::Duration;
 use futures::SinkExt;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::core::config::PeerConfig;
+use crate::core::config::{FederationRole, PeerConfig};
 use crate::core::identity::SeedId;
 use crate::core::nervous::{EventBus, SensorEvent};
 
@@ -20,14 +20,16 @@ use super::types::SignedEvent;
 pub struct FederationBridge {
     event_bus: EventBus,
     seed: Arc<SeedId>,
+    role: FederationRole,
     peers: Vec<PeerConfig>,
 }
 
 impl FederationBridge {
-    pub fn new(event_bus: EventBus, seed: Arc<SeedId>) -> Self {
+    pub fn new(event_bus: EventBus, seed: Arc<SeedId>, role: FederationRole) -> Self {
         Self {
             event_bus,
             seed,
+            role,
             peers: Vec::new(),
         }
     }
@@ -45,6 +47,7 @@ impl FederationBridge {
                 peer,
                 self.event_bus.clone(),
                 self.seed.clone(),
+                self.role,
             ));
         }
     }
@@ -52,7 +55,12 @@ impl FederationBridge {
 
 /// Connect to one peer and forward signed events, reconnecting with
 /// exponential backoff whenever the link drops.
-async fn peer_outbound_task(peer: PeerConfig, event_bus: EventBus, seed: Arc<SeedId>) {
+async fn peer_outbound_task(
+    peer: PeerConfig,
+    event_bus: EventBus,
+    seed: Arc<SeedId>,
+    role: FederationRole,
+) {
     let endpoint = federation_endpoint(&peer.url);
     let mut retry: u32 = 0;
 
@@ -73,6 +81,7 @@ async fn peer_outbound_task(peer: PeerConfig, event_bus: EventBus, seed: Arc<See
                         "federation_url": endpoint,
                         "label": None::<String>,
                         "pubkey": seed.public_key_hex(),
+                        "role": role.as_str(),
                     })),
                     seed_id: None,
                     reply_to: None,

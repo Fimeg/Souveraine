@@ -1,9 +1,14 @@
+use crate::core::config::FederationRole;
 use crate::core::nervous::SensorEvent;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
+
+fn default_role() -> String {
+    "hearth".to_string()
+}
 
 /// A peer device known to this federation. Updated on every `device_announce`
 /// and `device_leave` event from the peer's bridge.
@@ -15,6 +20,9 @@ pub struct PeerEntry {
     pub label: Option<String>,
     /// The peer's federation endpoint (ws://host:port).
     pub url: String,
+    /// The peer's federation role — "hearth" or "limb".
+    #[serde(default = "default_role")]
+    pub role: String,
     /// First time we saw this peer's announce.
     pub first_seen: DateTime<Utc>,
     /// Most recent announce.
@@ -30,12 +38,14 @@ pub struct DeviceRegistry {
     known_peers_path: PathBuf,
     /// This instance's own seed_id (pubkey hex) — filters self-announcements.
     local_seed_id: String,
+    /// This machine's role — used to detect a hearth/hearth split-brain.
+    local_role: FederationRole,
 }
 
 impl DeviceRegistry {
     /// `base_dir` = `~/.souveraine/`. The registry writes to
     /// `{base_dir}/federation/known_peers.json`.
-    pub fn new(base_dir: PathBuf, local_seed_id: String) -> Self {
+    pub fn new(base_dir: PathBuf, local_seed_id: String, local_role: FederationRole) -> Self {
         let fed_dir = base_dir.join("federation");
         let known_peers_path = fed_dir.join("known_peers.json");
         let peers = DashMap::new();
@@ -53,6 +63,7 @@ impl DeviceRegistry {
             peers,
             known_peers_path,
             local_seed_id,
+            local_role,
         }
     }
 
@@ -81,6 +92,24 @@ impl DeviceRegistry {
                     .and_then(|p| p.get("label"))
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
+                let role = event
+                    .payload
+                    .as_ref()
+                    .and_then(|p| p.get("role"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("hearth")
+                    .to_string();
+                // Split-brain guard: two hearths for one agent diverge memory.
+                // We refuse to auto-resolve — surface it loudly for the human.
+                if role == "hearth" && self.local_role == FederationRole::Hearth {
+                    tracing::error!(
+                        peer = %seed_id,
+                        "federation: HEARTH CONFLICT — this machine and {} both \
+                         claim hearth. Only one machine should be the hearth; \
+                         set [federation].role = \"limb\" on one of them.",
+                        seed_id,
+                    );
+                }
                 let now = Utc::now();
                 // Preserve the original first_seen across re-announces.
                 let first_seen = self.peers.get(&seed_id)
@@ -93,6 +122,7 @@ impl DeviceRegistry {
                         seed_id: seed_id.clone(),
                         label,
                         url,
+                        role,
                         first_seen,
                         last_seen: now,
                         alive: true,

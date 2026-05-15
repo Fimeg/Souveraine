@@ -74,7 +74,7 @@ impl LiteListener {
 
         // Outbound federation bridge — so this instance can also reach peers.
         if !config.peers.is_empty() {
-            let mut bridge = FederationBridge::new(event_bus.clone(), Arc::new(seed));
+            let mut bridge = FederationBridge::new(event_bus.clone(), Arc::new(seed), config.role);
             for peer in &config.peers {
                 bridge.add_peer(peer.clone());
             }
