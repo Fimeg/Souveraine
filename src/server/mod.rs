@@ -11,6 +11,7 @@ pub mod agent_inventory;
 pub mod consciousness_engine;
 pub mod conversation;
 pub mod db;
+pub mod device_registry;
 pub mod federation;
 pub mod gitea_client;
 pub mod gitea_memory;
@@ -18,6 +19,7 @@ pub mod session_manager;
 
 pub use agent_inventory::AgentInventory;
 pub use consciousness_engine::{ConsciousnessEngine, ConsciousnessEvent};
+pub use device_registry::DeviceRegistry;
 pub use session_manager::SessionManager;
 
 // Server-side memory backend (Send-safe, HTTP-only via Gitea API).
@@ -46,6 +48,12 @@ pub struct SouveraineServer {
     /// todo, energy, posture. Firehose subscribers (EventLog, WebSocket
     /// bridge, desktop overlay) listen on this bus.
     pub event_bus: crate::core::nervous::EventBus,
+    /// Tracks known federated peers. Updated by `device_announce`/`device_leave`
+    /// events on the bus. Persisted to disk for CLI access.
+    pub device_registry: Option<Arc<DeviceRegistry>>,
+    /// This instance's Ed25519 public key hex — used to filter self-announcements
+    /// from the device registry. Loaded at construction; None if seed unavailable.
+    pub local_seed_id: Option<String>,
 }
 
 pub struct ServerConfig {
@@ -102,6 +110,7 @@ impl SouveraineServer {
             });
         }
 
+        let event_bus = crate::core::nervous::EventBus::default();
         let sessions = Arc::new(SessionManager::with_persistence(data_dir.join("agents")));
 
         let primary = &config.bifrost.primary_model;
@@ -191,6 +200,32 @@ impl SouveraineServer {
             gitea_url: std::env::var("SOUVERAINE_GITEA_URL").ok(),
         };
 
+        // ── Device registry ──
+        let souveraine_base = dirs::home_dir()
+            .unwrap_or_default()
+            .join(".souveraine");
+        let local_seed_id = match crate::core::identity::SeedId::load_or_generate(
+            &crate::core::identity::SeedId::default_dir(&souveraine_base),
+        ) {
+            Ok(seed) => {
+                let pubkey = seed.public_key_hex();
+                Some(pubkey)
+            }
+            Err(_) => None,
+        };
+        let device_registry = local_seed_id.clone().map(|seed_id| {
+            let reg = Arc::new(DeviceRegistry::new(souveraine_base, seed_id));
+            // Subscribe the registry to the event bus for live updates.
+            let reg_clone = reg.clone();
+            let mut rx = event_bus.subscribe();
+            tokio::spawn(async move {
+                while let Ok(event) = rx.recv().await {
+                    reg_clone.handle_event(&event);
+                }
+            });
+            reg
+        });
+
         Ok(Self {
             agents,
             sessions,
@@ -203,7 +238,9 @@ impl SouveraineServer {
             app_config: Arc::new(RwLock::new(config)),
             rate_delay,
             instance_id,
-            event_bus: crate::core::nervous::EventBus::default(),
+            event_bus,
+            device_registry,
+            local_seed_id,
         })
     }
 

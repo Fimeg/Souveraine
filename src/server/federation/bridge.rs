@@ -8,7 +8,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::core::config::PeerConfig;
 use crate::core::identity::SeedId;
-use crate::core::nervous::EventBus;
+use crate::core::nervous::{EventBus, SensorEvent};
 
 use super::types::SignedEvent;
 
@@ -61,6 +61,27 @@ async fn peer_outbound_task(peer: PeerConfig, event_bus: EventBus, seed: Arc<See
             Ok((mut ws, _resp)) => {
                 retry = 0;
                 tracing::info!(peer = %endpoint, "federation: outbound connected");
+
+                // Announce our presence to the peer.
+                let announce = SensorEvent {
+                    sensor_name: "federation".into(),
+                    timestamp: chrono::Utc::now(),
+                    event_type: "device_announce".into(),
+                    target: None,
+                    urgency: 0.0,
+                    payload: Some(serde_json::json!({
+                        "federation_url": endpoint,
+                        "label": None::<String>,
+                        "pubkey": seed.public_key_hex(),
+                    })),
+                    seed_id: None,
+                    reply_to: None,
+                };
+                let signed = SignedEvent::sign(&announce, &seed);
+                if let Ok(json) = serde_json::to_string(&signed) {
+                    let _ = ws.send(Message::Text(json)).await;
+                }
+
                 let mut rx = event_bus.subscribe();
 
                 loop {

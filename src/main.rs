@@ -207,6 +207,14 @@ enum Commands {
         host: bool,
     },
 
+    /// Show known federated peers
+    #[command(long_about = "Show all peers tracked by the device registry, from federation announcements.")]
+    Peers {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Query the event firehose log
     Events {
         #[command(subcommand)]
@@ -358,6 +366,11 @@ async fn main() -> anyhow::Result<()> {
         return run_events(action, cli.json).await;
     }
 
+    // Handle peers early — reads known_peers.json, no backend needed
+    if let Some(Commands::Peers { json }) = &cli.command {
+        return run_peers(*json).await;
+    }
+
     let config = load_config().await?;
     let config = Arc::new(RwLock::new(config));
 
@@ -373,7 +386,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Reflect { conversation } => {
             run_reflect(config, cli.agent.clone(), conversation.clone(), cli.json).await?
         }
-        Commands::Init | Commands::Completions { .. } | Commands::Auth { .. } | Commands::Schedule { .. } | Commands::Identity { .. } | Commands::Events { .. } => unreachable!(),
+        Commands::Init | Commands::Completions { .. } | Commands::Auth { .. } | Commands::Schedule { .. } | Commands::Identity { .. } | Commands::Events { .. } | Commands::Peers { .. } => unreachable!(),
     }
 
     Ok(())
@@ -638,6 +651,45 @@ async fn run_identity(
                 println!("{}", if valid { "Valid ✓" } else { "Invalid ✗" });
             }
         }
+    }
+    Ok(())
+}
+
+async fn run_peers(json: bool) -> anyhow::Result<()> {
+    let base = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".souveraine");
+    let known_path = base.join("federation").join("known_peers.json");
+
+    if !known_path.exists() {
+        if json {
+            println!("[]");
+        } else {
+            println!("No federated peers known yet.");
+            println!("  Configure peers in [federation] in souveraine.toml and start the server.");
+        }
+        return Ok(());
+    }
+
+    let content = tokio::fs::read_to_string(&known_path).await?;
+    let peers: Vec<crate::server::device_registry::PeerEntry> = serde_json::from_str(&content)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&peers)?);
+    } else if peers.is_empty() {
+        println!("No federated peers known yet.");
+    } else {
+        println!("\n── Federated Peers ──────────────────────");
+        for p in &peers {
+            let status = if p.alive { "alive" } else { "offline" };
+            println!("  {}  {}", p.seed_id.get(..16).unwrap_or(&p.seed_id), status);
+            if let Some(label) = &p.label {
+                println!("    label: {label}");
+            }
+            println!("    url:   {}", p.url);
+            println!("    seen:  {}", p.last_seen.format("%Y-%m-%d %H:%M:%S UTC"));
+        }
+        println!();
     }
     Ok(())
 }
