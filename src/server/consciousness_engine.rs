@@ -16,7 +16,10 @@
 //! reflection module lands.)
 //!
 //! ## N+100 (Archivist)
-//! Context compression pass. (Stub until the archivist module lands.)
+//! Memory synthesis pass. Fires on interval or pressure threshold, scans
+//! journal entries written since the last pass, and writes a dense
+//! `system/synthesized/` fragment via a compression-model LLM call. See
+//! [`crate::core::archivist`].
 //!
 //! Per `docs/CONTEXT_CONSTITUTION.md` Article I, the Subconscious is not a
 //! separate agent — it is the same consciousness in a different mode that runs
@@ -55,6 +58,8 @@ pub struct ConsciousnessEngine {
     rate_delay: Arc<AtomicU64>,
     /// Reflection engine — N+25 phenomenological witness.
     reflection: Arc<crate::core::reflection::ReflectionEngine>,
+    /// Archivist engine — N+100 memory synthesis.
+    archivist: Arc<crate::core::archivist::ArchivistEngine>,
 }
 
 #[derive(Clone, Debug)]
@@ -66,6 +71,7 @@ pub enum ConsciousnessEvent {
 }
 
 impl ConsciousnessEngine {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         agents: Arc<AgentInventory>,
         sessions: Arc<SessionManager>,
@@ -74,6 +80,7 @@ impl ConsciousnessEngine {
         reflection_model: Option<String>,
         max_tokens: Option<u32>,
         rate_delay: Arc<AtomicU64>,
+        archivist_config: crate::core::config::ArchivistConfig,
     ) -> Self {
         let reflection = Arc::new(crate::core::reflection::ReflectionEngine::new(
             agents.clone(),
@@ -81,6 +88,13 @@ impl ConsciousnessEngine {
             rate_delay.clone(),
             reflection_model.or_else(|| subconscious_model.clone()),
             max_tokens,
+        ));
+        let archivist = Arc::new(crate::core::archivist::ArchivistEngine::new(
+            agents.clone(),
+            bifrost.clone(),
+            rate_delay.clone(),
+            archivist_config,
+            subconscious_model.clone(),
         ));
         Self {
             agents,
@@ -91,6 +105,7 @@ impl ConsciousnessEngine {
             max_tokens,
             rate_delay,
             reflection,
+            archivist,
         }
     }
 
@@ -98,6 +113,14 @@ impl ConsciousnessEngine {
     /// future chat `/reflect` slash command) can trigger a pass directly.
     pub fn reflection(&self) -> Arc<crate::core::reflection::ReflectionEngine> {
         self.reflection.clone()
+    }
+
+    /// Expose the archivist engine so external callers (a future
+    /// `souveraine synthesize` CLI / `/synthesize` chat command) can
+    /// trigger a synthesis pass directly.
+    #[allow(dead_code)] // future seam — see doc comment
+    pub fn archivist(&self) -> Arc<crate::core::archivist::ArchivistEngine> {
+        self.archivist.clone()
     }
 
     pub async fn on_response(
@@ -147,12 +170,25 @@ impl ConsciousnessEngine {
             }
         }
 
-        // ── N+100 / archivist (placeholder until archivist module lands) ──
-        if pressure > 0.7 {
-            events.push(ConsciousnessEvent::Archivist {
-                synthesis: "Context compression triggered".to_string(),
-                pressure,
-            });
+        // ── N+100 / archivist ───────────────────────────────────────────
+        // Fires on interval (maintenance) or pressure threshold (emergency).
+        // Synthesizes journal entries written since the last pass into a
+        // dense `system/synthesized/` fragment. No-ops when nothing is new.
+        match self
+            .archivist
+            .maybe_synthesize(&session.agent_id, session.turn_count as usize, pressure)
+            .await
+        {
+            Ok(Some(report)) => {
+                events.push(ConsciousnessEvent::Archivist {
+                    synthesis: report.summary_line(),
+                    pressure,
+                });
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("N+100 archivist failed: {}", e);
+            }
         }
 
         // ── Three-tier compaction warning (advisory only, never force) ──

@@ -5,6 +5,7 @@
 // + Gitea/LocalGit impls living in their own crate. For now this module only
 // exposes the stubs that survived the cleanup.
 
+pub mod archivist;
 pub mod chain;
 pub mod bootstrap;
 pub mod compact;

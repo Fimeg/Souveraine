@@ -143,6 +143,7 @@ impl SouveraineServer {
             config.reflection.model.clone(),
             config.subconscious.max_tokens,
             rate_delay.clone(),
+            config.archivist.clone(),
         ));
 
         // Build compaction engine with closure-based session access
