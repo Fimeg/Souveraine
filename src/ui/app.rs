@@ -30,6 +30,7 @@ use tracing::{info, warn};
 use crate::core::config::ConsciousnessConfig;
 use crate::ui::chat::{ChatState, draw as draw_chat};
 use crate::ui::cockpit_panel::CockpitPane;
+use crate::ui::health_panel::HealthPane;
 use crate::ui::presence::{Posture, Presence, draw_overlay as draw_presence_overlay};
 use crate::ui::color_support::rgb;
 use crate::ui::component::{Component, Scene, SceneLayout, TuiEvent};
@@ -270,6 +271,9 @@ impl App {
         // Presence (Annie's body channel) lives outside the Scene because it's
         // an overlay, not a zoned component — App feeds it events via `dispatch`.
         app.scene.add(CockpitPane::new());
+        // HealthPane sits below the cockpit in the sidebar — substrate vitals
+        // (pressure, backend, N+1 cadence, 504 strain) beneath her voice.
+        app.scene.add(HealthPane::new());
 
         app
     }

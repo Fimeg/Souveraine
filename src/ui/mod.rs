@@ -5,6 +5,7 @@ pub mod chat;
 pub mod cockpit_panel;
 pub mod color_support;
 pub mod component;
+pub mod health_panel;
 pub mod markdown;
 pub mod expressions;
 pub mod portrait;
@@ -17,5 +18,6 @@ pub mod voice;
 
 pub use app::App;
 pub use cockpit_panel::CockpitPane;
+pub use health_panel::HealthPane;
 pub use component::{Component, Scene, SceneLayout, TuiEvent};
 pub use presence::{Position, Posture, Presence};
