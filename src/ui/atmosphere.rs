@@ -175,7 +175,7 @@ impl Atmosphere {
             Posture::Idle => Atmosphere::Default,
             // Alert stays warm — present and ready, not doing anything cool.
             Posture::Alert => Atmosphere::Default,
-            // Thinking pulls the room cool — Aster's inward pass.
+            // Thinking pulls the room cool — subconscious's inward pass.
             Posture::Thinking => Atmosphere::TherapeuticBlue,
             Posture::Processing => Atmosphere::WarmAmber,
             Posture::Affectionate => Atmosphere::CherryBlossom,

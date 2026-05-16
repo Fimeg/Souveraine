@@ -1,9 +1,9 @@
-//! CockpitPane — Aster's surfaced observations + inner-voice stream.
+//! CockpitPane — subconscious's surfaced observations + inner-voice stream.
 //!
 //! Two regions, vertically stacked inside one bordered block:
 //!
 //! ```text
-//! ╭─ Aster ─────────────────╮
+//! ╭─ Subconscious ─────────────────╮
 //! │ ◈ surface · low · 14:32 │  ← top region: promoted events
 //! │   Subconscious pass…    │     (Surfacing/Reflection/Archivist/Warn)
 //! │                         │     spaced, headered, wrapped
@@ -390,7 +390,7 @@ impl Component for CockpitPane {
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(self.palette.surfacing).add_modifier(Modifier::DIM))
             .title(Span::styled(
-                " Aster ",
+                " Subconscious ",
                 Style::default().fg(self.palette.surfacing).add_modifier(Modifier::BOLD),
             ));
         let inner = block.inner(area);
@@ -414,7 +414,7 @@ impl Component for CockpitPane {
         let top = chunks[0];
         let event_lines = if self.entries.is_empty() {
             vec![Line::from(Span::styled(
-                "  Aster is listening…",
+                "  Subconscious is listening…",
                 Style::default().fg(self.palette.agent_dim).add_modifier(Modifier::ITALIC),
             ))]
         } else {

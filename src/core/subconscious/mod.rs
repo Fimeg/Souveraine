@@ -86,9 +86,9 @@ impl InboxItem {
 /// inbox mutation is a git commit and survives compaction.
 ///
 /// The inbox boxes (pending/intrusive/sent) live in the subconscious agent's
-/// own memfs — that's Aster's working space. But the inner voice channel
+/// own memfs — that's subconscious's working space. But the inner voice channel
 /// (`system/metacognition/subconscious.md`) writes to the **primary** agent's
-/// memfs so Annie can actually read what Aster noticed.
+/// memfs so Annie can actually read what subconscious noticed.
 #[derive(Clone)]
 pub struct SubconsciousInbox {
     repo: MemoryRepo,
@@ -143,7 +143,7 @@ impl SubconsciousInbox {
     ///
     /// Appends to the primary agent's `system/metacognition/subconscious.md`
     /// so the conscious agent finds it in her own memfs — not buried in
-    /// Aster's working directory.
+    /// subconscious's working directory.
     ///
     /// Format: `[2026-05-06 14:32] [URGENCY: low] — content`
     pub async fn surface_to_conscious(&self, urgency: Urgency, content: &str) -> Result<()> {

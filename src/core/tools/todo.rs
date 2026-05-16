@@ -98,7 +98,7 @@ impl Tool for Todo {
                 },
                 "source": {
                     "type": "string",
-                    "enum": ["casey", "autogenic", "aster", "heartbeat"]
+                    "enum": ["casey", "autogenic", "subconscious", "heartbeat"]
                 },
                 "thread": { "type": "string" }
             },

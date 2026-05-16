@@ -414,7 +414,7 @@ impl CompactionStrategy for CullStrategy {
 
 /// Keep the system message + the last `preserve_recent_n` messages, drop the
 /// middle. No LLM dependency — the cheap, fast default for analytical agents
-/// (Aster) and ephemeral subagents.
+/// (subconscious) and ephemeral subagents.
 ///
 /// Tool-pair aware: if the cut would split a tool-call message from its
 /// matching tool-result, the cut slides back to keep the pair together.
@@ -500,7 +500,7 @@ impl CompactionStrategy for SlidingWindowStrategy {
 /// The result is inserted as a system message so the agent carries the gist
 /// even after the originals are gone.
 ///
-/// Uses whichever model the engine provides (subconscious model if Aster is
+/// Uses whichever model the engine provides (subconscious model if subconscious is
 /// enabled, compaction model / primary otherwise). If no Bifrost client is
 /// available, falls back to plain SlidingWindow (no threads lost is better
 /// than no compaction at all).

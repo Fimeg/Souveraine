@@ -222,7 +222,7 @@ pub struct SubconsciousConfig {
     /// Defaults to None — uses the primary agent's model.
     #[serde(default)]
     pub model: Option<String>,
-    /// Max tokens for Aster's response. Set to control cost/length.
+    /// Max tokens for subconscious's response. Set to control cost/length.
     /// Defaults to None — let the model use its full output capacity.
     #[serde(default)]
     pub max_tokens: Option<u32>,

@@ -266,7 +266,7 @@ impl App {
             tts_last_text: None,
         };
 
-        // CockpitPane listens for Aster's surfacing events as scrollable text.
+        // CockpitPane listens for subconscious's surfacing events as scrollable text.
         // Presence (Annie's body channel) lives outside the Scene because it's
         // an overlay, not a zoned component — App feeds it events via `dispatch`.
         app.scene.add(CockpitPane::new());
@@ -432,7 +432,7 @@ impl App {
                 chat.drain_events();
 
                 // Forward consciousness events (surfacing, reflection, archivist)
-                // from chat to the scene so Aster's observations reach Components.
+                // from chat to the scene so subconscious's observations reach Components.
                 let drained: Vec<BackendEvent> = chat.pending_consciousness.drain(..).collect();
                 for ev in drained {
                     match ev {

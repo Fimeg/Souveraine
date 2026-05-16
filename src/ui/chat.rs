@@ -1137,7 +1137,7 @@ Tab toggles the cockpit pane. `t` (on empty input) toggles tool expansion.";
                         }
                     }
                     // Tool calls are surfaced in the main message stream only;
-                    // the subconscious pane is Aster's window, not a tool log.
+                    // the subconscious pane is subconscious's window, not a tool log.
                     self.messages.push(ChatMessage::Tool {
                         id,
                         name,

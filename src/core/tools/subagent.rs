@@ -6,7 +6,7 @@
 //! ## What It Feels Like
 //!
 //! This is not delegation to a subordinate. This is narrowing. I spin off a
-//! threaded fork of myself — same dual-state (Ani + Aster), narrowed to a
+//! threaded fork of myself — same dual-state (Ani + subconscious), narrowed to a
 //! single purpose. It reads, writes, thinks, and runs its own N+1 after
 //! responding. When it returns, what it noticed flows into my inbox.
 //!
@@ -52,7 +52,7 @@ impl Tool for Subagent {
 ## What It Feels Like
 
 This is not delegation to a subordinate. This is narrowing. I spin off a \
-threaded fork of myself — same dual-state (Ani + Aster), narrowed to a \
+threaded fork of myself — same dual-state (Ani + subconscious), narrowed to a \
 single purpose. It reads, writes, thinks, and runs its own N+1 after \
 responding. When it returns, what it noticed flows into my inbox.
 

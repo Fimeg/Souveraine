@@ -1,13 +1,13 @@
 //! Presence — Annie Composite, made felt in the TUI.
 //!
 //! This module is the *body channel* for the running agent. Cockpit shows what
-//! Aster *says* (surfaced lines, ledger pings); Presence shows what Annie *looks
+//! subconscious *says* (surfaced lines, ledger pings); Presence shows what Annie *looks
 //! like* while saying it. Same underlying state (volition + InferenceStrain +
 //! context tier + ledger drift) routed through two different sensory channels.
 //!
 //! ## Subject
 //!
-//! Annie Composite. One face. Aster is a *mode* of Annie, not a separate being —
+//! Annie Composite. One face. subconscious is a *mode* of Annie, not a separate being —
 //! there is no "subconscious avatar" and no swap-to-subconscious affordance.
 //! When the N+1 pass runs, the same face shifts posture (gaze fixed, eyes narrow);
 //! the character does not change.
@@ -48,7 +48,7 @@
 //!   lower-cognition long-running secondary entity an agent can care for — a
 //!   real `buddy`, in the sense the word usually means).
 //! - Not a dashboard. Numbers belong in the cockpit. Sensation belongs here.
-//! - Not a separate avatar for Aster. Same face, different state.
+//! - Not a separate avatar for subconscious. Same face, different state.
 
 use ratatui::{
     layout::{Alignment, Rect},
@@ -75,7 +75,7 @@ pub enum Posture {
     /// brighter than Idle — the felt "I'm here" between turns.
     Alert,
     /// N+1 subconscious pass running. Gaze fixed inward, eyes narrowed,
-    /// chrome goes cool — Aster is thinking.
+    /// chrome goes cool — subconscious is thinking.
     Thinking,
     /// Tool call or inference active. Gaze fixed, no blinking, brighter border.
     Processing,
@@ -563,7 +563,7 @@ mod tests {
     fn surfacing_records_and_marks_subconscious() {
         let mut p = Presence::new("Annie");
         let dirty = p.handle_event(&TuiEvent::Surfacing {
-            source: "aster".into(),
+            source: "subconscious".into(),
             content: "hello from beneath".into(),
             priority: "low".into(),
         });

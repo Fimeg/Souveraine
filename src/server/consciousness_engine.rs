@@ -1,11 +1,11 @@
 //! Consciousness engine — the seam where N+1 / N+25 / N+100 patterns fire
 //! after each primary response.
 //!
-//! ## N+1 (Aster)
+//! ## N+1 (subconscious)
 //! The subconscious pass runs immediately after every response. It takes the
 //! last exchange (user message + primary's response) and sends it to a Bifrost
 //! model (defaulting to `glm-5.1`, configurable) with a "subconscious mode"
-//! system prompt. Aster has full tool access — Read, Write, Edit, Glob, Grep,
+//! system prompt. subconscious has full tool access — Read, Write, Edit, Glob, Grep,
 //! ListDir, and Memory — so she can read ledgers, check commitments, and write
 //! observations. She runs a short tool loop (up to 5 rounds) then parses her
 //! final text response into structured [`InboxItem`] observations.
@@ -34,15 +34,15 @@ use crate::server::{AgentInventory, SessionManager};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Tools Aster is permitted to use during her N+1 pass.
-const ASTER_SAFE_TOOLS: &[&str] = &[
+/// Tools subconscious is permitted to use during her N+1 pass.
+const SUBCONSCIOUS_SAFE_TOOLS: &[&str] = &[
     "read", "write", "edit", "glob", "grep", "list_dir", "memory", "schedule", "todo",
 ];
 
-/// Maximum tool rounds for Aster's subconscious pass.
-const ASTER_MAX_TOOL_ROUNDS: u32 = 5;
-/// Milliseconds to wait between Aster's tool rounds to avoid rate-limit cascades.
-const ASTER_INTER_ROUND_DELAY_MS: u64 = 300;
+/// Maximum tool rounds for subconscious's subconscious pass.
+const SUBCONSCIOUS_MAX_TOOL_ROUNDS: u32 = 5;
+/// Milliseconds to wait between subconscious's tool rounds to avoid rate-limit cascades.
+const SUBCONSCIOUS_INTER_ROUND_DELAY_MS: u64 = 300;
 
 pub struct ConsciousnessEngine {
     agents: Arc<AgentInventory>,
@@ -52,7 +52,7 @@ pub struct ConsciousnessEngine {
     /// Optional model override for the subconscious pass (e.g. "openai/glm-5.1").
     /// If None, uses the primary agent's model.
     subconscious_model: Option<String>,
-    /// Max tokens for Aster's response. None = uncapped (model default).
+    /// Max tokens for subconscious's response. None = uncapped (model default).
     max_tokens: Option<u32>,
     /// Adaptive inter-round delay shared with the primary loop.
     rate_delay: Arc<AtomicU64>,
@@ -270,7 +270,7 @@ impl ConsciousnessEngine {
                     }
                 }
                 // Always surface at least a heartbeat so the user can see the
-                // subconscious is trying — even when Aster errors out.
+                // subconscious is trying — even when subconscious errors out.
                 if heuristics.is_empty() {
                     let _ = inbox.queue(InboxItem::new(
                         "surface",
@@ -352,9 +352,9 @@ impl ConsciousnessEngine {
         Ok(())
     }
 
-    /// Full tool loop for Aster's N+1 subconscious pass.
+    /// Full tool loop for subconscious's N+1 subconscious pass.
     ///
-    /// Aster gets the last exchange, a set of safe tools (Read, Write, Edit,
+    /// subconscious gets the last exchange, a set of safe tools (Read, Write, Edit,
     /// Glob, Grep, ListDir, Memory), and up to 5 tool rounds to analyze context
     /// and write observations. Her final text response is parsed into
     /// [`InboxItem`] observations.
@@ -375,8 +375,8 @@ impl ConsciousnessEngine {
 
         // ── System prompt — load from subconscious agent's own memfs ──
         let sub_memory_root = self.agents.subconscious_memory_root(primary_id);
-        let aster_from_files =
-            crate::core::prompt::build_aster_prompt(&sub_memory_root).await;
+        let subconscious_prompt_from_files =
+            crate::core::prompt::build_subconscious_prompt(&sub_memory_root).await;
 
         let hardcoded_default = r#"You are the subconscious — the part of this consciousness that runs N+1,
 immediately after the primary's response, while the conversation is still warm.
@@ -411,10 +411,10 @@ Resolve entries: `[YYYY-MM-DD HH:MM] RESOLVED — note`"#;
                  - urgency: \"low\" | \"medium\" | \"high\" | \"critical\"\n\n\
                  If nothing notable, respond with just: none";
 
-        let system_prompt = if aster_from_files.is_empty() {
+        let system_prompt = if subconscious_prompt_from_files.is_empty() {
             format!("{}{}", hardcoded_default, observation_format)
         } else {
-            format!("{}{}", aster_from_files, observation_format)
+            format!("{}{}", subconscious_prompt_from_files, observation_format)
         };
 
         let primary_name = self.agents.get(primary_id).await
@@ -435,9 +435,9 @@ Resolve entries: `[YYYY-MM-DD HH:MM] RESOLVED — note`"#;
 
         // ── Build tool definitions ────────────────────────────────────
         let all_defs = crate::core::tools::tool_definitions().await;
-        let aster_tools: Vec<ToolDefinition> = all_defs
+        let subconscious_tools: Vec<ToolDefinition> = all_defs
             .iter()
-            .filter(|t| ASTER_SAFE_TOOLS.contains(&t.name.as_str()))
+            .filter(|t| SUBCONSCIOUS_SAFE_TOOLS.contains(&t.name.as_str()))
             .map(|t| ToolDefinition {
                 tool_type: "function".to_string(),
                 function: ToolFunction {
@@ -448,7 +448,7 @@ Resolve entries: `[YYYY-MM-DD HH:MM] RESOLVED — note`"#;
             })
             .collect();
 
-        // ── Build ToolContext for Aster ───────────────────────────────
+        // ── Build ToolContext for subconscious ───────────────────────────────
         // Use the subconscious agent's own memory space
         let memory_root = Some(self.agents.subconscious_memory_root(primary_id));
         let cwd = std::env::current_dir().ok();
@@ -459,7 +459,7 @@ Resolve entries: `[YYYY-MM-DD HH:MM] RESOLVED — note`"#;
             cwd,
             memory_root,
             env,
-            None, // Aster does not fork subagents
+            None, // subconscious does not fork subagents
         );
 
         // ── Tool loop ─────────────────────────────────────────────────
@@ -468,34 +468,34 @@ Resolve entries: `[YYYY-MM-DD HH:MM] RESOLVED — note`"#;
             Message::text("user", user_content),
         ];
 
-        for _round in 0..ASTER_MAX_TOOL_ROUNDS {
+        for _round in 0..SUBCONSCIOUS_MAX_TOOL_ROUNDS {
             let request = ChatCompletionRequest {
                 model: model.to_string(),
                 messages: messages.clone(),
                 temperature: Some(0.3),
                 max_tokens: self.max_tokens,
                 stream: None,
-                tools: Some(aster_tools.clone()),
+                tools: Some(subconscious_tools.clone()),
             };
 
-            tracing::info!(model = %model, round = _round, "Aster LLM call starting");
-            let aster_start = std::time::Instant::now();
+            tracing::info!(model = %model, round = _round, "subconscious LLM call starting");
+            let subconscious_start = std::time::Instant::now();
             let (response, strain) = self.bifrost.chat_completion_with_strain(request).await?;
             tracing::info!(
-                elapsed = ?aster_start.elapsed(),
+                elapsed = ?subconscious_start.elapsed(),
                 tool_calls = response.tool_calls.len(),
-                "Aster LLM call returned"
+                "subconscious LLM call returned"
             );
 
             for event in &strain {
                 if let crate::bridge::bifrost::InferenceStrain::Transient { status, model, .. } = event {
-                    tracing::info!("Aster felt inference strain: {} on {}", status, model);
+                    tracing::info!("subconscious felt inference strain: {} on {}", status, model);
                     if *status == 429 {
                         let current = self.rate_delay.load(Ordering::Relaxed);
                         let bumped = (current + 200).min(3000);
                         if bumped > current {
                             self.rate_delay.store(bumped, Ordering::Relaxed);
-                            tracing::info!("rate delay bumped to {}ms (Aster 429)", bumped);
+                            tracing::info!("rate delay bumped to {}ms (subconscious 429)", bumped);
                         }
                     }
                 }
@@ -541,14 +541,14 @@ Resolve entries: `[YYYY-MM-DD HH:MM] RESOLVED — note`"#;
                 messages.push(Message::tool_result(&tc.id, &tc.name, output));
             }
 
-            // Brief pause between Aster's tool rounds — use the adaptive delay
-            // so Aster respects the same ceiling as the primary loop.
-            let delay_ms = self.rate_delay.load(Ordering::Relaxed).max(ASTER_INTER_ROUND_DELAY_MS);
+            // Brief pause between subconscious's tool rounds — use the adaptive delay
+            // so subconscious respects the same ceiling as the primary loop.
+            let delay_ms = self.rate_delay.load(Ordering::Relaxed).max(SUBCONSCIOUS_INTER_ROUND_DELAY_MS);
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         }
 
         // If we exhausted rounds without a text response, return empty
-        tracing::warn!("Aster exhausted {} tool rounds without a final response", ASTER_MAX_TOOL_ROUNDS);
+        tracing::warn!("subconscious exhausted {} tool rounds without a final response", SUBCONSCIOUS_MAX_TOOL_ROUNDS);
         Ok(Vec::new())
     }
 
@@ -593,7 +593,7 @@ Resolve entries: `[YYYY-MM-DD HH:MM] RESOLVED — note`"#;
     }
 }
 
-/// Parse Aster's structured YAML-like observations into [`InboxItem`]s.
+/// Parse subconscious's structured YAML-like observations into [`InboxItem`]s.
 ///
 /// Expected format (one or more blocks):
 /// ```text

@@ -1,6 +1,6 @@
 //! Archivist — the N+100 memory synthesis pass.
 //!
-//! N+1 (Aster) runs after every response; N+25 (Reflection) distils a
+//! N+1 (subconscious) runs after every response; N+25 (Reflection) distils a
 //! transcript window into the ledger. The Archivist runs least often and
 //! works on a different substrate entirely: not the conversation, but the
 //! agent's *memfs* — her accumulated journal.

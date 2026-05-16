@@ -143,7 +143,7 @@ impl Tool for Schedule {
                 }
 
                 let content = format!(
-                    "---\nname: {name}\nkind: {kind_str}\nschedule: \"{schedule}\"\nsource: aster\nenabled: true\nurgency: {urgency}\ncreated_at: {}\n---\n\n{prompt}\n",
+                    "---\nname: {name}\nkind: {kind_str}\nschedule: \"{schedule}\"\nsource: subconscious\nenabled: true\nurgency: {urgency}\ncreated_at: {}\n---\n\n{prompt}\n",
                     chrono::Utc::now().to_rfc3339()
                 );
 

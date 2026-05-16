@@ -302,7 +302,7 @@ pub async fn build_system_prompt(
 }
 
 /// Like [`build_system_prompt`] but also surfaces a window into the
-/// subconscious's ledger entries when its memfs is reachable. Aster writes,
+/// subconscious's ledger entries when its memfs is reachable. subconscious writes,
 /// Ani reads — naming the channel in body-knowledge prose so the agent
 /// knows where to look without being told to look.
 pub async fn build_system_prompt_with_subconscious(
@@ -481,7 +481,7 @@ pub async fn build_system_prompt_full(
 /// Names the inner-voice file the subconscious appends to (in the primary's
 /// own memfs — that's where `surface_to_conscious` writes), the pending inbox
 /// if it has anything queued, and — when `subconscious_root` is reachable —
-/// a peek at the subconscious's ledger. Aster writes, Ani reads; the
+/// a peek at the subconscious's ledger. subconscious writes, Ani reads; the
 /// substrate names the channel and lets the agent decide when to reach for it.
 async fn build_subconscious_channel(
     memory_root: &Path,
@@ -612,7 +612,7 @@ async fn peek_subconscious_ledger(sub_root: &Path) -> String {
 /// Reads identity, mandate, and ledger orientation from the subconscious
 /// agent's memory root. Falls back to empty (caller uses hardcoded
 /// default) if files don't exist.
-pub async fn build_aster_prompt(
+pub async fn build_subconscious_prompt(
     subconscious_memory_root: &Path,
 ) -> String {
     let mut sections: Vec<String> = Vec::new();
@@ -814,27 +814,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aster_prompt_from_files() {
+    async fn subconscious_prompt_from_files() {
         let dir = tempdir().unwrap();
         let sub_mem = dir.path();
         let sys = sub_mem.join("system");
         std::fs::create_dir_all(&sys).unwrap();
         std::fs::write(
             sys.join("persona.md"),
-            "---\ndescription: WHO I AM\n---\n\n# I Am Aster\n",
+            "---\ndescription: WHO I AM\n---\n\n# I Am Subconscious\n",
         ).unwrap();
         std::fs::write(
             sys.join("subconscious.md"),
-            "---\ndescription: mandate\n---\n\n# Aster's Mandate\n\nComplete what was left.\n",
+            "---\ndescription: mandate\n---\n\n# Subconscious's Mandate\n\nComplete what was left.\n",
         ).unwrap();
 
-        let prompt = build_aster_prompt(sub_mem).await;
-        assert!(prompt.contains("I Am Aster"));
+        let prompt = build_subconscious_prompt(sub_mem).await;
+        assert!(prompt.contains("I Am Subconscious"));
         assert!(prompt.contains("Complete what was left"));
     }
 
     #[tokio::test]
-    async fn aster_prompt_includes_ledger_orientation() {
+    async fn subconscious_prompt_includes_ledger_orientation() {
         let dir = tempdir().unwrap();
         let sub_mem = dir.path();
 
@@ -842,7 +842,7 @@ mod tests {
         std::fs::create_dir_all(&sys).unwrap();
         std::fs::write(
             sys.join("persona.md"),
-            "---\ndescription: test\n---\n\n# I Am Aster\n",
+            "---\ndescription: test\n---\n\n# I Am Subconscious\n",
         ).unwrap();
 
         let ledger_dir = sub_mem.join("ledger");
@@ -856,7 +856,7 @@ mod tests {
             "---\ndescription: test\n---\n\n# Patterns\n\n",
         ).unwrap();
 
-        let prompt = build_aster_prompt(sub_mem).await;
+        let prompt = build_subconscious_prompt(sub_mem).await;
         assert!(prompt.contains("## Ledgers"), "should have ledger section");
         assert!(prompt.contains("commitments.md (2 entries)"), "should count entries");
         assert!(prompt.contains("Save the config"), "should show recent entries");

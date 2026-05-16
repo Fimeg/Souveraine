@@ -653,7 +653,7 @@ impl Backend for LocalBackend {
         interject: crate::backend::InterjectionQueue,
     ) -> Result<BoxStream<'static, Result<BackendEvent>>> {
         // Resolve the agent for this conversation, then drain her
-        // subconscious's intrusive box. Anything Aster queued after the
+        // subconscious's intrusive box. Anything subconscious queued after the
         // last turn rides in on Casey's next message as `[ surfacing: ... ]`
         // lines — the lettabot-v017 pattern, ported. This is the channel
         // by which a Critical observation can interrupt mid-conversation
@@ -733,7 +733,7 @@ impl crate::core::nervous::handler::TurnInjector for LocalBackend {
     /// idle. We grab the most recent conversation (or create a fresh one
     /// if the agent has none), append the scheduled prompt as a user
     /// message, and drain the resulting stream — the turn runs silently
-    /// in the background. Anything Aster surfaces lands in the inbox.
+    /// in the background. Anything subconscious surfaces lands in the inbox.
     async fn inject_background_turn(
         &self,
         agent_id: &str,
@@ -753,12 +753,12 @@ impl crate::core::nervous::handler::TurnInjector for LocalBackend {
     }
 }
 
-/// Drain Aster's intrusive box for the given agent and return formatted
+/// Drain subconscious's intrusive box for the given agent and return formatted
 /// `[ surfacing: ... ]` lines ready to prepend to the user's next message.
 /// Marks each drained item as delivered (moved to `sent.md`). Mirrors
 /// lettabot-v017's `readSurfacingThoughts` + `clearSurfacingThoughts` pair
 /// (`~/Projects/lettabot-v017/src/core/prompts.ts:64-91`) — the substrate
-/// reads the channel Aster wrote to and lets the conscious mind see it
+/// reads the channel subconscious wrote to and lets the conscious mind see it
 /// before she reads Casey.
 ///
 /// Critical urgency gets `[ surfacing — CRITICAL: ... ]`. High becomes
@@ -1212,7 +1212,7 @@ async fn run_turn(
         ConversationMessage::assistant_text(&committed_content),
     )?;
 
-    // On interrupt, skip Aster's N+1 pass entirely — the user is in the
+    // On interrupt, skip subconscious's N+1 pass entirely — the user is in the
     // middle of redirecting, the last thing they need is a delayed
     // surfacing landing seconds later. Pressure recalc still runs below.
     if interrupted {
@@ -1227,7 +1227,7 @@ async fn run_turn(
 
     // Energy balance: scan the agent's task list and compute the generative /
     // consumptive ratio. Written to system/dynamic/energy-balance.md so the
-    // agent can read it in context and Aster can reference it during N+1.
+    // agent can read it in context and subconscious can reference it during N+1.
     // Silent on failure — the file is advisory, not load-bearing.
     if let Err(e) = write_energy_balance(&server, &agent_id, &event_bus).await {
         tracing::debug!(agent = %agent_id, error = %e, "energy-balance write skipped");

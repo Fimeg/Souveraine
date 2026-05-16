@@ -1,6 +1,6 @@
 //! Reflection — the N+25 phenomenological witness.
 //!
-//! N+1 (Aster) runs immediately after every primary response, scoped to
+//! N+1 (subconscious) runs immediately after every primary response, scoped to
 //! the last exchange. Reflection runs less often (every N turns, or on
 //! demand) and sees a broader transcript window. It's the pass where
 //! durable learnings get distilled into the ledger and the primary's
@@ -41,7 +41,7 @@ use crate::core::session::{ContentBlock, ConversationMessage, MessageRole};
 use crate::core::tools::defs::ToolContext;
 use crate::server::AgentInventory;
 
-/// Tools Reflection is permitted to use. Same set as Aster plus we lean
+/// Tools Reflection is permitted to use. Same set as subconscious plus we lean
 /// on `memory` for ledger + system-file edits (auto-committed by git).
 const REFLECTION_TOOLS: &[&str] = &[
     "read", "write", "edit", "glob", "grep", "list_dir", "memory",

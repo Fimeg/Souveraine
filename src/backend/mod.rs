@@ -49,7 +49,7 @@ pub enum BackendEvent {
     Token(String),
     /// Reasoning trace (the "thinking" pane).
     Reasoning(String),
-    /// Subconscious surfacing (Aster-voice bubble).
+    /// Subconscious surfacing (subconscious-voice bubble).
     Surfacing {
         source: String,
         content: String,
@@ -95,7 +95,7 @@ pub enum BackendEvent {
     /// N+1 subconscious pass started (`true`) or finished (`false`).
     /// Presence reads this to flip into / out of `Posture::Thinking` so the
     /// face shows when the subconscious is the one looking at the conversation.
-    /// (For Casey's agent the subconscious instance is "Aster", but the event
+    /// (For Casey's agent the subconscious instance is "subconscious", but the event
     /// itself is generic — every agent's subconscious is what's named here.)
     SubconsciousPass(bool),
     /// Agent changed her outfit. The string is the outfit name (a subdirectory

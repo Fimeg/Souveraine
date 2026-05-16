@@ -42,7 +42,7 @@ pub struct SouveraineServer {
     pub memory: Option<Arc<ServerMemory>>,
     pub app_config: Arc<RwLock<ConsciousnessConfig>>,
     /// Adaptive inter-round delay — starts at 500ms, bumps +200ms on 429.
-    /// Shared across primary loop and Aster so both respect the same ceiling.
+    /// Shared across primary loop and subconscious so both respect the same ceiling.
     pub rate_delay: Arc<AtomicU64>,
     /// Stable identifier for this process — used to register/heartbeat
     /// agent instances so the manager card shows running counts.
