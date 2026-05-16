@@ -644,9 +644,15 @@ pub struct TuiConfig {
     #[serde(default = "default_stale_timeout_secs")]
     pub stale_timeout_secs: u64,
     /// When the model produces text alongside tool calls, surface it in the
-    /// chat stream as italic interstitial narration. Off = silent tool chains.
+    /// chat stream as interstitial narration. Off = silent tool chains.
     #[serde(default = "default_true")]
     pub show_interstitial: bool,
+    /// Word-count boundary between the two interstitial registers. Narration
+    /// shorter than this is a "cenno" — a terse ambient aside attached to
+    /// tool work. At or above it, it's "her-voice": a substantive mid-turn
+    /// passage, rendered with a gutter bar instead of a quiet italic line.
+    #[serde(default = "default_cenno_word_threshold")]
+    pub cenno_word_threshold: usize,
 }
 
 impl Default for TuiConfig {
@@ -654,9 +660,12 @@ impl Default for TuiConfig {
         Self {
             stale_timeout_secs: default_stale_timeout_secs(),
             show_interstitial: true,
+            cenno_word_threshold: default_cenno_word_threshold(),
         }
     }
 }
+
+fn default_cenno_word_threshold() -> usize { 30 }
 
 fn default_stale_timeout_secs() -> u64 { 90 }
 

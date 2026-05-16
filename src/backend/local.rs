@@ -1105,7 +1105,21 @@ async fn run_turn(
         if !narration.is_empty() {
             let cfg = server.app_config.read().await;
             if cfg.tui.show_interstitial {
-                let _ = tx.send(Ok(BackendEvent::Interstitial(narration.to_string()))).await;
+                // Classify by length: a brief aside is a cenno, a full
+                // passage is her-voice. tui.cenno_word_threshold is the line.
+                let register = if narration.split_whitespace().count()
+                    >= cfg.tui.cenno_word_threshold
+                {
+                    crate::backend::Register::HerVoice
+                } else {
+                    crate::backend::Register::Cenno
+                };
+                let _ = tx
+                    .send(Ok(BackendEvent::Interstitial {
+                        text: narration.to_string(),
+                        register,
+                    }))
+                    .await;
             }
         }
 

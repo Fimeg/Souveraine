@@ -43,6 +43,20 @@ pub struct ConversationInfo {
     pub updated_at: String,
 }
 
+/// The register of a mid-turn interstitial — how loudly it should speak.
+///
+/// When the model emits text alongside tool calls it isn't always the same
+/// kind of utterance. A few words attached to a gesture ("checking the
+/// ledger…") is ambient — a *cenno*. A full paragraph of reasoning mid-turn
+/// is her actual voice and deserves to read as such, not as a quiet aside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Register {
+    /// Short ambient aside attached to tool work. Terse, quiet.
+    Cenno,
+    /// A substantive mid-turn passage in her own voice.
+    HerVoice,
+}
+
 #[derive(Debug, Clone)]
 pub enum BackendEvent {
     /// Streaming chunk of the assistant's reply.
@@ -102,8 +116,9 @@ pub enum BackendEvent {
     /// under `expressions/`). Empty string clears to default expressions.
     Outfit(String),
     /// Text the model produced alongside tool calls — her narration between
-    /// gestures. Rendered in italics, quieter than a full assistant message.
-    Interstitial(String),
+    /// gestures. The `register` decides how it renders: a quiet cenno line
+    /// or a gutter-barred her-voice passage.
+    Interstitial { text: String, register: Register },
     /// The backend is alive but producing no content (waiting on provider,
     /// between tool rounds, processing). The TUI resets `last_event_at`
     /// on this the same way it does for `Token` — it's a liveness signal.

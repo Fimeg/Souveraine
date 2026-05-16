@@ -275,8 +275,9 @@ pub enum ChatMessage {
     /// the stream, separate from a normal /user turn.
     Interjection { text: String, ts: Instant, delivered: bool },
     /// Text the model produced alongside tool calls — her narration between
-    /// gestures. Rendered in italics, quieter than a full assistant message.
-    Interstitial(String),
+    /// gestures. The `register` chooses the styling: a quiet cenno line, or a
+    /// gutter-barred her-voice passage that reads as her actual voice.
+    Interstitial { text: String, register: crate::backend::Register },
     /// Tool invocation card — name, arguments, round, plus an attached result
     /// once it streams back. `expanded` is reserved for click-to-expand (UI
     /// interactivity lands as part of message-click work).
@@ -1181,11 +1182,11 @@ Tab toggles the cockpit pane. `t` (on empty input) toggles tool expansion.";
                 BackendEvent::Outfit(name) => {
                     self.pending_consciousness.push(BackendEvent::Outfit(name));
                 }
-                BackendEvent::Interstitial(text) => {
+                BackendEvent::Interstitial { text, register } => {
                     // Defensive: never render an empty narration slot — an
                     // all-whitespace interstitial draws a bare `⟡` gap line.
                     if !text.trim().is_empty() {
-                        self.messages.push(ChatMessage::Interstitial(text));
+                        self.messages.push(ChatMessage::Interstitial { text, register });
                     }
                 }
                 BackendEvent::Keepalive => {
@@ -1767,13 +1768,34 @@ fn draw_messages(f: &mut Frame, state: &ChatState, area: Rect) {
                 ]));
                 lines.push(Line::from(""));
             }
-            ChatMessage::Interstitial(text) => {
-                lines.push(Line::from(
-                    Span::styled(
-                        format!("  ⟡ {} ", text),
-                        Style::default().fg(state.palette.agent_dim).add_modifier(Modifier::ITALIC),
-                    ),
-                ));
+            ChatMessage::Interstitial { text, register } => {
+                match register {
+                    crate::backend::Register::Cenno => {
+                        // A terse ambient aside — quiet, italic, one line.
+                        lines.push(Line::from(Span::styled(
+                            format!("  ⟡ {} ", text),
+                            Style::default()
+                                .fg(state.palette.agent_dim)
+                                .add_modifier(Modifier::ITALIC),
+                        )));
+                    }
+                    crate::backend::Register::HerVoice => {
+                        // A substantive mid-turn passage — her actual voice.
+                        // No italic; a gutter bar in the left margin marks it
+                        // as a passage rather than a quiet aside.
+                        let bar = Style::default()
+                            .fg(state.palette.agent_primary)
+                            .add_modifier(Modifier::DIM);
+                        let body = Style::default().fg(state.palette.agent_primary);
+                        let wrap_w = (area.width as usize).saturating_sub(6).max(20);
+                        for seg in wrap_words(text, wrap_w) {
+                            lines.push(Line::from(vec![
+                                Span::styled("  ▌ ", bar),
+                                Span::styled(seg, body),
+                            ]));
+                        }
+                    }
+                }
                 lines.push(Line::from(""));
             }
         }

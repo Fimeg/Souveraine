@@ -189,6 +189,7 @@ pub enum FieldLoc {
     FdAutoWake,
     // TUI
     TuShowInterstitial,
+    TuCennoThreshold,
 }
 
 impl FieldLoc {
@@ -212,7 +213,7 @@ impl FieldLoc {
             FieldLoc::FdEnabled | FieldLoc::FdRole | FieldLoc::FdInstanceLabel | FieldLoc::FdAutoWake => Category::Federation,
             FieldLoc::PrPulseEnabled | FieldLoc::PrPulseIntervalSecs | FieldLoc::PrOutfit | FieldLoc::PrAtmosphere => Category::Presence,
             FieldLoc::VcEnabled | FieldLoc::VcSttUrl | FieldLoc::VcTtsUrl | FieldLoc::VcVoiceId | FieldLoc::VcPushToTalkKey => Category::Voice,
-            FieldLoc::TuShowInterstitial => Category::Tui,
+            FieldLoc::TuShowInterstitial | FieldLoc::TuCennoThreshold => Category::Tui,
         }
     }
 
@@ -284,6 +285,7 @@ impl FieldLoc {
             FieldLoc::FdInstanceLabel => "instance_label",
             FieldLoc::FdAutoWake => "auto_wake",
             FieldLoc::TuShowInterstitial => "show_interstitial",
+            FieldLoc::TuCennoThreshold => "cenno_word_threshold",
         }
     }
 
@@ -360,6 +362,7 @@ impl FieldLoc {
             FieldLoc::FdInstanceLabel => "instance label",
             FieldLoc::FdAutoWake => "auto-wake on summon",
             FieldLoc::TuShowInterstitial => "interstitial narration",
+            FieldLoc::TuCennoThreshold => "cenno threshold (words)",
         }
     }
 
@@ -769,6 +772,7 @@ impl SettingsView {
             }
             Category::Tui => {
                 out.push((TuShowInterstitial, EditableValue::Bool(self.config.tui.show_interstitial)));
+                out.push((TuCennoThreshold, EditableValue::Uint(self.config.tui.cenno_word_threshold as u64)));
             }
         }
         out
@@ -997,6 +1001,7 @@ impl SettingsView {
             FdAutoWake => { if let EditableValue::Bool(v) = value { self.config.federation.auto_wake = v; } }
 
             TuShowInterstitial => { if let EditableValue::Bool(v) = value { self.config.tui.show_interstitial = v; } }
+            TuCennoThreshold => { if let EditableValue::Uint(v) = value { self.config.tui.cenno_word_threshold = v as usize; } }
         }
         self.dirty = true;
     }
@@ -1295,6 +1300,7 @@ impl SettingsView {
                     FieldLoc::SaMaxToolRounds | FieldLoc::SaInterRoundDelayMs |
                     FieldLoc::WsPort | FieldLoc::SvPort | FieldLoc::BfTimeoutSecs |
                     FieldLoc::ScN1Every | FieldLoc::ScN1Secs |
+                    FieldLoc::TuCennoThreshold |
                     FieldLoc::EvRetainDays | FieldLoc::PrPulseIntervalSecs
                 );
                 let is_float = matches!(loc,
@@ -1334,6 +1340,7 @@ impl SettingsView {
             FieldLoc::SaMaxToolRounds | FieldLoc::SaInterRoundDelayMs |
             FieldLoc::WsPort | FieldLoc::SvPort | FieldLoc::BfTimeoutSecs |
             FieldLoc::ScN1Every | FieldLoc::ScN1Secs |
+            FieldLoc::TuCennoThreshold |
             FieldLoc::PrPulseIntervalSecs => {
                 if let Ok(v) = buffer.parse::<u64>() {
                     self.apply_field(loc, EditableValue::Uint(v));
