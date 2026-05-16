@@ -1099,10 +1099,13 @@ async fn run_turn(
 
         // Stream any text the model produced alongside tool calls as italic
         // interstitial narration. Configurable via tui.show_interstitial.
-        if !response.content.is_empty() {
+        // Trim first: a model that emits only whitespace ("\n") alongside its
+        // tool calls must not produce an empty `⟡` gap line.
+        let narration = response.content.trim();
+        if !narration.is_empty() {
             let cfg = server.app_config.read().await;
             if cfg.tui.show_interstitial {
-                let _ = tx.send(Ok(BackendEvent::Interstitial(response.content.clone()))).await;
+                let _ = tx.send(Ok(BackendEvent::Interstitial(narration.to_string()))).await;
             }
         }
 

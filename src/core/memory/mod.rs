@@ -721,15 +721,17 @@ pub async fn execute_memory_command_with_context(
             Ok(out)
         }
         MemoryCommand::Compact { strategy } => {
+            // None when no --strategy was given: the engine then resolves the
+            // per-agent-type default (cfg.strategy via for_agent_type) instead
+            // of being force-pinned to Cull at the call site.
             let strategy_kind = strategy
                 .as_deref()
-                .and_then(CompactionStrategyKind::from_str)
-                .unwrap_or(CompactionStrategyKind::Cull);
+                .and_then(CompactionStrategyKind::from_str);
 
             match ctx.and_then(|c| c.compaction_engine.as_ref()) {
                 Some(engine) => {
                     let report = engine
-                        .compact(&agent_id, Some(strategy_kind))
+                        .compact(&agent_id, strategy_kind)
                         .await?;
                     Ok(report.to_string())
                 }

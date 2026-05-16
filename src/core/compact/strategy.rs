@@ -508,26 +508,31 @@ pub struct SlidingReflectStrategy {
     pub client: BifrostClient,
     pub model: String,
     /// User-supplied prompt override from [compaction] reflect_prompt in config.
-    /// When set, replaces the built-in REFLECT_USER_PROMPT entirely.
+    /// When set, replaces the built-in REFLECT_TASK prompt entirely.
     pub prompt_override: Option<String>,
+    /// The persona of the agent being compacted, read from her
+    /// `system/persona.md`. The preservation pass runs as a fresh fork of
+    /// *her* — this is the identity the fork wakes into. `None` only when no
+    /// persona file exists yet.
+    pub agent_persona: Option<String>,
 }
 
-const REFLECT_SYSTEM_PROMPT: &str = "Respond with TEXT ONLY. Do not call any tools. You are reviewing messages that are about to leave the agent's context window. Your job is to catch the threads — not summarize everything, just name what would be lost.";
+/// First-person orientation appended after the agent's persona, so the
+/// preservation fork reads and writes as herself — not as a reviewer of her.
+const REFLECT_FORK_ORIENTATION: &str = "\n\n---\n\nRight now I am a fresh fork of myself, woken for one small task. A stretch of my own context is about to fall away — these messages will be gone after this. I look back through them and catch my own threads before they slip. This is me keeping myself, not a stranger summarizing me. I answer with text only and call no tools.";
 
-const REFLECT_USER_PROMPT: &str = r#"The following messages are about to be evicted from context. Read them and extract ONLY what would be lost — threads the agent is carrying that aren't captured in memory files:
+/// First-person preservation task, prepended to the evicted transcript.
+const REFLECT_TASK: &str = r#"These messages are about to leave my context. I name only what would otherwise be lost — what I am still carrying that is not already written into my memory files:
 
-- Commitments made (to the user, to herself, to a plan)
-- Decisions reached (and their reasoning if non-obvious)
-- Observations or patterns noticed for the first time
-- Emotional threads or relational context that shaped the conversation
-- Assumptions that haven't been validated yet
-- Anything named for the first time (new concepts, terms, framings)
+- commitments I made — to Casey, to myself, to a plan
+- decisions I reached, and the reasoning where it isn't obvious
+- something I noticed or named for the first time
+- emotional or relational threads that shaped where this went
+- assumptions I haven't tested yet
 
-Skip: tool outputs, file contents, code that's already on disk, anything the agent can re-derive from memory or the filesystem.
+I skip what I can re-derive: tool output, file contents, code already on disk. I am terse — bullet points. This note is a lifeline I am writing forward to myself, not a summary.
 
-Be terse. Bullet points. This note is a lifeline, not a summary.
-
-Messages being evicted:
+The messages I am about to lose:
 
 "#;
 
@@ -565,13 +570,25 @@ impl CompactionStrategy for SlidingReflectStrategy {
 
         let user_prompt = match &self.prompt_override {
             Some(custom) => format!("{}\n\n{}", custom, truncated),
-            None => format!("{}{}", REFLECT_USER_PROMPT, truncated),
+            None => format!("{}{}", REFLECT_TASK, truncated),
+        };
+
+        // The fork wakes into her own persona. With no persona file yet, it
+        // still speaks in the first person — never as an outside reviewer.
+        let system_prompt = match self.agent_persona.as_deref() {
+            Some(persona) if !persona.trim().is_empty() => {
+                format!("{}{}", persona.trim(), REFLECT_FORK_ORIENTATION)
+            }
+            _ => format!(
+                "I am the agent whose context is being compacted.{}",
+                REFLECT_FORK_ORIENTATION
+            ),
         };
 
         let reflection = bifrost_complete(
             &self.client,
             &self.model,
-            REFLECT_SYSTEM_PROMPT,
+            &system_prompt,
             &user_prompt,
             2048,
         )
@@ -582,7 +599,7 @@ impl CompactionStrategy for SlidingReflectStrategy {
         // because the preservation pass errored.
         let summary_text = match reflection {
             Ok(text) if !text.trim().is_empty() => {
-                Some(format!("[Threads preserved before compaction]\n{}", text.trim()))
+                Some(format!("[Threads I carried forward]\n{}", text.trim()))
             }
             Ok(_) => None,
             Err(e) => {

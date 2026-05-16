@@ -567,12 +567,9 @@ Tab toggles the cockpit pane. `t` (on empty input) toggles tool expansion.";
         let text = trimmed;
         let ts = Instant::now();
         self.messages.push(ChatMessage::User { text: text.clone(), ts });
-        self.messages.push(ChatMessage::Assistant {
-            text: String::new(),
-            ts,
-            streaming: true,
-            rendered_cache: RefCell::new(None),
-        });
+        // No pre-created Assistant bubble — if the agent starts with tool
+        // calls, the empty bubble would finalize as a tiny blank box.
+        // `append_streaming()` creates one on first text token.
         self.busy = true;
         self.tool_calls_this_turn = 0;
         self.phase = TurnPhase::Thinking;
@@ -1185,7 +1182,11 @@ Tab toggles the cockpit pane. `t` (on empty input) toggles tool expansion.";
                     self.pending_consciousness.push(BackendEvent::Outfit(name));
                 }
                 BackendEvent::Interstitial(text) => {
-                    self.messages.push(ChatMessage::Interstitial(text));
+                    // Defensive: never render an empty narration slot — an
+                    // all-whitespace interstitial draws a bare `⟡` gap line.
+                    if !text.trim().is_empty() {
+                        self.messages.push(ChatMessage::Interstitial(text));
+                    }
                 }
                 BackendEvent::Keepalive => {
                     // Liveness signal — no visual change, just resets the

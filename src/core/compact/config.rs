@@ -59,13 +59,24 @@ impl CompactionConfig {
         self.per_type
             .get(agent_type)
             .cloned()
-            .unwrap_or_else(|| AgentCompactionConfig {
-                enabled: self.enabled,
-                strategy: self.strategy.clone(),
-                warn_pressure: self.warn_pressure,
-                urgent_pressure: self.urgent_pressure,
-                critical_pressure: self.critical_pressure,
-                ..Default::default()
+            .unwrap_or_else(|| {
+                // No explicit [compaction.per_type] entry. The subconscious
+                // leans on sliding_reflect — its preservation fork catches her
+                // threads before the cut, which is what an unattended pass
+                // needs. Everything else uses the global default. She can
+                // still name any strategy herself; this is only the default.
+                let strategy = match agent_type {
+                    "subconscious" => CompactionStrategyKind::SlidingReflect,
+                    _ => self.strategy.clone(),
+                };
+                AgentCompactionConfig {
+                    enabled: self.enabled,
+                    strategy,
+                    warn_pressure: self.warn_pressure,
+                    urgent_pressure: self.urgent_pressure,
+                    critical_pressure: self.critical_pressure,
+                    ..Default::default()
+                }
             })
     }
 }

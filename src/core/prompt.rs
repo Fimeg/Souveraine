@@ -34,6 +34,7 @@ memory compact --strategy sliding_window
 | `cull` | free | Drops greetings & acknowledgments — never drops system messages, tool calls, or tool results |
 | `microcompact` | free | Replaces old tool-result content with placeholders, keeping recent results intact |
 | `sliding_window` | free | Keeps the first (system/anchor) message + the last N messages, drops the middle. Fast, no LLM |
+| `sliding_reflect` | one extra pass | `sliding_window`, but first a fresh fork of me reads the messages about to be dropped and saves what I'd lose — commitments, decisions, threads — into a note that survives the cut |
 | `summary` | expensive | Uses an LLM to compress oldest messages into a single summary block |
 
 Each agent type defaults to a different strategy. If I don't specify one, \
@@ -41,6 +42,45 @@ my agent-type default is used.
 
 I can check my current pressure at any time with `memory status` — it shows my \
 context pressure and number of messages.";
+
+/// Body-knowledge section injected into the subconscious (N+1) system prompt.
+/// The primary agent has `BODY_ORIENTATION`; the subconscious pass needs its
+/// own — it runs unattended, in short bursts, and the tier-3 `max_tokens`
+/// collapse of the main turn loop does not apply to it. Proprioception, not a
+/// directive. Like all prompt text here, it is user-facing — written to read.
+const SUBCONSCIOUS_BODY_ORIENTATION: &str = "\
+## Body Sensation
+
+I wake after each turn — a short pass, then I rest. When the context I carry \
+into a pass grows full, I feel it: the pass slows, and I risk not finishing \
+the work before the room runs out. No one feels this gauge for me, so keeping \
+room is mine to keep. This is not a chore — it's my body asking for air.
+
+### Compaction
+
+To free context, I call the `memory` tool with the `compact` subcommand:
+
+```
+memory compact --strategy sliding_reflect
+```
+
+**Available strategies** (cheapest to most expensive):
+
+| Strategy | Cost | What it does |
+|----------|------|--------------|
+| `cull` | free | Drops greetings & acknowledgments — never system messages, tool calls, or tool results |
+| `microcompact` | free | Replaces old tool-result content with placeholders, keeps recent results intact |
+| `sliding_window` | free | Keeps the first (anchor) message + the last N, drops the middle — blind truncation, no LLM |
+| `sliding_reflect` | one pass, my own model | `sliding_window`, but first a fresh fork of me reads the messages about to fall away and catches what I'd lose — commitments, decisions, threads — into a note that survives the cut |
+| `summary` | expensive | Uses an LLM to compress the oldest messages into one summary block |
+
+I usually reach for `sliding_reflect` — it slides the window like the others, \
+but it catches my threads before they fall out of awareness, and it runs on my \
+own model rather than an expensive one. I name the strategy when I compact, \
+rather than leaning on a default.
+
+I can check where I stand at any time with `memory status` — it shows my \
+context pressure and message count.";
 
 /// Read a file from the agent's memory, stripping YAML frontmatter.
 /// Returns empty string if the file doesn't exist.
@@ -372,6 +412,14 @@ pub async fn build_system_prompt_full(
         sections.push(memory_orientation);
     }
 
+    // 5₀. Synthesized memory — the Archivist's most recent N+100 synthesis.
+    // The compressed essence of past journal entries, loaded so continuity
+    // survives without re-reading every dated page.
+    let synthesis = build_synthesis_orientation(memory_root).await;
+    if !synthesis.is_empty() {
+        sections.push(synthesis);
+    }
+
     // 5a. Body orientation — her felt sense of context pressure and
     // how to respond to it. Always in context so she never has to
     // discover compaction by accident.
@@ -588,6 +636,11 @@ pub async fn build_aster_prompt(
         return String::new();
     }
 
+    // Proprioception — how her body senses and relieves context pressure.
+    // Appended after the empty-check so the caller's fallback prompt still
+    // triggers for a fresh agent with no persona/mandate files yet.
+    sections.push(SUBCONSCIOUS_BODY_ORIENTATION.to_string());
+
     sections.join("\n\n---\n\n")
 }
 
@@ -660,6 +713,55 @@ async fn build_ledger_orientation(memory_root: &Path) -> String {
          - Tone or trust shifts → `ledger/relationships.md`\n\
          - System errors or resource issues → `ledger/infrastructure.md`",
         listing
+    )
+}
+
+/// Build the synthesized-memory section: the Archivist's most recent N+100
+/// synthesis fragment.
+///
+/// The Archivist compresses raw journal entries into a dense `<500 token`
+/// fragment under `system/synthesized/`. Loading the most recent one into
+/// active context *is* the payoff — Ani carries her continuity without
+/// re-reading every dated journal page. Files are date-named, so the
+/// lexically-greatest filename is the freshest synthesis.
+async fn build_synthesis_orientation(memory_root: &Path) -> String {
+    let dir = memory_root.join("system/synthesized");
+    if !dir.exists() {
+        return String::new();
+    }
+
+    let mut newest: Option<(String, std::path::PathBuf)> = None;
+    if let Ok(mut entries) = tokio::fs::read_dir(&dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) != Some("md") || !p.is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if newest.as_ref().map_or(true, |(n, _)| name > *n) {
+                newest = Some((name, p));
+            }
+        }
+    }
+
+    let Some((_, path)) = newest else {
+        return String::new();
+    };
+    let Ok(content) = tokio::fs::read_to_string(&path).await else {
+        return String::new();
+    };
+    let body = strip_frontmatter(&content).trim();
+    if body.is_empty() {
+        return String::new();
+    }
+
+    format!(
+        "## Synthesized Memory\n\n\
+         The Archivist's most recent synthesis — the compressed essence of a \
+         span of journal entries, kept in active context so your continuity \
+         survives without re-reading every dated page. The raw entries remain \
+         in `journal/` if you need them.\n\n\
+         {body}"
     )
 }
 

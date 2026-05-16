@@ -924,7 +924,7 @@ impl App {
                     let mut live = self.config.write().await;
                     *live = saved.clone();
                     view.mode = crate::ui::settings::SettingsMode::Status {
-                        msg: format!("saved to {}", path.display()),
+                        msg: "saved".to_string(),
                         is_error: false,
                     };
                     // Diff known fields and push changes to SQLite.

@@ -451,7 +451,7 @@ impl SettingsView {
             field_idx: 0,
             mode: SettingsMode::Browse,
             expressions_path: None,
-            focus: PanelFocus::Fields,
+            focus: PanelFocus::Categories,
             available_models: Vec::new(),
             models_rx: None,
             models_fetching: false,
@@ -1132,11 +1132,19 @@ impl SettingsView {
                 }
             }
             KeyCode::Left => {
-                if cursor > 0 { cursor -= 1; }
+                // `cursor` is a byte index — step to the previous char boundary.
+                cursor = buffer[..cursor]
+                    .char_indices()
+                    .next_back()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
                 self.mode = SettingsMode::Editing { loc, buffer, cursor };
             }
             KeyCode::Right => {
-                if cursor < buffer.len() { cursor += 1; }
+                // Step forward by one whole char, not one byte.
+                if let Some(c) = buffer[cursor..].chars().next() {
+                    cursor += c.len_utf8();
+                }
                 self.mode = SettingsMode::Editing { loc, buffer, cursor };
             }
             KeyCode::Home => {
@@ -1149,9 +1157,15 @@ impl SettingsView {
             }
             KeyCode::Backspace => {
                 if cursor > 0 {
-                    let idx = cursor - 1;
-                    buffer.remove(idx);
-                    cursor -= 1;
+                    // Remove the whole char before the cursor — `cursor - 1`
+                    // can land mid-codepoint and panic on non-ASCII input.
+                    let prev = buffer[..cursor]
+                        .char_indices()
+                        .next_back()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    buffer.remove(prev);
+                    cursor = prev;
                 }
                 // Backspace on empty Optional field → set to None
                 if buffer.is_empty() && matches!(loc, FieldLoc::ScModel | FieldLoc::RfModel | FieldLoc::CpModel | FieldLoc::ScMaxTokens | FieldLoc::MeBasePath) {
@@ -1194,7 +1208,7 @@ impl SettingsView {
                     }
                 } else {
                     buffer.insert(cursor, c);
-                    cursor += 1;
+                    cursor += c.len_utf8();
                 }
                 self.mode = SettingsMode::Editing { loc, buffer, cursor };
             }
@@ -1207,7 +1221,7 @@ impl SettingsView {
 
     fn commit_edit(&mut self, loc: FieldLoc, buffer: &str) {
         match loc {
-            FieldLoc::ScMaxTokens | FieldLoc::RfMessageInterval |
+            FieldLoc::RfMessageInterval |
             FieldLoc::ArInterval | FieldLoc::SaMaxConcurrent |
             FieldLoc::SaTimeout | FieldLoc::SaMaxDepth |
             FieldLoc::SaMaxToolRounds | FieldLoc::SaInterRoundDelayMs |
@@ -1229,7 +1243,8 @@ impl SettingsView {
                     self.apply_field(loc, EditableValue::Float(v));
                 }
             }
-            FieldLoc::ScModel | FieldLoc::RfModel | FieldLoc::CpModel | FieldLoc::MeBasePath => {
+            FieldLoc::ScModel | FieldLoc::RfModel | FieldLoc::CpModel
+            | FieldLoc::MeBasePath | FieldLoc::ScMaxTokens => {
                 let val = if buffer.is_empty() { None } else { Some(buffer.to_string()) };
                 self.apply_field(loc, EditableValue::OptionalText(val));
             }

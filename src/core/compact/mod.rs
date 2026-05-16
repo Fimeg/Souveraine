@@ -184,10 +184,26 @@ impl CompactionEngine for DefaultCompactionEngine {
                         .model
                         .as_deref()
                         .unwrap_or("openai/kimi-k2.6");
+                    // The preservation pass runs as a fresh fork of *this*
+                    // agent — load her persona so the fork wakes as her.
+                    let agent_persona = (self.get_repo)(agent_id)
+                        .and_then(|repo| {
+                            std::fs::read_to_string(repo.root().join("system/persona.md")).ok()
+                        })
+                        .map(|c| {
+                            // Drop a leading YAML frontmatter block if present.
+                            if let Some(rest) = c.strip_prefix("---\n") {
+                                if let Some(end) = rest.find("\n---\n") {
+                                    return rest[end + 5..].trim().to_string();
+                                }
+                            }
+                            c.trim().to_string()
+                        });
                     let s = SlidingReflectStrategy {
                         client: client.clone(),
                         model: model.to_string(),
                         prompt_override: reflect_prompt,
+                        agent_persona,
                     };
                     s.plan(&messages, &cfg, &self.counter).await?
                 }
