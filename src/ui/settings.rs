@@ -18,7 +18,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::core::compact::CompactionStrategyKind;
 use crate::core::config::{
-    BandwidthClass, ConsciousnessConfig, N1Trigger, ReflectionTrigger,
+    BandwidthClass, ConsciousnessConfig, FederationRole, N1Trigger, ReflectionTrigger,
 };
 use crate::ui::chat::ChatPalette;
 
@@ -50,6 +50,7 @@ pub enum Category {
     Federation,
     Presence,
     Voice,
+    Tui,
 }
 
 impl Category {
@@ -71,6 +72,7 @@ impl Category {
             Category::Federation,
             Category::Presence,
             Category::Voice,
+            Category::Tui,
         ]
     }
 
@@ -92,6 +94,7 @@ impl Category {
             Category::Federation => "Federation",
             Category::Presence => "Presence",
             Category::Voice => "Voice",
+            Category::Tui => "TUI",
         }
     }
 }
@@ -173,13 +176,24 @@ pub enum FieldLoc {
     VcTtsUrl,
     VcVoiceId,
     VcPushToTalkKey,
+    // Bifrost (cont.)
+    BfTimeoutSecs,
+    // Server auth
+    SvAuthRequired,
+    SvAuthLoopback,
+    // Federation (cont.)
+    FdRole,
+    FdInstanceLabel,
+    FdAutoWake,
+    // TUI
+    TuShowInterstitial,
 }
 
 impl FieldLoc {
     pub fn category(&self) -> Category {
         match self {
             FieldLoc::AgSystemPrompt => Category::Agent,
-            FieldLoc::BfBaseUrl | FieldLoc::BfApiKey | FieldLoc::BfVirtualKey | FieldLoc::BfPrimaryModel => Category::Bifrost,
+            FieldLoc::BfBaseUrl | FieldLoc::BfApiKey | FieldLoc::BfVirtualKey | FieldLoc::BfPrimaryModel | FieldLoc::BfTimeoutSecs => Category::Bifrost,
             FieldLoc::ScN1Enabled | FieldLoc::ScN1Trigger | FieldLoc::ScInboxEnabled | FieldLoc::ScModel | FieldLoc::ScMaxTokens => Category::Subconscious,
             FieldLoc::RfEnabled | FieldLoc::RfMessageInterval | FieldLoc::RfTrigger | FieldLoc::RfModel => Category::Reflection,
             FieldLoc::ArEnabled | FieldLoc::ArInterval | FieldLoc::ArThreshold | FieldLoc::ArCompressionModel => Category::Archivist,
@@ -189,12 +203,13 @@ impl FieldLoc {
             FieldLoc::WsEnabled | FieldLoc::WsPort => Category::WebSocket,
             FieldLoc::SePrimaryBandwidth | FieldLoc::SeLowUrgencyOnly | FieldLoc::SeMinimalPresenceMode => Category::Sensorium,
             FieldLoc::CpEnabled | FieldLoc::CpStrategy | FieldLoc::CpWarnPressure | FieldLoc::CpUrgentPressure | FieldLoc::CpCriticalPressure | FieldLoc::CpModel => Category::Compaction,
-            FieldLoc::SvBind | FieldLoc::SvPort | FieldLoc::SvUrl => Category::Server,
+            FieldLoc::SvBind | FieldLoc::SvPort | FieldLoc::SvUrl | FieldLoc::SvAuthRequired | FieldLoc::SvAuthLoopback => Category::Server,
             FieldLoc::ScdEnabled => Category::Schedules,
             FieldLoc::EvEnabled | FieldLoc::EvRetainDays => Category::Events,
-            FieldLoc::FdEnabled => Category::Federation,
+            FieldLoc::FdEnabled | FieldLoc::FdRole | FieldLoc::FdInstanceLabel | FieldLoc::FdAutoWake => Category::Federation,
             FieldLoc::PrPulseEnabled | FieldLoc::PrPulseIntervalSecs | FieldLoc::PrOutfit | FieldLoc::PrAtmosphere => Category::Presence,
             FieldLoc::VcEnabled | FieldLoc::VcSttUrl | FieldLoc::VcTtsUrl | FieldLoc::VcVoiceId | FieldLoc::VcPushToTalkKey => Category::Voice,
+            FieldLoc::TuShowInterstitial => Category::Tui,
         }
     }
 
@@ -257,6 +272,13 @@ impl FieldLoc {
             FieldLoc::VcTtsUrl => "tts_url",
             FieldLoc::VcVoiceId => "voice_id",
             FieldLoc::VcPushToTalkKey => "push_to_talk_key",
+            FieldLoc::BfTimeoutSecs => "timeout_secs",
+            FieldLoc::SvAuthRequired => "required",
+            FieldLoc::SvAuthLoopback => "allow_loopback",
+            FieldLoc::FdRole => "role",
+            FieldLoc::FdInstanceLabel => "instance_label",
+            FieldLoc::FdAutoWake => "auto_wake",
+            FieldLoc::TuShowInterstitial => "show_interstitial",
         }
     }
 
@@ -324,6 +346,13 @@ impl FieldLoc {
             FieldLoc::VcTtsUrl => "TTS endpoint",
             FieldLoc::VcVoiceId => "voice ID",
             FieldLoc::VcPushToTalkKey => "push-to-talk",
+            FieldLoc::BfTimeoutSecs => "request timeout (s)",
+            FieldLoc::SvAuthRequired => "require auth",
+            FieldLoc::SvAuthLoopback => "allow loopback bypass",
+            FieldLoc::FdRole => "role",
+            FieldLoc::FdInstanceLabel => "instance label",
+            FieldLoc::FdAutoWake => "auto-wake on summon",
+            FieldLoc::TuShowInterstitial => "interstitial narration",
         }
     }
 }
@@ -523,6 +552,7 @@ impl SettingsView {
                     let idx = variants.iter().position(|m| m == &self.config.bifrost.primary_model).unwrap_or(0);
                     out.push((BfPrimaryModel, EditableValue::EnumVariant { index: idx, variants }));
                 }
+                out.push((BfTimeoutSecs, EditableValue::Uint(self.config.bifrost.timeout_secs)));
             }
             Category::Subconscious => {
                 let sc = &self.config.subconscious;
@@ -652,6 +682,8 @@ impl SettingsView {
                 out.push((SvBind, EditableValue::Text(sv.bind.clone())));
                 out.push((SvPort, EditableValue::Uint(sv.port as u64)));
                 out.push((SvUrl, EditableValue::Text(sv.url.clone())));
+                out.push((SvAuthRequired, EditableValue::Bool(sv.auth.required)));
+                out.push((SvAuthLoopback, EditableValue::Bool(sv.auth.allow_loopback)));
             }
             Category::Schedules => {
                 out.push((ScdEnabled, EditableValue::Bool(self.config.schedules.enabled)));
@@ -662,7 +694,18 @@ impl SettingsView {
                 out.push((EvRetainDays, EditableValue::Int(ev.retain_days)));
             }
             Category::Federation => {
-                out.push((FdEnabled, EditableValue::Bool(self.config.federation.enabled)));
+                let fd = &self.config.federation;
+                out.push((FdEnabled, EditableValue::Bool(fd.enabled)));
+                let role_idx = match fd.role {
+                    FederationRole::Hearth => 0,
+                    FederationRole::Limb => 1,
+                };
+                out.push((FdRole, EditableValue::EnumVariant {
+                    index: role_idx,
+                    variants: vec!["hearth".into(), "limb".into()],
+                }));
+                out.push((FdInstanceLabel, EditableValue::OptionalText(fd.instance_label.clone())));
+                out.push((FdAutoWake, EditableValue::Bool(fd.auto_wake)));
             }
             Category::Presence => {
                 let pr = &self.config.presence;
@@ -695,6 +738,9 @@ impl SettingsView {
                 out.push((VcTtsUrl, EditableValue::Text(vc.tts_url.clone())));
                 out.push((VcVoiceId, EditableValue::Text(vc.voice_id.clone())));
                 out.push((VcPushToTalkKey, EditableValue::Text(vc.push_to_talk_key.clone())));
+            }
+            Category::Tui => {
+                out.push((TuShowInterstitial, EditableValue::Bool(self.config.tui.show_interstitial)));
             }
         }
         out
@@ -891,6 +937,28 @@ impl SettingsView {
             VcTtsUrl => { if let EditableValue::Text(v) = value { self.config.voice.tts_url = v; } }
             VcVoiceId => { if let EditableValue::Text(v) = value { self.config.voice.voice_id = v; } }
             VcPushToTalkKey => { if let EditableValue::Text(v) = value { self.config.voice.push_to_talk_key = v; } }
+
+            BfTimeoutSecs => { if let EditableValue::Uint(v) = value { self.config.bifrost.timeout_secs = v; } }
+
+            SvAuthRequired => { if let EditableValue::Bool(v) = value { self.config.server.auth.required = v; } }
+            SvAuthLoopback => { if let EditableValue::Bool(v) = value { self.config.server.auth.allow_loopback = v; } }
+
+            FdRole => {
+                if let EditableValue::EnumVariant { index, .. } = value {
+                    self.config.federation.role = match index {
+                        1 => FederationRole::Limb,
+                        _ => FederationRole::Hearth,
+                    };
+                }
+            }
+            FdInstanceLabel => {
+                if let EditableValue::OptionalText(v) = value {
+                    self.config.federation.instance_label = v;
+                }
+            }
+            FdAutoWake => { if let EditableValue::Bool(v) = value { self.config.federation.auto_wake = v; } }
+
+            TuShowInterstitial => { if let EditableValue::Bool(v) = value { self.config.tui.show_interstitial = v; } }
         }
         self.dirty = true;
     }
@@ -1168,7 +1236,7 @@ impl SettingsView {
                     cursor = prev;
                 }
                 // Backspace on empty Optional field → set to None
-                if buffer.is_empty() && matches!(loc, FieldLoc::ScModel | FieldLoc::RfModel | FieldLoc::CpModel | FieldLoc::ScMaxTokens | FieldLoc::MeBasePath) {
+                if buffer.is_empty() && matches!(loc, FieldLoc::ScModel | FieldLoc::RfModel | FieldLoc::CpModel | FieldLoc::ScMaxTokens | FieldLoc::MeBasePath | FieldLoc::FdInstanceLabel) {
                     self.apply_field(loc, EditableValue::OptionalText(None));
                     self.mode = SettingsMode::Browse;
                     return None;
@@ -1187,7 +1255,7 @@ impl SettingsView {
                     FieldLoc::ArInterval | FieldLoc::SaMaxConcurrent |
                     FieldLoc::SaTimeout | FieldLoc::SaMaxDepth |
                     FieldLoc::SaMaxToolRounds | FieldLoc::SaInterRoundDelayMs |
-                    FieldLoc::WsPort | FieldLoc::SvPort |
+                    FieldLoc::WsPort | FieldLoc::SvPort | FieldLoc::BfTimeoutSecs |
                     FieldLoc::EvRetainDays | FieldLoc::PrPulseIntervalSecs
                 );
                 let is_float = matches!(loc,
@@ -1225,7 +1293,7 @@ impl SettingsView {
             FieldLoc::ArInterval | FieldLoc::SaMaxConcurrent |
             FieldLoc::SaTimeout | FieldLoc::SaMaxDepth |
             FieldLoc::SaMaxToolRounds | FieldLoc::SaInterRoundDelayMs |
-            FieldLoc::WsPort | FieldLoc::SvPort |
+            FieldLoc::WsPort | FieldLoc::SvPort | FieldLoc::BfTimeoutSecs |
             FieldLoc::PrPulseIntervalSecs => {
                 if let Ok(v) = buffer.parse::<u64>() {
                     self.apply_field(loc, EditableValue::Uint(v));
@@ -1244,7 +1312,7 @@ impl SettingsView {
                 }
             }
             FieldLoc::ScModel | FieldLoc::RfModel | FieldLoc::CpModel
-            | FieldLoc::MeBasePath | FieldLoc::ScMaxTokens => {
+            | FieldLoc::MeBasePath | FieldLoc::ScMaxTokens | FieldLoc::FdInstanceLabel => {
                 let val = if buffer.is_empty() { None } else { Some(buffer.to_string()) };
                 self.apply_field(loc, EditableValue::OptionalText(val));
             }
