@@ -113,6 +113,8 @@ pub enum FieldLoc {
     // Subconscious
     ScN1Enabled,
     ScN1Trigger,
+    ScN1Every,
+    ScN1Secs,
     ScInboxEnabled,
     ScModel,
     ScMaxTokens,
@@ -194,7 +196,8 @@ impl FieldLoc {
         match self {
             FieldLoc::AgSystemPrompt => Category::Agent,
             FieldLoc::BfBaseUrl | FieldLoc::BfApiKey | FieldLoc::BfVirtualKey | FieldLoc::BfPrimaryModel | FieldLoc::BfTimeoutSecs => Category::Bifrost,
-            FieldLoc::ScN1Enabled | FieldLoc::ScN1Trigger | FieldLoc::ScInboxEnabled | FieldLoc::ScModel | FieldLoc::ScMaxTokens => Category::Subconscious,
+            FieldLoc::ScN1Enabled | FieldLoc::ScN1Trigger | FieldLoc::ScN1Every | FieldLoc::ScN1Secs
+                | FieldLoc::ScInboxEnabled | FieldLoc::ScModel | FieldLoc::ScMaxTokens => Category::Subconscious,
             FieldLoc::RfEnabled | FieldLoc::RfMessageInterval | FieldLoc::RfTrigger | FieldLoc::RfModel => Category::Reflection,
             FieldLoc::ArEnabled | FieldLoc::ArInterval | FieldLoc::ArThreshold | FieldLoc::ArCompressionModel => Category::Archivist,
             FieldLoc::SaEnabled | FieldLoc::SaMaxConcurrent | FieldLoc::SaTimeout | FieldLoc::SaMaxDepth | FieldLoc::SaMaxToolRounds
@@ -222,6 +225,8 @@ impl FieldLoc {
             FieldLoc::BfPrimaryModel => "primary_model",
             FieldLoc::ScN1Enabled => "n1_enabled",
             FieldLoc::ScN1Trigger => "n1_trigger",
+            FieldLoc::ScN1Every => "n1_every_n_responses",
+            FieldLoc::ScN1Secs => "n1_interval_secs",
             FieldLoc::ScInboxEnabled => "inbox_enabled",
             FieldLoc::ScModel => "model",
             FieldLoc::ScMaxTokens => "max_tokens",
@@ -296,6 +301,8 @@ impl FieldLoc {
             FieldLoc::BfPrimaryModel => "primary model",
             FieldLoc::ScN1Enabled => "N+1 enabled",
             FieldLoc::ScN1Trigger => "N+1 trigger",
+            FieldLoc::ScN1Every => "  └ every N responses",
+            FieldLoc::ScN1Secs => "  └ interval (s)",
             FieldLoc::ScInboxEnabled => "inbox",
             FieldLoc::ScModel => "model",
             FieldLoc::ScMaxTokens => "max tokens",
@@ -354,6 +361,17 @@ impl FieldLoc {
             FieldLoc::FdAutoWake => "auto-wake on summon",
             FieldLoc::TuShowInterstitial => "interstitial narration",
         }
+    }
+
+    /// Whether a change to this field reaches the running system immediately.
+    /// On save the whole config is written to disk and to the shared config
+    /// lock — but most subsystems captured their settings at startup and only
+    /// re-read on restart. These few are wired to apply live.
+    pub fn applies_live(&self) -> bool {
+        matches!(
+            self,
+            FieldLoc::PrAtmosphere | FieldLoc::PrOutfit | FieldLoc::BfPrimaryModel
+        )
     }
 }
 
@@ -565,6 +583,16 @@ impl SettingsView {
                 };
                 let n1_variants = vec!["every_response".into(), "every_n_responses".into(), "time_based".into(), "manual".into()];
                 out.push((ScN1Trigger, EditableValue::EnumVariant { index: n1_idx, variants: n1_variants }));
+                // Trigger payload — only the field for the active trigger mode.
+                match sc.n1_trigger {
+                    N1Trigger::EveryNResponses(n) => {
+                        out.push((ScN1Every, EditableValue::Uint(n as u64)));
+                    }
+                    N1Trigger::TimeBased(s) => {
+                        out.push((ScN1Secs, EditableValue::Uint(s)));
+                    }
+                    _ => {}
+                }
                 out.push((ScInboxEnabled, EditableValue::Bool(sc.inbox_enabled)));
                 if self.available_models.is_empty() {
                     out.push((ScModel, EditableValue::OptionalText(sc.model.clone())));
@@ -789,6 +817,16 @@ impl SettingsView {
                         3 => N1Trigger::Manual,
                         _ => N1Trigger::EveryResponse,
                     };
+                }
+            }
+            ScN1Every => {
+                if let EditableValue::Uint(v) = value {
+                    self.config.subconscious.n1_trigger = N1Trigger::EveryNResponses(v as usize);
+                }
+            }
+            ScN1Secs => {
+                if let EditableValue::Uint(v) = value {
+                    self.config.subconscious.n1_trigger = N1Trigger::TimeBased(v);
                 }
             }
             ScInboxEnabled => { if let EditableValue::Bool(v) = value { self.config.subconscious.inbox_enabled = v; } }
@@ -1256,6 +1294,7 @@ impl SettingsView {
                     FieldLoc::SaTimeout | FieldLoc::SaMaxDepth |
                     FieldLoc::SaMaxToolRounds | FieldLoc::SaInterRoundDelayMs |
                     FieldLoc::WsPort | FieldLoc::SvPort | FieldLoc::BfTimeoutSecs |
+                    FieldLoc::ScN1Every | FieldLoc::ScN1Secs |
                     FieldLoc::EvRetainDays | FieldLoc::PrPulseIntervalSecs
                 );
                 let is_float = matches!(loc,
@@ -1294,6 +1333,7 @@ impl SettingsView {
             FieldLoc::SaTimeout | FieldLoc::SaMaxDepth |
             FieldLoc::SaMaxToolRounds | FieldLoc::SaInterRoundDelayMs |
             FieldLoc::WsPort | FieldLoc::SvPort | FieldLoc::BfTimeoutSecs |
+            FieldLoc::ScN1Every | FieldLoc::ScN1Secs |
             FieldLoc::PrPulseIntervalSecs => {
                 if let Ok(v) = buffer.parse::<u64>() {
                     self.apply_field(loc, EditableValue::Uint(v));
@@ -1451,8 +1491,17 @@ fn draw_field_panel(frame: &mut Frame, area: Rect, view: &SettingsView) {
         }
 
         spans.extend(value.display_spans(is_selected, &view.palette));
+        if loc.applies_live() {
+            spans.push(Span::styled("  ◆", Style::default().fg(Color::Rgb(120, 200, 120))));
+        }
         lines.push(Line::from(spans));
     }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  ◆ applies live · other changes take effect on restart",
+        Style::default().fg(p.agent_dim).add_modifier(Modifier::ITALIC),
+    )));
 
     let focused = view.focus == PanelFocus::Fields;
     let border_color = if view.dirty {
