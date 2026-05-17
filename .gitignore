@@ -1,7 +1,6 @@
 # Rust
 /target/
 **/*.rs.bk
-Cargo.lock
 
 # IDE
 .vscode/
@@ -41,6 +40,9 @@ lcov.info
 # Local development
 local.toml
 config.local.toml
+
+# Voice-input test recordings — transient, stay local
+voice-recording-*.mp3
 
 # Memory repos (should be external)
 .memer/
