@@ -105,6 +105,7 @@ impl Category {
 pub enum FieldLoc {
     // Agent
     AgSystemPrompt,
+    AgModel,
     // Bifrost
     BfBaseUrl,
     BfApiKey,
@@ -196,7 +197,7 @@ pub enum FieldLoc {
 impl FieldLoc {
     pub fn category(&self) -> Category {
         match self {
-            FieldLoc::AgSystemPrompt => Category::Agent,
+            FieldLoc::AgSystemPrompt | FieldLoc::AgModel => Category::Agent,
             FieldLoc::BfBaseUrl | FieldLoc::BfApiKey | FieldLoc::BfVirtualKey | FieldLoc::BfPrimaryModel | FieldLoc::BfTimeoutSecs => Category::Bifrost,
             FieldLoc::ScN1Enabled | FieldLoc::ScN1Trigger | FieldLoc::ScN1Every | FieldLoc::ScN1Secs
                 | FieldLoc::ScInboxEnabled | FieldLoc::ScModel | FieldLoc::ScMaxTokens
@@ -222,6 +223,7 @@ impl FieldLoc {
     pub fn key(&self) -> &'static str {
         match self {
             FieldLoc::AgSystemPrompt => "system_prompt",
+            FieldLoc::AgModel => "model",
             FieldLoc::BfBaseUrl => "base_url",
             FieldLoc::BfApiKey => "api_key",
             FieldLoc::BfVirtualKey => "virtual_key",
@@ -300,6 +302,7 @@ impl FieldLoc {
     pub fn label(&self) -> &'static str {
         match self {
             FieldLoc::AgSystemPrompt => "platform prompt",
+            FieldLoc::AgModel => "agent model",
             FieldLoc::BfBaseUrl => "endpoint",
             FieldLoc::BfApiKey => "API key",
             FieldLoc::BfVirtualKey => "virtual key",
@@ -377,7 +380,7 @@ impl FieldLoc {
     pub fn applies_live(&self) -> bool {
         matches!(
             self,
-            FieldLoc::PrAtmosphere | FieldLoc::PrOutfit | FieldLoc::BfPrimaryModel
+            FieldLoc::PrAtmosphere | FieldLoc::PrOutfit | FieldLoc::BfPrimaryModel | FieldLoc::AgModel
         )
     }
 }
@@ -466,6 +469,22 @@ pub enum SettingsMode {
 
 // ── Main state ──────────────────────────────────────────────────────────────
 
+/// The active agent's per-agent settings, loaded into the view so the Agent
+/// category edits *this agent* — not substrate-wide config. `None` when
+/// Settings is opened with no resolvable agent / backend (the per-agent
+/// fields are then simply not shown).
+#[derive(Debug, Clone, Default)]
+pub struct ActiveAgentSettings {
+    /// Agent id — the save target.
+    pub id: String,
+    /// Display name, so the field shows which agent is being edited.
+    pub name: String,
+    /// Editable working copy of the agent's llm model handle.
+    pub model: String,
+    /// The model as loaded — for save-time diffing.
+    pub model_original: String,
+}
+
 pub struct SettingsView {
     /// Working copy of config — all edits go here.
     pub config: ConsciousnessConfig,
@@ -493,6 +512,10 @@ pub struct SettingsView {
 
     /// Atmosphere-derived colour palette. Used for coloured values and accents.
     pub palette: ChatPalette,
+
+    /// The agent the Settings screen is editing per-agent fields for. Set by
+    /// App on entry from the active agent, so Settings follows agent switches.
+    pub active_agent: Option<ActiveAgentSettings>,
 }
 
 impl SettingsView {
@@ -510,7 +533,24 @@ impl SettingsView {
             models_rx: None,
             models_fetching: false,
             palette: ChatPalette::default(),
+            active_agent: None,
         }
+    }
+
+    /// Load the active agent's per-agent settings into the view. Called by App
+    /// on Settings entry so the Agent category edits the agent we're working
+    /// as — and follows when the user switches agents. `None` clears it.
+    pub fn set_active_agent(&mut self, agent: Option<ActiveAgentSettings>) {
+        self.active_agent = agent;
+    }
+
+    /// Whether the active agent's model was changed and needs pushing back to
+    /// the agent record on save.
+    pub fn agent_model_dirty(&self) -> bool {
+        self.active_agent
+            .as_ref()
+            .map(|a| a.model != a.model_original)
+            .unwrap_or(false)
     }
 
     /// Called each tick. Drains the model fetch receiver if one is pending.
@@ -562,6 +602,20 @@ impl SettingsView {
         match cat {
             Category::Agent => {
                 out.push((AgSystemPrompt, EditableValue::OptionalText(self.config.agent.system_prompt.clone())));
+                // Per-agent model — edits the active agent's llm_config.model,
+                // not the substrate-wide bifrost.primary_model default.
+                if let Some(agent) = &self.active_agent {
+                    if self.available_models.is_empty() {
+                        out.push((AgModel, EditableValue::Text(agent.model.clone())));
+                    } else {
+                        let mut variants = self.available_models.clone();
+                        if !agent.model.is_empty() && !variants.contains(&agent.model) {
+                            variants.insert(0, agent.model.clone());
+                        }
+                        let idx = variants.iter().position(|m| m == &agent.model).unwrap_or(0);
+                        out.push((AgModel, EditableValue::EnumVariant { index: idx, variants }));
+                    }
+                }
             }
             Category::Bifrost => {
                 out.push((BfBaseUrl, EditableValue::Text(self.config.bifrost.base_url.clone())));
@@ -790,6 +844,17 @@ impl SettingsView {
             AgSystemPrompt => {
                 if let EditableValue::OptionalText(v) = value {
                     self.config.agent.system_prompt = v;
+                }
+            }
+            AgModel => {
+                if let Some(agent) = &mut self.active_agent {
+                    match value {
+                        EditableValue::Text(v) => agent.model = v,
+                        EditableValue::EnumVariant { index, variants } => {
+                            if let Some(m) = variants.get(index) { agent.model = m.clone(); }
+                        }
+                        _ => {}
+                    }
                 }
             }
             BfBaseUrl => { if let EditableValue::Text(v) = value { self.config.bifrost.base_url = v; } }

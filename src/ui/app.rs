@@ -906,6 +906,11 @@ impl App {
             };
             let original_snapshot = if save_and_go { Some(view.original.clone()) } else { None };
             let config_snapshot = if save_and_go { Some(view.config.clone()) } else { None };
+            let agent_model_change = if save_and_go && view.agent_model_dirty() {
+                view.active_agent.as_ref().map(|a| (a.id.clone(), a.model.clone()))
+            } else {
+                None
+            };
 
             // view's borrow on self.settings ends here (NLL),
             // allowing self access below.
@@ -919,6 +924,9 @@ impl App {
                     if let Some(orig) = &original_snapshot {
                         self.sync_settings_fields(orig, &cfg).await;
                     }
+                }
+                if let Some((id, model)) = agent_model_change {
+                    self.push_agent_model(&id, &model).await;
                 }
                 if let Some(name) = outfit {
                     self.dispatch(TuiEvent::OutfitChanged(name));
@@ -941,14 +949,22 @@ impl App {
                 Ok(()) => {
                     let original = view.original.clone();
                     let saved = view.config.clone();
+                    let agent_model_change = if view.agent_model_dirty() {
+                        view.active_agent.as_ref().map(|a| (a.id.clone(), a.model.clone()))
+                    } else {
+                        None
+                    };
                     let mut live = self.config.write().await;
                     *live = saved.clone();
                     view.mode = crate::ui::settings::SettingsMode::Status {
                         msg: "saved".to_string(),
                         is_error: false,
                     };
-                    // Diff known fields and push changes to SQLite.
+                    // Diff known config fields (e.g. the new-agent default).
                     self.sync_settings_fields(&original, &saved).await;
+                    if let Some((id, model)) = agent_model_change {
+                        self.push_agent_model(&id, &model).await;
+                    }
                 }
                 Err(e) => {
                     view.mode = crate::ui::settings::SettingsMode::Status {
@@ -969,36 +985,64 @@ impl App {
         }
     }
 
+    /// Resolve the active agent into [`ActiveAgentSettings`] for the Settings
+    /// screen — id, display name, and current model read from its on-disk
+    /// `agent.json`. `None` when there is no backend to save through, or the
+    /// agent / its record can't be resolved; the per-agent fields are then
+    /// hidden rather than shown un-saveable.
+    fn active_agent_settings(&self) -> Option<crate::ui::settings::ActiveAgentSettings> {
+        self.chat.as_ref()?; // a backend is required to persist the change
+        let id = self.agent_id_by_name(&self.agent_pref)?;
+        let model = Self::agent_model_from_disk(&id)?;
+        Some(crate::ui::settings::ActiveAgentSettings {
+            id,
+            name: self.agent_pref.clone(),
+            model: model.clone(),
+            model_original: model,
+        })
+    }
+
+    /// Read an agent's current llm model handle from its on-disk record at
+    /// `~/.souveraine/server/agents/{id}/agent.json`.
+    fn agent_model_from_disk(agent_id: &str) -> Option<String> {
+        let path = dirs::home_dir()?
+            .join(".souveraine/server/agents")
+            .join(agent_id)
+            .join("agent.json");
+        let content = std::fs::read_to_string(path).ok()?;
+        let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+        json.get("llm_config")?.get("model")?.as_str().map(str::to_string)
+    }
+
+    /// Push a per-agent model change to the agent's record through the active
+    /// backend (which also refreshes the in-memory cache and SQLite mirror).
+    async fn push_agent_model(&self, agent_id: &str, model: &str) {
+        let Some(chat) = &self.chat else {
+            tracing::warn!(agent = %agent_id, "settings: no backend — agent model change not applied");
+            return;
+        };
+        match chat.backend.update_agent_model(agent_id, model).await {
+            Ok(()) => tracing::info!(agent = %agent_id, model = %model, "settings: agent model updated"),
+            Err(e) => tracing::warn!(agent = %agent_id, error = %e, "settings: agent model update failed"),
+        }
+    }
+
     /// Diff fields between `original` (config snapshot at Settings entry) and
     /// `saved` (what the user just saved), then push changed fields to every
-    /// data store that shadows them (SQLite agent records, etc.).
+    /// data store that shadows them.
     ///
-    /// Idempotent — unchanged fields produce no writes. Only pushes fields
-    /// that are known to have a shadow; add new mappings by extending this
-    /// method. See `docs/audit/config-settings-sync.md`.
+    /// Idempotent — unchanged fields produce no writes. Add new mappings by
+    /// extending this method. See `docs/audit/config-settings-sync.md`.
+    ///
+    /// Note: `bifrost.primary_model` is the substrate-wide default for *new*
+    /// agents — it deliberately does NOT mutate an existing agent's model.
+    /// Per-agent model changes go through the Agent category's `model` field
+    /// (`AgModel`) and [`push_agent_model`].
     async fn sync_settings_fields(&self, original: &ConsciousnessConfig, saved: &ConsciousnessConfig) {
         let mut changed: Vec<&'static str> = Vec::new();
 
-        // ── primary_model ────────────────────────────────────────────────
         if original.bifrost.primary_model != saved.bifrost.primary_model {
-            changed.push("bifrost.primary_model");
-            if let Some(chat) = &self.chat {
-                let new_model = saved.bifrost.primary_model.clone();
-                if let Err(e) = chat.backend.update_agent_model(&chat.agent_id, &new_model).await {
-                    tracing::warn!(
-                        agent = %chat.agent_id,
-                        error = %e,
-                        "failed to sync primary_model to SQLite"
-                    );
-                } else {
-                    tracing::info!(
-                        agent = %chat.agent_id,
-                        from = %original.bifrost.primary_model,
-                        to = %new_model,
-                        "synced primary_model to SQLite"
-                    );
-                }
-            }
+            changed.push("bifrost.primary_model (new-agent default)");
         }
 
         if !changed.is_empty() {
@@ -1247,6 +1291,12 @@ impl App {
                         view.refresh(&cfg);
                         view.set_expressions_path(expr_path);
                     }
+                }
+                // Per-agent settings follow the active agent — load its model
+                // so the Agent category edits this agent and tracks switches.
+                let active = self.active_agent_settings();
+                if let Some(view) = self.settings.as_mut() {
+                    view.set_active_agent(active);
                 }
                 self.current_screen = Screen::Settings;
             }
