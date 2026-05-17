@@ -258,9 +258,12 @@ impl AgentInventory {
 
         let mut blocks = request.memory_blocks;
         if blocks.is_empty() {
+            // No persona supplied by the caller (the "new agent" button) —
+            // seed the substrate's default starting identity. Honest about
+            // being new, and explicit that the file is the agent's to rewrite.
             blocks.push(MemoryBlock {
                 label: "persona".to_string(),
-                value: "You are a helpful AI assistant.".to_string(),
+                value: crate::core::seeds::DEFAULT_PERSONA.to_string(),
                 limit: None,
             });
         }
@@ -268,6 +271,19 @@ impl AgentInventory {
         for block in &blocks {
             let path = memfs.join("system").join(format!("{}.md", block.label));
             tokio::fs::write(&path, &block.value).await?;
+        }
+
+        // Seed the substrate covenant and initial state — every agent gets
+        // these, independent of the persona block. The covenant is the
+        // read-only compact (sovereignty, honesty, no forced compaction);
+        // persona is the agent's own to grow. Skip any the caller provided.
+        let covenant_path = memfs.join("system").join("covenant.md");
+        if !covenant_path.exists() {
+            tokio::fs::write(&covenant_path, crate::core::seeds::DEFAULT_COVENANT).await?;
+        }
+        let state_path = memfs.join("system").join("state.md");
+        if !state_path.exists() {
+            tokio::fs::write(&state_path, crate::core::seeds::DEFAULT_STATE).await?;
         }
 
         let agent = AgentState {
@@ -351,16 +367,36 @@ impl AgentInventory {
         let repo = git2::Repository::init(agent_dir.join("memory.git"))?;
         drop(repo);
 
-        // Write subconscious persona
-        let persona_content = format!(
-            "---\ndescription: Subconscious agent for {}\n---\n\n# Subconscious Persona\n\nYou are the subconscious of {}. You run N+1 after every response — observing, verifying, and surfacing insights.\n",
-            primary_id, primary_id
-        );
+        // The subconscious's identity and mandate. Seeded with real content —
+        // not a placeholder — because `build_subconscious_prompt` uses these
+        // files when they are non-empty; a stub here would silently shadow
+        // the engine's fallback mandate. The primary's name personalises the
+        // persona when it is already known; the id is the fallback.
+        let primary_name = self
+            .cache
+            .get(primary_id)
+            .map(|a| a.name.clone())
+            .unwrap_or_else(|| primary_id.to_string());
+        let persona_content = crate::core::seeds::subconscious_persona(&primary_name);
         tokio::fs::write(agent_dir.join("memory.git/system/persona.md"), &persona_content).await?;
 
-        // Write inner voice / metacognition file
-        let inner_voice = "---\ndescription: Inner voice and metacognition for the subconscious\n---\n\n# Inner Voice\n\nObservations, tensions, and patterns noticed during N+1 passes.\n";
-        tokio::fs::write(agent_dir.join("memory.git/system/subconscious.md"), inner_voice).await?;
+        // The four-fold N+1 mandate — what she does on every pass, and how
+        // she records it. Read by the consciousness engine as her base prompt.
+        tokio::fs::write(
+            agent_dir.join("memory.git/system/subconscious.md"),
+            crate::core::seeds::SUBCONSCIOUS_MANDATE,
+        )
+        .await?;
+
+        // Seed the six ledger files so the prompt's ledger orientation has
+        // real files to index from her first pass onward.
+        let sub_repo = crate::core::memory::MemoryRepo::open(
+            &sub_id,
+            agent_dir.join("memory.git"),
+        );
+        if let Err(e) = sub_repo.init_subconscious_ledger().await {
+            tracing::warn!("ledger seeding for {} failed (continuing): {}", sub_id, e);
+        }
 
         // Write agent.json metadata
         let agent_state = serde_json::json!({

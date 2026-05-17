@@ -1253,6 +1253,33 @@ async fn run_turn(
     // substrate signals; it does not hold her hostage to Aster's pass.
     let _ = tx.send(Ok(BackendEvent::PrimaryComplete)).await;
 
+    // N+1 gate — the subconscious pass is sovereign-configurable, and the
+    // toggle must actually be wired (it was previously read nowhere). The
+    // global switch (`souveraine.toml [subconscious] n1_enabled`) and the
+    // per-agent flag (`agent.json _souveraine.n1_enabled`) must both be on.
+    // Either off → the primary's turn simply ends here; pressure is still
+    // recalculated so the gauge stays honest.
+    let n1_enabled = {
+        let global = server.app_config.read().await.subconscious.n1_enabled;
+        let per_agent = server
+            .agents
+            .get(&agent_id)
+            .await
+            .map(|a| a.souveraine.n1_enabled)
+            .unwrap_or(true);
+        global && per_agent
+    };
+    if !n1_enabled {
+        tracing::info!(agent = %agent_id, "subconscious N+1 pass disabled — skipping");
+        if let Some(mut session) = server.sessions.get_mut(&conversation_id) {
+            let pressure = server
+                .consciousness
+                .calculate_pressure(&session.messages, context_limit);
+            session.context_pressure = pressure;
+        }
+        return Ok(());
+    }
+
     // Breather between turns — unconditional,
     // so the upstream always gets a gap before the N+1 pass starts.
     tokio::time::sleep(Duration::from_millis(2000)).await;

@@ -9,7 +9,7 @@ api_key = "sk-bf-ae0d5801-9936-4fa9-ac9e-e956ffce6cfa"
 virtual_key = ""  # x-bf-vk header if required by provider
 
 # Default model for conversation
-primary_model = "fireworks/accounts/fireworks/routers/kimi-k2p5-turbo"
+primary_model = "openai/kimi-k2.6"
 
 # Request timeout in seconds for each LLM call attempt (default: 120).
 # When exceeded, the attempt is retried up to 6 times with backoff.
@@ -21,8 +21,8 @@ context_limit = 128000
 output_limit = 8192
 archivist_threshold = 0.7
 
-[bifrost.models.kimi-k2p5-turbo]
-context_limit = 128000
+[bifrost.models.kimi-k2.6]
+context_limit = 262000
 output_limit = 8192
 archivist_threshold = 0.7
 

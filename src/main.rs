@@ -23,7 +23,7 @@ const CONFIG_TEMPLATE: &str = r##"# Souveraine — The world where your agents l
 
 [bifrost]
 base_url = "http://10.10.20.120:3360"
-primary_model = "kimi-k2.5-turbo"
+primary_model = "openai/kimi-k2.6"
 # Bearer token for auth (env: BIFROST_KEY)
 api_key = ""
 # Virtual key for x-bf-vk header, required by some providers (env: BIFROST_VIRTUAL_KEY)
@@ -57,15 +57,15 @@ trigger = "step_count"
 enabled = true
 interval = 100
 threshold = 0.7
-compression_model = "kimi-k2.5-turbo"
+compression_model = "openai/kimi-k2.6"
 
 [sensorium]
 primary_interface = "tui"
 
-[models."kimi-k2.5-turbo"]
+[models."kimi-k2.6"]
 provider = "bifrost"
-model = "fireworks/accounts/fireworks/routers/kimi-k2p5-turbo"
-context_limit = 128000
+model = "openai/kimi-k2.6"
+context_limit = 262000
 output_limit = 8192
 archivist_threshold = 0.7
 archivist_interval = 100

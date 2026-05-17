@@ -331,13 +331,15 @@ pub async fn build_system_prompt_full(
     let mut seen: std::collections::HashSet<std::path::PathBuf> = Default::default();
 
     // 0. Platform prompt — substrate-provided, injected before agent identity.
-    //    Operator-level context the agent reads but did not write.
-    if let Some(pp) = platform_prompt {
-        let trimmed = pp.trim();
-        if !trimmed.is_empty() {
-            sections.push(trimmed.to_string());
-        }
-    }
+    //    Operator-level context the agent reads but did not write. When the
+    //    operator has set one in config (`[agent] system_prompt`) it wins;
+    //    otherwise the built-in substrate orientation is used, so no agent
+    //    ever wakes without knowing the world she wakes into.
+    let platform = platform_prompt
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(crate::core::seeds::SUBSTRATE_PROMPT);
+    sections.push(platform.to_string());
 
     // 1. Core identity — try structured dir first, then flat persona.md
     let identity = read_memory_dir_tracking(memory_root, "system/identity", &mut seen).await;

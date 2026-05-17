@@ -18,6 +18,7 @@ pub mod nervous;
 pub mod memory;
 pub mod prompt;
 pub mod reflection;
+pub mod seeds;
 pub mod sensorium;
 pub mod session;
 pub mod skills;

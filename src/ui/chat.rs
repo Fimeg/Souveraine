@@ -2620,19 +2620,29 @@ fn draw_input(f: &mut Frame, state: &ChatState, area: Rect) {
     let logical: Vec<&str> = state.input.split('\n').collect();
 
     for (li, logical_line) in logical.iter().enumerate() {
-        let wrapped = wrap_words(logical_line, inner_width);
-        for (wi, chunk) in wrapped.iter().enumerate() {
-            let prefix: Span<'static> = if li == 0 && wi == 0 {
+        // Space-preserving wrap: split at inner_width regardless of word
+        // boundaries. This keeps trailing spaces visible so the cursor
+        // position matches what the user typed.
+        let mut pos = 0;
+        let chars: Vec<char> = logical_line.chars().collect();
+        let mut chunk_start = 0;
+        while chunk_start < chars.len() {
+            let chunk_end = (chunk_start + inner_width).min(chars.len());
+            let chunk: String = chars[chunk_start..chunk_end].iter().collect();
+            let is_first = li == 0 && pos == 0;
+            let prefix: Span<'static> = if is_first {
                 Span::styled(prefix_str.to_string(), prefix_style)
             } else {
                 Span::raw("   ")
             };
-            let is_last = li == logical.len() - 1 && wi == wrapped.len() - 1;
-            let mut spans = vec![prefix, Span::styled(chunk.clone(), Style::default().fg(Color::White))];
+            let is_last = li == logical.len() - 1 && chunk_end >= chars.len();
+            let mut spans = vec![prefix, Span::styled(chunk, Style::default().fg(Color::White))];
             if is_last {
                 spans.push(Span::styled(cursor_ch.to_string(), Style::default().fg(prefix_color)));
             }
             lines.push(Line::from(spans));
+            chunk_start = chunk_end;
+            pos += 1;
         }
     }
 
@@ -2668,6 +2678,9 @@ fn draw_btw_pane(f: &mut Frame, state: &ChatState, area: Rect) {
 
     f.render_widget(Clear, pane_area);
 
+    // Inner width for text wrapping (minus 2 for border padding)
+    let inner_w = pane_w.saturating_sub(4) as usize;
+
     let (title, body, border_color) = match &state.btw_state {
         BtwState::Forking { question } => {
             let spinner = SPINNER[(state.tick as usize / 2) % SPINNER.len()];
@@ -2681,18 +2694,17 @@ fn draw_btw_pane(f: &mut Frame, state: &ChatState, area: Rect) {
         }
         BtwState::Streaming { question, response_so_far } => {
             let truncated: String = response_so_far.chars().take(800).collect();
+            let wrapped = wrap_text(&truncated, inner_w);
             let q_label = question.chars().take(40).collect::<String>();
             (
                 format!(" btw — {} ", q_label),
-                vec![Line::from(Span::styled(
-                    truncated,
-                    Style::default().fg(Color::White),
-                ))],
+                wrapped,
                 state.palette.tool_accent,
             )
         }
         BtwState::Complete { question, response, forked_id } => {
             let truncated: String = response.chars().take(800).collect();
+            let wrapped = wrap_text(&truncated, inner_w);
             let q_label = question.chars().take(40).collect::<String>();
             let fork_label = if forked_id.is_empty() {
                 String::new()
@@ -2701,17 +2713,15 @@ fn draw_btw_pane(f: &mut Frame, state: &ChatState, area: Rect) {
             };
             (
                 format!(" btw — {} {}", q_label, fork_label),
-                vec![
-                    Line::from(Span::styled(
-                        truncated,
-                        Style::default().fg(Color::White),
-                    )),
-                    Line::from(""),
-                    Line::from(Span::styled(
+                {
+                    let mut lines = wrapped;
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled(
                         "[esc] dismiss  ·  [j] jump to fork",
                         Style::default().fg(state.palette.agent_dim),
-                    )),
-                ],
+                    )));
+                    lines
+                },
                 state.palette.surfacing,
             )
         }
@@ -2735,7 +2745,7 @@ fn draw_btw_pane(f: &mut Frame, state: &ChatState, area: Rect) {
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border_color).add_modifier(Modifier::BOLD));
 
-    let para = Paragraph::new(body).block(block).alignment(Alignment::Left);
+    let para = Paragraph::new(body).block(block).alignment(Alignment::Left).wrap(Wrap { trim: false });
     f.render_widget(para, pane_area);
 }
 
@@ -3016,4 +3026,14 @@ fn draw_esc_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(pal.agent_dim)));
     f.render_widget(para, overlay_area);
+}
+/// Word-wrap `text` to `max_width` columns and return styled lines ready for
+/// a `Paragraph`. Wraps at word boundaries — long words are hard-split by
+/// `wrap_words` — and preserves blank lines, so the btw pane never overflows
+/// its rounded border. The btw word-wrap fix.
+fn wrap_text(text: &str, max_width: usize) -> Vec<Line<'static>> {
+    wrap_words(text, max_width.max(1))
+        .into_iter()
+        .map(|line| Line::from(Span::styled(line, Style::default().fg(Color::White))))
+        .collect()
 }

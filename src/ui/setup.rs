@@ -938,7 +938,7 @@ mod tests {
 
     #[test]
     fn test_fresh_install_flow() {
-        let mut state = SetupState::new(SetupFlow::FreshInstall, "kimi-k2.5-turbo");
+        let mut state = SetupState::new(SetupFlow::FreshInstall, "kimi-k2.6");
         assert_eq!(state.step, SetupStep::Welcome);
         assert!(state.form.show_submit);
         assert!(state.form.is_submit_focused());
@@ -956,7 +956,7 @@ mod tests {
 
     #[test]
     fn test_import_agent_flow() {
-        let mut state = SetupState::new(SetupFlow::ImportAgent, "kimi-k2.5-turbo");
+        let mut state = SetupState::new(SetupFlow::ImportAgent, "kimi-k2.6");
         assert_eq!(state.step, SetupStep::CreateAgent);
         state.advance();
         assert_eq!(state.step, SetupStep::ImportOrFederation);
@@ -968,7 +968,7 @@ mod tests {
 
     #[test]
     fn test_text_input() {
-        let mut state = SetupState::new(SetupFlow::FreshInstall, "kimi-k2.5-turbo");
+        let mut state = SetupState::new(SetupFlow::FreshInstall, "kimi-k2.6");
         state.advance(); // → BifrostConfig
         state.form.focus = 0;
         state.form.slots[0].kind = SlotKind::Text {
@@ -986,7 +986,7 @@ mod tests {
 
     #[test]
     fn test_go_back() {
-        let mut state = SetupState::new(SetupFlow::FreshInstall, "kimi-k2.5-turbo");
+        let mut state = SetupState::new(SetupFlow::FreshInstall, "kimi-k2.6");
         state.advance();
         state.advance();
         state.go_back();
@@ -995,7 +995,7 @@ mod tests {
 
     #[test]
     fn test_model_picker_cycle() {
-        let mut state = SetupState::new(SetupFlow::FreshInstall, "kimi-k2.5-turbo");
+        let mut state = SetupState::new(SetupFlow::FreshInstall, "kimi-k2.6");
         state.advance(); // BifrostConfig
         state.advance(); // CreateAgent
 
@@ -1009,13 +1009,13 @@ mod tests {
             variants.push("model-c".to_string());
         }
 
-        // Current value should be the default (kimi-k2.5-turbo isn't in variants yet)
-        assert_eq!(state.form.slots[1].value(), "kimi-k2.5-turbo");
+        // Current value should be the default (kimi-k2.6 isn't in variants yet)
+        assert_eq!(state.form.slots[1].value(), "kimi-k2.6");
 
         // Simulate a fetch that populates variants properly synced with value
         if let SlotKind::ModelPicker { ref mut variants, .. } = state.form.slots[1].kind {
             variants.clear();
-            variants.push("kimi-k2.5-turbo".to_string());
+            variants.push("kimi-k2.6".to_string());
             variants.push("gpt-4o".to_string());
             variants.push("claude-3.7".to_string());
         }
@@ -1025,9 +1025,9 @@ mod tests {
         state.handle_key(key);
         assert_eq!(state.form.slots[1].value(), "claude-3.7");
 
-        // Right → cycle forwards to kimi-k2.5-turbo
+        // Right → cycle forwards to kimi-k2.6
         let key = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
         state.handle_key(key);
-        assert_eq!(state.form.slots[1].value(), "kimi-k2.5-turbo");
+        assert_eq!(state.form.slots[1].value(), "kimi-k2.6");
     }
 }

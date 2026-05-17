@@ -869,7 +869,7 @@ fn default_bifrost_key() -> String {
 fn default_bifrost_virtual_key() -> String {
     std::env::var("BIFROST_VIRTUAL_KEY").unwrap_or_else(|_| String::new())
 }
-fn default_primary_model() -> String { "fireworks/accounts/fireworks/routers/kimi-k2p5-turbo".to_string() }
+fn default_primary_model() -> String { "openai/kimi-k2.6".to_string() }
 fn default_bifrost_timeout() -> u64 { 120 }
 fn default_bandwidth_high() -> BandwidthClass { BandwidthClass::High }
 fn default_presence_breathing() -> String { "breathing_color".to_string() }
@@ -880,10 +880,10 @@ fn default_synthesis_elements() -> Vec<SynthesisElement> {
 
 fn default_models() -> HashMap<String, ModelConfig> {
     let mut m = HashMap::new();
-    m.insert("kimi-k2p5-turbo".to_string(), ModelConfig {
+    m.insert("kimi-k2.6".to_string(), ModelConfig {
         provider: "bifrost".to_string(),
-        model: "fireworks/accounts/fireworks/routers/kimi-k2p5-turbo".to_string(),
-        context_limit: 128000,
+        model: "openai/kimi-k2.6".to_string(),
+        context_limit: 262000,
         output_limit: 8192,
         archivist_threshold: 0.7,
         archivist_interval: 100,
