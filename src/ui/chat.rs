@@ -402,6 +402,10 @@ pub struct ChatState {
     pub render_mode: ChatMode,
     /// Live palette derived from the agent's current atmosphere.
     pub palette: ChatPalette,
+    /// Semantic stream buffer. Tokens land here on arrival; `advance_tick`
+    /// releases a bounded slice per frame into the visible message, so a
+    /// burst of tokens reveals as steady flow instead of a sudden block.
+    pub stream_buffer: String,
 }
 
 /// Ephemeral /btw fork state. Mirrors Letta's BtwPane — a forked conversation
@@ -491,6 +495,7 @@ impl ChatState {
             show_esc_overlay: false,
             render_mode: ChatMode::Conversation,
             palette: ChatPalette::default(),
+            stream_buffer: String::new(),
         })
     }
 
@@ -1023,7 +1028,8 @@ Tab toggles the cockpit pane. `t` (on empty input) toggles tool expansion.";
             match ev {
                 BackendEvent::Token(t) => {
                     self.phase = TurnPhase::Streaming;
-                    self.append_streaming(&t);
+                    // Buffer — `release_stream` (on tick) reveals it smoothly.
+                    self.stream_buffer.push_str(&t);
                 }
                 BackendEvent::Reasoning(r) => {
                     self.thinking.push(r.clone());
@@ -1456,6 +1462,45 @@ Tab toggles the cockpit pane. `t` (on empty input) toggles tool expansion.";
     /// Bump the animation tick. Called once per UI frame.
     pub fn advance_tick(&mut self) {
         self.tick = self.tick.wrapping_add(1);
+        self.release_stream();
+    }
+
+    /// Release a bounded slice of the stream buffer into the visible message.
+    /// Proportional drain: a trickle empties in a frame or two (feels
+    /// instant), a burst drains over several frames (reads as flow). The cut
+    /// lands on a char boundary, and prefers a nearby whitespace break so a
+    /// partial word never flashes on screen.
+    fn release_stream(&mut self) {
+        if self.stream_buffer.is_empty() {
+            return;
+        }
+        let total = self.stream_buffer.len();
+        // Drain ~a third of what's waiting each frame (min 8 bytes) — fast
+        // enough never to lag behind arrival, slow enough to smooth bursts.
+        let mut take = (total / 3).max(8).min(total);
+        if take < total {
+            // Prefer a whitespace break within reach of the cut point.
+            if let Some(ws) = self.stream_buffer[..take].rfind(char::is_whitespace) {
+                if take - ws <= 24 {
+                    take = ws + 1;
+                }
+            }
+            // Snap forward to a valid UTF-8 boundary.
+            while take < total && !self.stream_buffer.is_char_boundary(take) {
+                take += 1;
+            }
+        }
+        let chunk: String = self.stream_buffer.drain(..take).collect();
+        self.append_streaming(&chunk);
+    }
+
+    /// Empty the stream buffer immediately into the visible message. Called
+    /// when a turn finalizes so no buffered text is left unrevealed.
+    fn flush_stream(&mut self) {
+        if !self.stream_buffer.is_empty() {
+            let rest = std::mem::take(&mut self.stream_buffer);
+            self.append_streaming(&rest);
+        }
     }
 
     fn append_streaming(&mut self, t: &str) {
@@ -1474,6 +1519,8 @@ Tab toggles the cockpit pane. `t` (on empty input) toggles tool expansion.";
     }
 
     fn finalize_streaming(&mut self) {
+        // Reveal anything still buffered so the final message is complete.
+        self.flush_stream();
         for msg in self.messages.iter_mut().rev() {
             if let ChatMessage::Assistant { streaming, .. } = msg {
                 if *streaming {
