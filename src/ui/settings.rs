@@ -118,6 +118,7 @@ pub enum FieldLoc {
     ScInboxEnabled,
     ScModel,
     ScMaxTokens,
+    ScSystemPrompt,
     // Reflection
     RfEnabled,
     RfMessageInterval,
@@ -198,7 +199,8 @@ impl FieldLoc {
             FieldLoc::AgSystemPrompt => Category::Agent,
             FieldLoc::BfBaseUrl | FieldLoc::BfApiKey | FieldLoc::BfVirtualKey | FieldLoc::BfPrimaryModel | FieldLoc::BfTimeoutSecs => Category::Bifrost,
             FieldLoc::ScN1Enabled | FieldLoc::ScN1Trigger | FieldLoc::ScN1Every | FieldLoc::ScN1Secs
-                | FieldLoc::ScInboxEnabled | FieldLoc::ScModel | FieldLoc::ScMaxTokens => Category::Subconscious,
+                | FieldLoc::ScInboxEnabled | FieldLoc::ScModel | FieldLoc::ScMaxTokens
+                | FieldLoc::ScSystemPrompt => Category::Subconscious,
             FieldLoc::RfEnabled | FieldLoc::RfMessageInterval | FieldLoc::RfTrigger | FieldLoc::RfModel => Category::Reflection,
             FieldLoc::ArEnabled | FieldLoc::ArInterval | FieldLoc::ArThreshold | FieldLoc::ArCompressionModel => Category::Archivist,
             FieldLoc::SaEnabled | FieldLoc::SaMaxConcurrent | FieldLoc::SaTimeout | FieldLoc::SaMaxDepth | FieldLoc::SaMaxToolRounds
@@ -231,6 +233,7 @@ impl FieldLoc {
             FieldLoc::ScInboxEnabled => "inbox_enabled",
             FieldLoc::ScModel => "model",
             FieldLoc::ScMaxTokens => "max_tokens",
+            FieldLoc::ScSystemPrompt => "system_prompt",
             FieldLoc::RfEnabled => "enabled",
             FieldLoc::RfMessageInterval => "message_interval",
             FieldLoc::RfTrigger => "trigger",
@@ -308,6 +311,7 @@ impl FieldLoc {
             FieldLoc::ScInboxEnabled => "inbox",
             FieldLoc::ScModel => "model",
             FieldLoc::ScMaxTokens => "max tokens",
+            FieldLoc::ScSystemPrompt => "subconscious prompt",
             FieldLoc::RfEnabled => "enabled",
             FieldLoc::RfMessageInterval => "every N msgs",
             FieldLoc::RfTrigger => "trigger",
@@ -608,6 +612,7 @@ impl SettingsView {
                 }
                 let max_tokens = sc.max_tokens.map(|v| v.to_string());
                 out.push((ScMaxTokens, EditableValue::OptionalText(max_tokens)));
+                out.push((ScSystemPrompt, EditableValue::OptionalText(sc.system_prompt.clone())));
             }
             Category::Reflection => {
                 let rf = &self.config.reflection;
@@ -846,6 +851,12 @@ impl SettingsView {
             ScMaxTokens => {
                 if let EditableValue::OptionalText(v) = value {
                     self.config.subconscious.max_tokens = v.and_then(|s| s.parse().ok());
+                }
+            }
+            ScSystemPrompt => {
+                if let EditableValue::OptionalText(v) = value {
+                    self.config.subconscious.system_prompt =
+                        v.filter(|s| !s.trim().is_empty());
                 }
             }
 

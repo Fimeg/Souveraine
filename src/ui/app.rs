@@ -508,6 +508,22 @@ impl App {
                             _ => SceneLayout::Single,
                         };
                     }
+                    Event::Mouse(m) => {
+                        // Left-click on a message bubble copies it to the
+                        // clipboard (the ⧉ in the bubble title is the cue).
+                        if self.current_screen == Screen::Chat
+                            && matches!(
+                                m.kind,
+                                crossterm::event::MouseEventKind::Down(
+                                    crossterm::event::MouseButton::Left
+                                )
+                            )
+                        {
+                            if let Some(chat) = self.chat.as_mut() {
+                                chat.copy_message_at(m.column, m.row);
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }

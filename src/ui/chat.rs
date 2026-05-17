@@ -303,6 +303,9 @@ pub enum TurnPhase {
     Tool,
     Streaming,
     Interrupted,
+    /// The primary's turn is committed; the N+1 subconscious pass is running.
+    /// The input is unlocked in this phase — the user may speak over it.
+    Subconscious,
 }
 
 /// Render posture for the chat surface. Same conversation, same memfs,
@@ -327,6 +330,18 @@ pub struct ToolResultBlock {
     pub is_error: bool,
 }
 
+/// Where each message landed in the last messages render — the bridge
+/// from a mouse click back to the bubble it hit. Built fresh every draw.
+#[derive(Default)]
+pub struct MsgLayout {
+    /// The messages-pane rect from the last draw.
+    pub area: Rect,
+    /// Buffer lines hidden above the viewport (the scroll offset).
+    pub offset: u16,
+    /// `(message index, first line, last line exclusive)` in the line buffer.
+    pub spans: Vec<(usize, usize, usize)>,
+}
+
 pub struct ChatState {
     pub backend: Arc<dyn Backend>,
     pub mode: String,
@@ -336,6 +351,11 @@ pub struct ChatState {
     pub messages: Vec<ChatMessage>,
     pub input: String,
     pub scroll: u16,
+    /// Layout of the last messages render — lets a mouse click map back to
+    /// the bubble it landed on. `RefCell` so `draw` (`&ChatState`) can fill it.
+    pub msg_layout: RefCell<MsgLayout>,
+    /// Set when a bubble was just copied — drives a brief footer flash.
+    pub copy_flash: Option<Instant>,
     pub turn_rx: Option<mpsc::Receiver<BackendEvent>>,
     /// Cancellation handle for the current in-flight turn. Esc fires this;
     /// the backend treats it as a signal (Constitution VI.1 — substrate, not
@@ -469,6 +489,8 @@ impl ChatState {
             }],
             input: String::new(),
             scroll: 0,
+            msg_layout: RefCell::new(MsgLayout::default()),
+            copy_flash: None,
             turn_rx: None,
             cancel_token: None,
             busy: false,
@@ -1199,6 +1221,19 @@ Tab toggles the cockpit pane. `t` (on empty input) toggles tool expansion.";
                     // Liveness signal — no visual change, just resets the
                     // event timer so the liveness label stays calm.
                 }
+                BackendEvent::PrimaryComplete => {
+                    // Her words are committed; the N+1 subconscious pass is
+                    // starting. Release the input — the user may speak over
+                    // the pass — but keep `turn_rx` open so the pass's
+                    // `SubconsciousPass` / `Surfacing` events still arrive.
+                    // `turn_started` keeps running so the phase line shows
+                    // how long the pass is taking.
+                    self.finalize_streaming();
+                    self.busy = false;
+                    self.cancel_token = None;
+                    self.phase = TurnPhase::Subconscious;
+                    self.tool_calls_this_turn = 0;
+                }
                 BackendEvent::Done => {
                     self.finalize_streaming();
                     self.busy = false;
@@ -1478,16 +1513,23 @@ Tab toggles the cockpit pane. `t` (on empty input) toggles tool expansion.";
         // Drain ~a third of what's waiting each frame (min 8 bytes) — fast
         // enough never to lag behind arrival, slow enough to smooth bursts.
         let mut take = (total / 3).max(8).min(total);
+        // Snap backward to a valid UTF-8 char boundary before any indexing.
+        while take > 0 && !self.stream_buffer.is_char_boundary(take) {
+            take -= 1;
+        }
+        if take == 0 {
+            return;
+        }
         if take < total {
             // Prefer a whitespace break within reach of the cut point.
             if let Some(ws) = self.stream_buffer[..take].rfind(char::is_whitespace) {
                 if take - ws <= 24 {
                     take = ws + 1;
+                    // Re-validate the whitespace-adjusted cut is on a char boundary.
+                    while take < total && !self.stream_buffer.is_char_boundary(take) {
+                        take += 1;
+                    }
                 }
-            }
-            // Snap forward to a valid UTF-8 boundary.
-            while take < total && !self.stream_buffer.is_char_boundary(take) {
-                take += 1;
             }
         }
         let chunk: String = self.stream_buffer.drain(..take).collect();
@@ -1530,6 +1572,53 @@ Tab toggles the cockpit pane. `t` (on empty input) toggles tool expansion.";
             }
         }
     }
+
+    /// The plain text of a message, for clipboard copy. `None` for kinds
+    /// that aren't meaningful to copy (tool cards, bare separators).
+    pub fn message_copy_text(&self, idx: usize) -> Option<String> {
+        match self.messages.get(idx)? {
+            ChatMessage::User { text, .. }
+            | ChatMessage::Assistant { text, .. }
+            | ChatMessage::System { text, .. }
+            | ChatMessage::Interstitial { text, .. } => Some(text.clone()),
+            ChatMessage::Surfacing { content, .. } => Some(content.clone()),
+            _ => None,
+        }
+    }
+
+    /// Map a mouse click (terminal column/row) to a message bubble and copy
+    /// it to the system clipboard. Returns `true` when something was copied.
+    pub fn copy_message_at(&mut self, col: u16, row: u16) -> bool {
+        let idx = {
+            let layout = self.msg_layout.borrow();
+            let a = layout.area;
+            // Inside the messages pane? (a 1-row top border, 1-row bottom.)
+            if a.height < 3 || row <= a.y || row + 1 >= a.y + a.height {
+                return false;
+            }
+            if col < a.x || col >= a.x + a.width {
+                return false;
+            }
+            let buf_line = (row - a.y - 1) as usize + layout.offset as usize;
+            layout
+                .spans
+                .iter()
+                .find(|(_, s, e)| buf_line >= *s && buf_line < *e)
+                .map(|(i, _, _)| *i)
+        };
+        let Some(idx) = idx else { return false };
+        let Some(text) = self.message_copy_text(idx) else { return false };
+        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
+            Ok(()) => {
+                self.copy_flash = Some(Instant::now());
+                true
+            }
+            Err(e) => {
+                tracing::warn!("clipboard copy failed: {}", e);
+                false
+            }
+        }
+    }
 }
 
 // ─── Rendering ───────────────────────────────────────────────────────────
@@ -1547,7 +1636,10 @@ pub fn draw(f: &mut Frame, state: &ChatState) {
     let input_height = (input_visual_lines.min(max_input_lines) as u16) + 2; // +2 for borders
 
     // Phase strip: 1 row when a turn is in flight, 0 rows when idle.
-    let phase_height: u16 = if state.busy || state.phase == TurnPhase::Interrupted { 1 } else { 0 };
+    let phase_height: u16 = if state.busy
+        || state.phase == TurnPhase::Interrupted
+        || state.phase == TurnPhase::Subconscious
+    { 1 } else { 0 };
 
     let vchunks = Layout::default()
         .direction(Direction::Vertical)
@@ -1620,6 +1712,7 @@ fn draw_phase(f: &mut Frame, state: &ChatState, area: Rect) {
         }
         TurnPhase::Streaming => (spinner, "Streaming".to_string(), state.palette.agent_primary),
         TurnPhase::Interrupted => ("×", "Interrupted".to_string(), state.palette.compaction),
+        TurnPhase::Subconscious => (spinner, "Subconscious".to_string(), state.palette.surfacing),
     };
     let queued = state
         .pending_interjections
@@ -1672,16 +1765,184 @@ fn draw_header(f: &mut Frame, state: &ChatState, area: Rect) {
     f.render_widget(Paragraph::new(title).alignment(Alignment::Center), area);
 }
 
+/// Wall-clock age of a message's entry, as a 0.0–1.0 shimmer intensity.
+/// Rises to a peak and falls back over a 450ms window, then stays at zero —
+/// one soft pulse as the message arrives.
+fn entry_intensity(ts: Instant) -> f32 {
+    const ENTRY_MS: f32 = 450.0;
+    const SHIMMER_MAX: f32 = 0.5;
+    let age = ts.elapsed().as_millis() as f32;
+    if age >= ENTRY_MS {
+        return 0.0;
+    }
+    let t = age / ENTRY_MS;
+    (t * std::f32::consts::PI).sin().max(0.0) * SHIMMER_MAX
+}
+
+/// The entry timestamp of a message, if it carries one. Tool cards and
+/// interstitials have no `ts` and do not shimmer.
+fn msg_entry_ts(msg: &ChatMessage) -> Option<Instant> {
+    match msg {
+        ChatMessage::User { ts, .. }
+        | ChatMessage::Assistant { ts, .. }
+        | ChatMessage::Surfacing { ts, .. }
+        | ChatMessage::System { ts, .. }
+        | ChatMessage::Interjection { ts, .. } => Some(*ts),
+        _ => None,
+    }
+}
+
+/// Brighten every RGB span foreground toward white by `t` (0.0–1.0) — the
+/// entry shimmer. Named colours are left untouched.
+fn shimmer_lines(lines: &mut [Line<'static>], t: f32) {
+    let blend = |x: u8| (x as f32 + (255.0 - x as f32) * t).round().clamp(0.0, 255.0) as u8;
+    for line in lines.iter_mut() {
+        for span in line.spans.iter_mut() {
+            if let Some(Color::Rgb(r, g, b)) = span.style.fg {
+                span.style.fg = Some(Color::Rgb(blend(r), blend(g), blend(b)));
+            }
+        }
+    }
+}
+
+/// Soften the trailing edge of a still-streaming bubble. The last few body
+/// lines blend toward the pane background so freshly-arrived text *settles
+/// in* rather than snapping — the newest line is faintest, easing back to
+/// full colour over three lines. A spatial echo of the token stream: you
+/// see where her words are still forming.
+fn fade_streaming_tail(mut lines: Vec<Line<'static>>, palette: &ChatPalette) -> Vec<Line<'static>> {
+    // Per-line blend amount from the tail back: index 0 is the newest line.
+    const FADE: [f32; 3] = [0.62, 0.34, 0.13];
+    let (tr, tg, tb) = match palette.bg {
+        Color::Rgb(r, g, b) => (r, g, b),
+        _ => (12u8, 14u8, 18u8), // dark fallback when the bg is a named colour
+    };
+    let n = lines.len();
+    for (offset, &amount) in FADE.iter().enumerate() {
+        if offset >= n {
+            break;
+        }
+        let blend = |x: u8, t: u8| {
+            (x as f32 + (t as f32 - x as f32) * amount).round().clamp(0.0, 255.0) as u8
+        };
+        for span in lines[n - 1 - offset].spans.iter_mut() {
+            if let Some(Color::Rgb(r, g, b)) = span.style.fg {
+                span.style.fg = Some(Color::Rgb(blend(r, tr), blend(g, tg), blend(b, tb)));
+            }
+        }
+    }
+    lines
+}
+
+/// Append a streaming caret to the last body line — the point where her
+/// next token will land. Crisp accent against the faded tail; it draws the
+/// eye to the live edge of the stream.
+fn with_stream_cursor(mut lines: Vec<Line<'static>>, accent: Color) -> Vec<Line<'static>> {
+    if let Some(last) = lines.last_mut() {
+        last.spans.push(Span::styled(
+            "▌",
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ));
+    }
+    lines
+}
+
+/// Cyan↔purple oscillation for a tool whose call is still in flight — the
+/// sensor is reaching, and the colour breathes until the result lands.
+/// ~1.5s cycle. (jcode `tui-style/theme.rs:176`, ported.)
+fn tool_name_pulse(elapsed: Duration) -> Color {
+    let t = (elapsed.as_secs_f32() * 2.0).sin() * 0.5 + 0.5;
+    let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
+    Color::Rgb(lerp(80, 186), lerp(200, 139), lerp(220, 255))
+}
+
+/// Build the folded tool-footer label for a bubble — the run of tool
+/// gestures a turn made, collapsed to `⚙ read · grep · edit`. Consecutive
+/// repeats fold to `name ×N` so a loop of reads stays one short word.
+fn tool_footer_label(indices: &[usize], msgs: &[ChatMessage]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut run: Option<(String, usize)> = None;
+    let flush = |run: &mut Option<(String, usize)>, parts: &mut Vec<String>| {
+        if let Some((n, c)) = run.take() {
+            parts.push(if c > 1 { format!("{} ×{}", n, c) } else { n });
+        }
+    };
+    for &i in indices {
+        if let Some(ChatMessage::Tool { name, .. }) = msgs.get(i) {
+            match &mut run {
+                Some((n, c)) if n == name => *c += 1,
+                _ => {
+                    flush(&mut run, &mut parts);
+                    run = Some((name.clone(), 1));
+                }
+            }
+        }
+    }
+    flush(&mut run, &mut parts);
+    format!("⚙ {}", parts.join(" · "))
+}
+
 fn draw_messages(f: &mut Frame, state: &ChatState, area: Rect) {
     let mdpal = crate::ui::markdown::MarkdownPalette::from_chat_palette(&state.palette);
     let max_bubble = ((area.width as usize).saturating_sub(8) * 70 / 100).max(20);
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    for msg in &state.messages {
+    // ── Tool fold ────────────────────────────────────────────────────
+    // Collapsed (default): a turn's tool gestures fold into a footer on
+    // her bubble — `╰─ ⚙ read · grep ─╯` — so the surface reads as bubbles
+    // back and forth. Ctrl+T (`tool_cards_expanded`) reveals the full cards.
+    let show_cards = state.tool_cards_expanded || state.render_mode == ChatMode::Code;
+    let mut fold_footer: std::collections::HashMap<usize, String> =
+        std::collections::HashMap::new();
+    let mut consumed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    if !show_cards {
+        let msgs = &state.messages;
+        let mut leading: Vec<usize> = Vec::new();
+        for (idx, m) in msgs.iter().enumerate() {
+            match m {
+                ChatMessage::Tool { .. } => leading.push(idx),
+                ChatMessage::Assistant { .. } => {
+                    let mut j = idx + 1;
+                    while j < msgs.len() && matches!(msgs[j], ChatMessage::Tool { .. }) {
+                        j += 1;
+                    }
+                    let mut owned = std::mem::take(&mut leading);
+                    owned.extend((idx + 1)..j);
+                    if !owned.is_empty() {
+                        for &t in &owned {
+                            consumed.insert(t);
+                        }
+                        fold_footer.insert(idx, tool_footer_label(&owned, msgs));
+                    }
+                }
+                // A tool run with no bubble to land on (rare — a turn ends
+                // in her voice) falls through and renders as a compact card.
+                _ => leading.clear(),
+            }
+        }
+    }
+
+    // Per-message line ranges, recorded as we render — a click maps back
+    // through these to the bubble it landed on.
+    let mut span_spans: Vec<(usize, usize, usize)> = Vec::new();
+    let mut prev_was_tool = false;
+    for (idx, msg) in state.messages.iter().enumerate() {
+        // Folded into a bubble footer above — don't render it on its own.
+        if consumed.contains(&idx) {
+            continue;
+        }
+        let this_is_tool = matches!(msg, ChatMessage::Tool { .. });
+        // Air around a run of tool gestures — prose settles apart from the
+        // sensor work, while the run of cards itself stays tight.
+        if this_is_tool != prev_was_tool && !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+        prev_was_tool = this_is_tool;
+        let line_start = lines.len();
         match msg {
             ChatMessage::User { text, .. } => {
                 lines.extend(bubble(
-                    "you",
+                    "⧉ you",
                     text,
                     max_bubble,
                     Style::default().fg(state.palette.user_accent),
@@ -1691,7 +1952,11 @@ fn draw_messages(f: &mut Frame, state: &ChatState, area: Rect) {
                 lines.push(Line::from(""));
             }
             ChatMessage::Assistant { text, streaming, rendered_cache, .. } => {
-                let label = if *streaming { format!("{} ◦", state.agent_name) } else { state.agent_name.clone() };
+                let label = if *streaming {
+                    format!("⧉ {} ◦", state.agent_name)
+                } else {
+                    format!("⧉ {}", state.agent_name)
+                };
                 // Pre-wrap to the bubble's inner width — no line should exit
                 // the bubble's borders, and Paragraph's later re-wrap becomes
                 // a no-op (preserves scroll line-count math).
@@ -1735,6 +2000,17 @@ fn draw_messages(f: &mut Frame, state: &ChatState, area: Rect) {
                         lines
                     }
                 };
+                // Streaming elegance: soften the trailing edge so her newest
+                // tokens settle in rather than snap, and mark the live edge
+                // with a caret. Finalized bubbles render flat and full-colour.
+                let body_lines = if *streaming && !text.is_empty() {
+                    with_stream_cursor(
+                        fade_streaming_tail(body_lines, &state.palette),
+                        state.palette.agent_primary,
+                    )
+                } else {
+                    body_lines
+                };
                 lines.extend(bubble_rendered(
                     &label,
                     &body_lines,
@@ -1742,6 +2018,7 @@ fn draw_messages(f: &mut Frame, state: &ChatState, area: Rect) {
                     Style::default().fg(state.palette.agent_primary),
                     BubbleAlign::Left,
                     area.width,
+                    fold_footer.get(&idx).map(|s| s.as_str()),
                 ));
                 lines.push(Line::from(""));
             }
@@ -1777,9 +2054,16 @@ fn draw_messages(f: &mut Frame, state: &ChatState, area: Rect) {
                 )));
                 lines.push(Line::from(""));
             }
-            ChatMessage::Tool { name, arguments, round, result, expanded, .. } => {
+            ChatMessage::Tool { name, arguments, round, result, expanded, ts, .. } => {
                 let code_posture = state.render_mode == ChatMode::Code;
                 let expand = *expanded || state.tool_cards_expanded || code_posture;
+                // A call still in flight breathes cyan↔purple; a finished
+                // one holds steady at its outcome colour.
+                let name_pulse = if result.is_none() {
+                    Some(tool_name_pulse(ts.elapsed()))
+                } else {
+                    None
+                };
                 if expand {
                     lines.extend(render_tool_card(
                         name,
@@ -1789,6 +2073,7 @@ fn draw_messages(f: &mut Frame, state: &ChatState, area: Rect) {
                         max_bubble,
                         area.width,
                         &state.palette,
+                        name_pulse,
                     ));
                     lines.push(Line::from(""));
                 } else {
@@ -1799,6 +2084,7 @@ fn draw_messages(f: &mut Frame, state: &ChatState, area: Rect) {
                         result.as_ref(),
                         area.width,
                         &state.palette,
+                        name_pulse,
                     ));
                 }
             }
@@ -1846,6 +2132,14 @@ fn draw_messages(f: &mut Frame, state: &ChatState, area: Rect) {
                 lines.push(Line::from(""));
             }
         }
+        // Entry shimmer — one soft pulse over a freshly-arrived message.
+        if let Some(ts) = msg_entry_ts(msg) {
+            let intensity = entry_intensity(ts);
+            if intensity > 0.0 {
+                shimmer_lines(&mut lines[line_start..], intensity);
+            }
+        }
+        span_spans.push((idx, line_start, lines.len()));
     }
 
     // Final pre-wrap: anything still wider than the visible area (system
@@ -1874,6 +2168,13 @@ fn draw_messages(f: &mut Frame, state: &ChatState, area: Rect) {
     let max_scroll = effective_total.saturating_sub(view);
     let user_scroll = (state.scroll as usize).min(max_scroll);
     let offset = max_scroll.saturating_sub(user_scroll) as u16;
+
+    // Record the layout so a mouse click can find the bubble it hit.
+    *state.msg_layout.borrow_mut() = MsgLayout {
+        area,
+        offset,
+        spans: std::mem::take(&mut span_spans),
+    };
 
     let para = Paragraph::new(lines)
         .scroll((offset, 0))
@@ -1964,14 +2265,20 @@ fn bubble_rendered(
     border: Style,
     align: BubbleAlign,
     container_width: u16,
+    footer: Option<&str>,
 ) -> Vec<Line<'static>> {
     let max_inner = max_width.saturating_sub(4).max(8);
+    let footer_w = footer
+        .filter(|f| !f.is_empty())
+        .map(|f| f.chars().count() + 2)
+        .unwrap_or(0);
     let widest = body_lines
         .iter()
         .map(|l| l.width())
         .max()
         .unwrap_or(0)
-        .max(title.chars().count() + 2);
+        .max(title.chars().count() + 2)
+        .max(footer_w);
     let inner = widest.min(max_inner);
     let outer = inner + 4;
 
@@ -2006,7 +2313,18 @@ fn bubble_rendered(
         lines.push(Line::from(spans));
     }
 
-    let bottom = format!("{}╰{}╯", pad_str, "─".repeat(outer - 2));
+    // Footer in the bottom border — the folded tool run, drawn like the
+    // title so a turn's gestures read as part of the bubble, not beside it.
+    let bottom = match footer {
+        Some(f) if !f.is_empty() => {
+            let ftext = format!(" {} ", f);
+            let fdashes = outer.saturating_sub(2 + ftext.chars().count());
+            let fl = "─".repeat(fdashes / 2);
+            let fr = "─".repeat(fdashes - fdashes / 2);
+            format!("{}╰{}{}{}╯", pad_str, fl, ftext, fr)
+        }
+        _ => format!("{}╰{}╯", pad_str, "─".repeat(outer - 2)),
+    };
     lines.push(Line::from(Span::styled(bottom, border)));
 
     lines
@@ -2024,17 +2342,26 @@ fn render_tool_card(
     max_width: usize,
     container_width: u16,
     palette: &ChatPalette,
+    name_pulse: Option<Color>,
 ) -> Vec<Line<'static>> {
     let mdpal = crate::ui::markdown::MarkdownPalette::from_chat_palette(palette);
     let is_err = result.map(|r| r.is_error).unwrap_or(false);
-    let border_color = if is_err { palette.compaction } else { palette.tool_accent };
+    // In-flight tools breathe — the whole card outline pulses cyan↔purple
+    // until the result lands. Settled cards hold a steady accent.
+    let border_color = if is_err {
+        palette.compaction
+    } else if let Some(p) = name_pulse {
+        p
+    } else {
+        palette.tool_accent
+    };
     let dim_color = if is_err { palette.compaction } else { palette.tool_dim };
     let border = Style::default().fg(border_color);
 
-    // Header marker + status glyph: pending=⟳, ok=✓, err=⚠
+    // Header marker + status glyph: pending=⟳, ok=✓, err=✗
     let glyph = match result {
         None => '⟳',
-        Some(r) if r.is_error => '⚠',
+        Some(r) if r.is_error => '✗',
         Some(_) => '✓',
     };
     let title = format!("{} {}  ·  round {}", glyph, name, round);
@@ -2069,7 +2396,7 @@ fn render_tool_card(
         }
     }
 
-    bubble_rendered(&title, &body_lines, max_width, border, BubbleAlign::Left, container_width)
+    bubble_rendered(&title, &body_lines, max_width, border, BubbleAlign::Left, container_width, None)
 }
 
 /// Compact single-line tool render — the sensorium signalling a gesture, not
@@ -2084,16 +2411,26 @@ fn render_tool_card_compact(
     result: Option<&ToolResultBlock>,
     container_width: u16,
     palette: &ChatPalette,
+    name_pulse: Option<Color>,
 ) -> Vec<Line<'static>> {
     let is_err = result.map(|r| r.is_error).unwrap_or(false);
     let pending = result.is_none();
+    // While the call is in flight the glyph and name breathe cyan↔purple;
+    // once it lands they settle to the outcome colour.
+    let pulse = name_pulse.unwrap_or(palette.tool_accent);
     let (glyph, glyph_color) = match (pending, is_err) {
-        (true, _) => ("⟳", palette.tool_accent),
-        (false, true) => ("⚠", palette.compaction),
+        (true, _) => ("⟳", pulse),
+        (false, true) => ("✗", palette.compaction),
         (false, false) => ("✓", palette.tool_accent),
     };
 
-    let name_color = if is_err { palette.compaction } else { palette.tool_accent };
+    let name_color = if is_err {
+        palette.compaction
+    } else if pending {
+        pulse
+    } else {
+        palette.tool_accent
+    };
     let dim = if is_err { palette.compaction } else { palette.tool_dim };
 
     // Argument summary clipped tight — we want the gesture readable, not
@@ -2629,6 +2966,14 @@ fn draw_footer(f: &mut Frame, state: &ChatState, area: Rect) {
         spans.push(Span::styled(
             format!("↓ {} below", state.scroll),
             Style::default().fg(state.palette.agent_primary),
+        ));
+    }
+    // Brief confirmation after a click-to-copy.
+    if state.copy_flash.map(|t| t.elapsed().as_millis() < 1600).unwrap_or(false) {
+        spans.push(Span::raw("  │  "));
+        spans.push(Span::styled(
+            "⧉ copied",
+            Style::default().fg(state.palette.tool_accent).add_modifier(Modifier::BOLD),
         ));
     }
     let footer = Line::from(spans);

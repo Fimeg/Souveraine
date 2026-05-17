@@ -27,7 +27,8 @@
 
 use crate::bridge::bifrost::{BifrostClient, ChatCompletionRequest, Message, ToolDefinition, ToolFunction};
 use crate::bridge::model_router::TokenCounter;
-use crate::core::session::ConversationMessage;
+use crate::core::compact::CompactionEngine;
+use crate::core::session::{ContentBlock, ConversationMessage, MessageRole};
 use crate::core::subconscious::{InboxItem, SubconsciousInbox, Urgency};
 use crate::core::tools::defs::ToolContext;
 use crate::server::{AgentInventory, SessionManager};
@@ -46,12 +47,15 @@ const SUBCONSCIOUS_INTER_ROUND_DELAY_MS: u64 = 300;
 
 pub struct ConsciousnessEngine {
     agents: Arc<AgentInventory>,
-    _sessions: Arc<SessionManager>,
+    sessions: Arc<SessionManager>,
     bifrost: Arc<BifrostClient>,
     counter: TokenCounter,
     /// Optional model override for the subconscious pass (e.g. "openai/glm-5.1").
     /// If None, uses the primary agent's model.
     subconscious_model: Option<String>,
+    /// Platform prompt for the subconscious, prepended to the prompt she
+    /// assembles from her own memfs. None = memfs + body orientation only.
+    subconscious_system_prompt: Option<String>,
     /// Max tokens for subconscious's response. None = uncapped (model default).
     max_tokens: Option<u32>,
     /// Adaptive inter-round delay shared with the primary loop.
@@ -60,6 +64,8 @@ pub struct ConsciousnessEngine {
     reflection: Arc<crate::core::reflection::ReflectionEngine>,
     /// Archivist engine — N+100 memory synthesis.
     archivist: Arc<crate::core::archivist::ArchivistEngine>,
+    /// Shared compaction engine — subconscious uses this to compact her own session.
+    compaction_engine: Arc<dyn CompactionEngine>,
 }
 
 #[derive(Clone, Debug)]
@@ -81,6 +87,8 @@ impl ConsciousnessEngine {
         max_tokens: Option<u32>,
         rate_delay: Arc<AtomicU64>,
         archivist_config: crate::core::config::ArchivistConfig,
+        compaction_engine: Arc<dyn CompactionEngine>,
+        subconscious_system_prompt: Option<String>,
     ) -> Self {
         let reflection = Arc::new(crate::core::reflection::ReflectionEngine::new(
             agents.clone(),
@@ -98,14 +106,16 @@ impl ConsciousnessEngine {
         ));
         Self {
             agents,
-            _sessions: sessions,
+            sessions,
             bifrost,
             counter: TokenCounter::new(),
             subconscious_model,
+            subconscious_system_prompt,
             max_tokens,
             rate_delay,
             reflection,
             archivist,
+            compaction_engine,
         }
     }
 
@@ -113,6 +123,42 @@ impl ConsciousnessEngine {
     /// future chat `/reflect` slash command) can trigger a pass directly.
     pub fn reflection(&self) -> Arc<crate::core::reflection::ReflectionEngine> {
         self.reflection.clone()
+    }
+
+    /// Get or create the subconscious's persistent session. The subconscious
+    /// is a full agent with her own conversation that accumulates across N+1
+    /// passes — just like Aster had CONSCIENCE_CONVERSATION_ID in Letta.
+    ///
+    /// The conversation survives process restarts: every `add_message` writes
+    /// to disk, and this restores it from the conversation store on first use.
+    async fn subconscious_session_id(&self, sub_id: &str) -> String {
+        // Already live in memory?
+        let existing = self.sessions.list_for_agent(sub_id);
+        if let Some(conv_id) = existing.last() {
+            return conv_id.clone();
+        }
+        // Restore her conversation from disk if a prior run persisted one.
+        let _ = self.sessions.load_persisted(sub_id).await;
+        let restored = self.sessions.list_for_agent(sub_id);
+        if let Some(conv_id) = restored.last() {
+            return conv_id.clone();
+        }
+        // First run for this subconscious — open a fresh conversation.
+        self.sessions.create(sub_id)
+    }
+
+    /// Persist the messages generated during one N+1 pass into the
+    /// subconscious's session, so her conversation accumulates across passes.
+    /// The system message is never stored — it is rebuilt fresh each pass.
+    fn persist_subconscious_turn(&self, conv_id: &str, new_messages: &[Message]) {
+        for m in new_messages {
+            if m.role == "system" {
+                continue;
+            }
+            if let Err(e) = self.sessions.add_message(conv_id, bifrost_to_conversation(m)) {
+                tracing::warn!("subconscious session persist failed: {}", e);
+            }
+        }
     }
 
     /// Expose the archivist engine so external callers (a future
@@ -123,23 +169,32 @@ impl ConsciousnessEngine {
         self.archivist.clone()
     }
 
+    /// Run the post-turn consciousness cycle: N+25 reflection, N+100
+    /// archivist, compaction warnings, and the N+1 subconscious pass.
+    ///
+    /// Takes an owned snapshot (`agent_id`, `turn_count`, `messages`) rather
+    /// than a live `&Session` ref — the caller has already released the user
+    /// for her next turn, so a live DashMap ref held across this (long) pass
+    /// would race the next turn's session writes.
     pub async fn on_response(
         &self,
-        session: &crate::server::session_manager::Session,
+        agent_id: &str,
+        turn_count: u32,
+        messages: &[ConversationMessage],
         response: &str,
     ) -> anyhow::Result<Vec<ConsciousnessEvent>> {
         let mut events = Vec::new();
-        let pressure = self.pressure_for_session(session).await;
+        let pressure = self.pressure_for(agent_id, messages).await;
 
         // ── N+25 reflection ──
         // Fires at every Nth turn (config: reflection.message_interval).
         // Runs an LLM pass over the recent transcript and updates ledgers
         // / primary memory via the memory tool. The summary string is
         // surfaced as a ConsciousnessEvent so the cockpit panel renders it.
-        if session.turn_count > 0 && session.turn_count % 25 == 0 {
+        if turn_count > 0 && turn_count % 25 == 0 {
             match self
                 .reflection
-                .reflect_now(&session.agent_id, &session.messages)
+                .reflect_now(agent_id, messages)
                 .await
             {
                 Ok(report) => {
@@ -163,7 +218,7 @@ impl ConsciousnessEngine {
                     events.push(ConsciousnessEvent::Reflection {
                         content: format!(
                             "N+25 reflection skipped at turn {} — model error: {e}",
-                            session.turn_count
+                            turn_count
                         ),
                     });
                 }
@@ -176,7 +231,7 @@ impl ConsciousnessEngine {
         // dense `system/synthesized/` fragment. No-ops when nothing is new.
         match self
             .archivist
-            .maybe_synthesize(&session.agent_id, session.turn_count as usize, pressure)
+            .maybe_synthesize(agent_id, turn_count as usize, pressure)
             .await
         {
             Ok(Some(report)) => {
@@ -201,9 +256,9 @@ impl ConsciousnessEngine {
         }
 
         // ── N+1 / subconscious surfacing ────────────────────────────────
-        tracing::info!("subconscious pass starting for {}", session.agent_id);
-        let sub_repo = self.agents.subconscious_memory_repo(&session.agent_id);
-        let primary_repo = self.agents.memory_repo(&session.agent_id);
+        tracing::info!("subconscious pass starting for {}", agent_id);
+        let sub_repo = self.agents.subconscious_memory_repo(agent_id);
+        let primary_repo = self.agents.memory_repo(agent_id);
         let inbox = SubconsciousInbox::with_primary(sub_repo.clone(), primary_repo);
         let _ = inbox.init().await;
 
@@ -213,8 +268,7 @@ impl ConsciousnessEngine {
         }
 
         // Find the last user message for context
-        let last_user_msg = session
-            .messages
+        let last_user_msg = messages
             .iter()
             .rev()
             .find(|m| matches!(m.role, crate::core::session::MessageRole::User))
@@ -231,9 +285,9 @@ impl ConsciousnessEngine {
             .unwrap_or_default();
 
         // Run the tool loop with subconscious agent identity
-        let sub_id = format!("{}-sub", session.agent_id);
+        let sub_id = format!("{}-sub", agent_id);
         match self
-            .subconscious_tool_loop(&last_user_msg, response, &session.agent_id, &sub_id)
+            .subconscious_tool_loop(&last_user_msg, response, agent_id, &sub_id)
             .await
         {
             Ok(observations) => {
@@ -411,10 +465,17 @@ Resolve entries: `[YYYY-MM-DD HH:MM] RESOLVED — note`"#;
                  - urgency: \"low\" | \"medium\" | \"high\" | \"critical\"\n\n\
                  If nothing notable, respond with just: none";
 
-        let system_prompt = if subconscious_prompt_from_files.is_empty() {
-            format!("{}{}", hardcoded_default, observation_format)
+        let base_prompt = if subconscious_prompt_from_files.is_empty() {
+            hardcoded_default.to_string()
         } else {
-            format!("{}{}", subconscious_prompt_from_files, observation_format)
+            subconscious_prompt_from_files
+        };
+        // Prepend the configurable platform prompt when set (Settings → Subconscious).
+        let system_prompt = match &self.subconscious_system_prompt {
+            Some(platform) if !platform.trim().is_empty() => {
+                format!("{}\n\n---\n\n{}{}", platform.trim(), base_prompt, observation_format)
+            }
+            _ => format!("{}{}", base_prompt, observation_format),
         };
 
         let primary_name = self.agents.get(primary_id).await
@@ -449,24 +510,68 @@ Resolve entries: `[YYYY-MM-DD HH:MM] RESOLVED — note`"#;
             .collect();
 
         // ── Build ToolContext for subconscious ───────────────────────────────
-        // Use the subconscious agent's own memory space
+        // Use the subconscious agent's own memory space, with compaction wired in.
         let memory_root = Some(self.agents.subconscious_memory_root(primary_id));
         let cwd = std::env::current_dir().ok();
         let env: Vec<(String, String)> = std::env::vars().collect();
 
-        let tool_ctx = ToolContext::for_agent(
+        let mut tool_ctx = ToolContext::for_agent(
             sub_id.to_string(),
             cwd,
             memory_root,
             env,
             None, // subconscious does not fork subagents
         );
+        tool_ctx.compaction_engine = Some(self.compaction_engine.clone());
 
-        // ── Tool loop ─────────────────────────────────────────────────
-        let mut messages = vec![
-            Message::text("system", system_prompt.to_string()),
-            Message::text("user", user_content),
-        ];
+        // ── Persistent session — the subconscious is a full agent ────
+        let conv_id = self.subconscious_session_id(sub_id).await;
+
+        // Load prior messages from the persistent session.
+        let prior_messages: Vec<ConversationMessage> = self.sessions
+            .get(&conv_id)
+            .map(|s| s.messages.clone())
+            .unwrap_or_default();
+
+        // Build Bifrost messages: system prompt (always current) + history + new exchange.
+        let mut messages: Vec<Message> = Vec::new();
+        messages.push(Message::text("system", system_prompt.to_string()));
+
+        // Replay prior conversation (skip old system messages — we replaced above).
+        for msg in &prior_messages {
+            if msg.role == MessageRole::System {
+                continue;
+            }
+            for block in &msg.blocks {
+                match block {
+                    ContentBlock::Text { text } => {
+                        let role = match msg.role {
+                            MessageRole::User => "user",
+                            MessageRole::Assistant => "assistant",
+                            MessageRole::Tool => "tool",
+                            MessageRole::System => continue,
+                        };
+                        messages.push(Message::text(role, text.clone()));
+                    }
+                    ContentBlock::ToolUse { id, name, input } => {
+                        messages.push(Message::assistant_tool_calls(
+                            String::new(),
+                            vec![crate::bridge::bifrost::MessageToolCall::function(
+                                id.clone(), name.clone(), input.clone(),
+                            )],
+                        ));
+                    }
+                    ContentBlock::ToolResult { tool_use_id, tool_name, output, .. } => {
+                        messages.push(Message::tool_result(tool_use_id, tool_name, output.clone()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Append the new exchange for this pass.
+        messages.push(Message::text("user", user_content));
+        let history_len = messages.len();
 
         for _round in 0..SUBCONSCIOUS_MAX_TOOL_ROUNDS {
             let request = ChatCompletionRequest {
@@ -504,6 +609,9 @@ Resolve entries: `[YYYY-MM-DD HH:MM] RESOLVED — note`"#;
             // If no tool calls, this is the final text response — parse it
             if response.tool_calls.is_empty() {
                 let content = response.content.trim().to_string();
+                // Record this pass in the subconscious's persistent session.
+                messages.push(Message::text("assistant", response.content.clone()));
+                self.persist_subconscious_turn(&conv_id, &messages[(history_len - 1)..]);
                 if content.eq_ignore_ascii_case("none") || content.is_empty() {
                     return Ok(Vec::new());
                 }
@@ -547,8 +655,10 @@ Resolve entries: `[YYYY-MM-DD HH:MM] RESOLVED — note`"#;
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         }
 
-        // If we exhausted rounds without a text response, return empty
+        // If we exhausted rounds without a text response, return empty —
+        // still persist the pass so the unfinished work isn't lost.
         tracing::warn!("subconscious exhausted {} tool rounds without a final response", SUBCONSCIOUS_MAX_TOOL_ROUNDS);
+        self.persist_subconscious_turn(&conv_id, &messages[(history_len - 1)..]);
         Ok(Vec::new())
     }
 
@@ -583,13 +693,24 @@ Resolve entries: `[YYYY-MM-DD HH:MM] RESOLVED — note`"#;
         &self,
         session: &crate::server::session_manager::Session,
     ) -> f32 {
+        self.pressure_for(&session.agent_id, &session.messages).await
+    }
+
+    /// Context pressure for an agent given a message snapshot — the
+    /// session-free form used by `on_response`, which runs after the user
+    /// has been released and must not hold a live session ref.
+    pub async fn pressure_for(
+        &self,
+        agent_id: &str,
+        messages: &[ConversationMessage],
+    ) -> f32 {
         let limit = self
             .agents
-            .get(&session.agent_id)
+            .get(agent_id)
             .await
             .map(|a| a.llm_config.context_window as usize)
             .unwrap_or(128_000);
-        self.calculate_pressure(&session.messages, limit)
+        self.calculate_pressure(messages, limit)
     }
 }
 
@@ -605,6 +726,55 @@ Resolve entries: `[YYYY-MM-DD HH:MM] RESOLVED — note`"#;
 /// Multiple observation blocks can appear sequentially. The parser is forgiving
 /// — unmatched or missing fields silently skip an observation rather than
 /// crashing the entire analysis pass.
+/// Convert a Bifrost API message into the internal `ConversationMessage`
+/// form the session store and compaction engine operate on. The subconscious
+/// runs her tool loop in Bifrost `Message`s; this is the bridge back to her
+/// persistent session.
+fn bifrost_to_conversation(msg: &Message) -> ConversationMessage {
+    let role = match msg.role.as_str() {
+        "system" => MessageRole::System,
+        "user" => MessageRole::User,
+        "assistant" => MessageRole::Assistant,
+        "tool" => MessageRole::Tool,
+        _ => MessageRole::User,
+    };
+
+    // A `role: "tool"` message carries a single tool result.
+    if let Some(tool_use_id) = &msg.tool_call_id {
+        return ConversationMessage {
+            role,
+            blocks: vec![ContentBlock::ToolResult {
+                tool_use_id: tool_use_id.clone(),
+                tool_name: msg.name.clone().unwrap_or_default(),
+                output: msg.content.clone(),
+                is_error: false,
+            }],
+            usage: None,
+            timestamp: Some(chrono::Utc::now()),
+        };
+    }
+
+    let mut blocks = Vec::new();
+    if !msg.content.is_empty() {
+        blocks.push(ContentBlock::Text { text: msg.content.clone() });
+    }
+    if let Some(calls) = &msg.tool_calls {
+        for c in calls {
+            blocks.push(ContentBlock::ToolUse {
+                id: c.id.clone(),
+                name: c.function.name.clone(),
+                input: c.function.arguments.clone(),
+            });
+        }
+    }
+    ConversationMessage {
+        role,
+        blocks,
+        usage: None,
+        timestamp: Some(chrono::Utc::now()),
+    }
+}
+
 fn parse_observations(text: &str) -> Vec<InboxItem> {
     let mut items = Vec::new();
     let mut source: Option<&str> = None;

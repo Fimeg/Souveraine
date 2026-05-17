@@ -1247,6 +1247,12 @@ async fn run_turn(
         tracing::debug!(agent = %agent_id, error = %e, "energy-balance write skipped");
     }
 
+    // The primary's turn is done — her words are committed. Release the user
+    // here, before the N+1 pass: the stream stays open so the subconscious's
+    // surfacings still arrive, but the user is free to speak again. The
+    // substrate signals; it does not hold her hostage to Aster's pass.
+    let _ = tx.send(Ok(BackendEvent::PrimaryComplete)).await;
+
     // Breather between turns — unconditional,
     // so the upstream always gets a gap before the N+1 pass starts.
     tokio::time::sleep(Duration::from_millis(2000)).await;
@@ -1270,16 +1276,21 @@ async fn run_turn(
     });
 
     let pass_start = Instant::now();
-    let pass_result = {
+    // Snapshot the session before the N+1 await. `PrimaryComplete` has already
+    // released the user — she may be mid-way into a new turn. Holding a live
+    // DashMap ref across the (potentially long) subconscious pass would block
+    // that turn's writes on the shard lock. Clone what the pass needs instead.
+    let (n1_turn_count, n1_messages) = {
         let session = server
             .sessions
             .get(&conversation_id)
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", conversation_id))?;
-        server
-            .consciousness
-            .on_response(&*session, &final_content)
-            .await
+        (session.turn_count, session.messages.clone())
     };
+    let pass_result = server
+        .consciousness
+        .on_response(&agent_id, n1_turn_count, &n1_messages, &final_content)
+        .await;
 
     let pass_elapsed = pass_start.elapsed();
     tracing::info!(

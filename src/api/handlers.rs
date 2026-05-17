@@ -244,11 +244,16 @@ async fn handle_conversation_stream(
                 ConversationMessage::assistant_text(&content)
             );
             
-            // Run consciousness events
-            let session = server.sessions.get(&conversation_id)
-                .ok_or_else(|| anyhow::anyhow!("Session disappeared"))?;
-            let events = server.consciousness.on_response(&*session, &content).await?;
-            drop(session);
+            // Run consciousness events. Snapshot the session first — holding
+            // a live ref across the N+1 pass would block concurrent writes.
+            let (n1_agent, n1_turn_count, n1_messages) = {
+                let session = server.sessions.get(&conversation_id)
+                    .ok_or_else(|| anyhow::anyhow!("Session disappeared"))?;
+                (session.agent_id.clone(), session.turn_count, session.messages.clone())
+            };
+            let events = server.consciousness
+                .on_response(&n1_agent, n1_turn_count, &n1_messages, &content)
+                .await?;
             
             // Inject surfacing events back into the session as system messages
             // so the agent sees them in its context window on the next turn.

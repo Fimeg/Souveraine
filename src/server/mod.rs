@@ -135,18 +135,8 @@ impl SouveraineServer {
         let rate_delay = Arc::new(AtomicU64::new(1000));
         tracing::info!("rate delay initialized at 1000ms");
 
-        let consciousness = Arc::new(ConsciousnessEngine::new(
-            agents.clone(),
-            sessions.clone(),
-            bifrost.clone(),
-            config.subconscious.model.clone(),
-            config.reflection.model.clone(),
-            config.subconscious.max_tokens,
-            rate_delay.clone(),
-            config.archivist.clone(),
-        ));
-
-        // Build compaction engine with closure-based session access
+        // Build compaction engine with closure-based session access (before
+        // consciousness engine so it can be shared with the subconscious).
         let comp_session = sessions.clone();
         let comp_agents = agents.clone();
         let app_cfg = Arc::new(RwLock::new(config.clone()));
@@ -172,10 +162,23 @@ impl SouveraineServer {
         };
         let get_repo: Arc<dyn Fn(&str) -> Option<crate::core::memory::MemoryRepo> + Send + Sync> = {
             let agents = comp_agents.clone();
-            Arc::new(move |id| Some(agents.memory_repo(id)))
+            Arc::new(move |id| {
+                if id.ends_with("-sub") {
+                    let primary_id = id.trim_end_matches("-sub");
+                    Some(agents.subconscious_memory_repo(primary_id))
+                } else {
+                    Some(agents.memory_repo(id))
+                }
+            })
         };
         let get_agent_type: Arc<dyn Fn(&str) -> Option<String> + Send + Sync> =
-            Arc::new(|_| Some("primary".to_string()));
+            Arc::new(|id| {
+                if id.ends_with("-sub") {
+                    Some("subconscious".to_string())
+                } else {
+                    Some("primary".to_string())
+                }
+            });
 
         let compaction_engine: Arc<dyn CompactionEngine> = Arc::new(DefaultCompactionEngine {
             config: app_cfg,
@@ -188,6 +191,19 @@ impl SouveraineServer {
             get_repo,
             get_agent_type,
         });
+
+        let consciousness = Arc::new(ConsciousnessEngine::new(
+            agents.clone(),
+            sessions.clone(),
+            bifrost.clone(),
+            config.subconscious.model.clone(),
+            config.reflection.model.clone(),
+            config.subconscious.max_tokens,
+            rate_delay.clone(),
+            config.archivist.clone(),
+            compaction_engine.clone(),
+            config.subconscious.system_prompt.clone(),
+        ));
 
         // Gitea-backed memory is opt-in for the server: it requires a reachable
         // Gitea instance + token. If those aren't configured, the server still

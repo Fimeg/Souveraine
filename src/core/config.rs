@@ -226,6 +226,12 @@ pub struct SubconsciousConfig {
     /// Defaults to None — let the model use its full output capacity.
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    /// Platform prompt for the subconscious — prepended to the prompt she
+    /// assembles from her own memfs. The subconscious's equivalent of
+    /// `AgentConfig.system_prompt`. Defaults to None (memfs + body
+    /// orientation only).
+    #[serde(default)]
+    pub system_prompt: Option<String>,
     /// Per-agent N+ interval overrides (e.g. Ani=N+1, Helper=N+5)
     #[serde(default)]
     pub per_agent_intervals: HashMap<String, AgentSubconsciousConfig>,
@@ -244,6 +250,7 @@ impl Default for SubconsciousConfig {
             inbox_enabled: true,
             model: None,
             max_tokens: None,
+            system_prompt: None,
             per_agent_intervals: HashMap::new(),
         }
     }

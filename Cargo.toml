@@ -58,6 +58,7 @@ hound = "3.5"
 crossterm = "0.27"  # Terminal control
 ratatui = { version = "0.30", features = ["crossterm"] }  # TUI framework with crossterm backend
 unicode-width = "0.1"
+arboard = { version = "3", features = ["wayland-data-control"] }  # Clipboard — click-to-copy a message bubble
 colored = "2"       # Color gradients and effects
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }  # Per-agent portraits (assets/portrait.{png,jpg})
 ratatui-image = "11"  # Real photo rendering in TUI (kitty/sixel/halfblock)

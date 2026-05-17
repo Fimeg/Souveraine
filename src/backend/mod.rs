@@ -123,6 +123,12 @@ pub enum BackendEvent {
     /// between tool rounds, processing). The TUI resets `last_event_at`
     /// on this the same way it does for `Token` — it's a liveness signal.
     Keepalive,
+    /// The primary's response is committed and the user may speak again.
+    /// The stream stays open — the N+1 subconscious pass continues behind
+    /// this signal and still delivers `SubconsciousPass` / `Surfacing`
+    /// events. The substrate does not hold the user hostage to N+1: the
+    /// primary yields, the subconscious presses on.
+    PrimaryComplete,
     /// Stream ended cleanly.
     Done,
 }
