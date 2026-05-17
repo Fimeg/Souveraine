@@ -406,6 +406,9 @@ pub struct ChatState {
     pub switch_rx: Option<oneshot::Receiver<Result<(String, Vec<crate::core::session::ConversationMessage>)>>>,
     /// Conversation ID waiting for the current turn to finalize before loading.
     pub switch_pending: Option<String>,
+    /// True when the conversation list was requested as an on-entry
+    /// resume-or-new offer — silent on empty, raises the picker on non-empty.
+    pub resume_offer: bool,
     /// `/btw` fork state — an ephemeral side-quest conversation running
     /// in parallel to the main chat. Rendered as a floating bordered pane.
     pub btw_state: BtwState,
@@ -511,6 +514,7 @@ impl ChatState {
             convos_rx: None,
             switch_rx: None,
             switch_pending: None,
+            resume_offer: false,
             btw_state: BtwState::Idle,
             btw_rx: None,
             tool_cards_expanded: false,
@@ -591,13 +595,21 @@ Tab toggles the cockpit pane. `t` (on empty input) toggles tool expansion.";
             return true;
         }
 
-        // Normal chat message
+        // Normal chat message — a User bubble, then a turn for it.
         let text = trimmed;
-        let ts = Instant::now();
-        self.messages.push(ChatMessage::User { text: text.clone(), ts });
-        // No pre-created Assistant bubble — if the agent starts with tool
-        // calls, the empty bubble would finalize as a tiny blank box.
-        // `append_streaming()` creates one on first text token.
+        self.messages.push(ChatMessage::User { text: text.clone(), ts: Instant::now() });
+        self.spawn_turn(text);
+        true
+    }
+
+    /// Start a backend turn for `text`: set up the turn channel, cancel
+    /// token, and relay task. Does NOT push a user bubble — the caller owns
+    /// what the user sees (a normal `User` bubble for [`submit`], or the
+    /// already-shown `Interjection` bubbles for a deferred interjection
+    /// delivery). No pre-created Assistant bubble — `append_streaming()`
+    /// makes one on the first text token, so a tool-first turn doesn't
+    /// finalize a blank box.
+    fn spawn_turn(&mut self, text: String) {
         self.busy = true;
         self.tool_calls_this_turn = 0;
         self.phase = TurnPhase::Thinking;
@@ -607,7 +619,8 @@ Tab toggles the cockpit pane. `t` (on empty input) toggles tool expansion.";
         let (tx, rx) = mpsc::channel::<BackendEvent>(64);
         self.turn_rx = Some(rx);
 
-        // Cancellation token for this turn — Esc fires it.
+        // Cancellation token for this turn — Esc raises a hand, an agent
+        // switch cancels it outright (see cancel_active_turn).
         let cancel = CancellationToken::new();
         self.cancel_token = Some(cancel.clone());
 
@@ -641,7 +654,47 @@ Tab toggles the cockpit pane. `t` (on empty input) toggles tool expansion.";
             }
             let _ = tx.send(BackendEvent::Done).await;
         });
-        true
+    }
+
+    /// Cancel any in-flight turn — used when the chat surface is torn down
+    /// (an agent switch) so the turn does not keep running orphaned, still
+    /// working the message the user has already walked away from. The
+    /// backend reads the cancel token, commits whatever partial output
+    /// exists, and stops making new calls.
+    pub fn cancel_active_turn(&self) {
+        if let Some(token) = &self.cancel_token {
+            if !token.is_cancelled() {
+                token.cancel();
+            }
+        }
+    }
+
+    /// Deliver interjections the backend did not consume before the turn
+    /// ended. The user typed them while she was working; if her turn
+    /// finished without picking them up, they must still reach her — so we
+    /// open a fresh turn carrying them, rather than leaving them stranded
+    /// in the queue (the bug where "she isn't getting that message").
+    fn deliver_pending_interjections(&mut self) {
+        if self.busy {
+            return;
+        }
+        let pending: Vec<String> = self
+            .pending_interjections
+            .lock()
+            .ok()
+            .map(|mut q| q.drain(..).collect())
+            .unwrap_or_default();
+        if pending.is_empty() {
+            return;
+        }
+        // The Interjection bubbles already show what the user said — mark
+        // them delivered rather than pushing a duplicate User bubble.
+        for msg in &mut self.messages {
+            if let ChatMessage::Interjection { delivered, .. } = msg {
+                *delivered = true;
+            }
+        }
+        self.spawn_turn(pending.join("\n"));
     }
 
     fn handle_slash_command(&mut self, input: &str) -> bool {
@@ -740,6 +793,23 @@ Tab toggles the cockpit pane. `t` (on empty input) toggles tool expansion.";
 
         self.system_message("Creating new conversation...".to_string());
         self.new_conv_rx = Some(rx);
+    }
+
+    /// On chat entry, quietly check whether this agent has earlier
+    /// conversations. If it does, the resolved list raises the
+    /// ConversationPicker so the user chooses resume-or-new; if it does not,
+    /// nothing is shown and the fresh conversation simply begins. Unlike
+    /// `/resume`, this prints no "loading" / "none" chatter.
+    pub fn offer_resume_or_new(&mut self) {
+        let backend = self.backend.clone();
+        let agent_id = self.agent_id.clone();
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let result = backend.list_conversations(&agent_id).await;
+            let _ = tx.send(result);
+        });
+        self.resume_offer = true;
+        self.convos_rx = Some(rx);
     }
 
     fn handle_list_conversations(&mut self) {
@@ -959,10 +1029,19 @@ Tab toggles the cockpit pane. `t` (on empty input) toggles tool expansion.";
         // Check for /resume conversation list result → show picker overlay
         if let Some(rx) = self.convos_rx.as_mut() {
             if let Ok(result) = rx.try_recv() {
+                // `offer` = this list was an on-entry resume-or-new check, not
+                // an explicit `/resume`. It stays silent when there's nothing
+                // to resume, and excludes the just-created empty conversation.
+                let offer = std::mem::take(&mut self.resume_offer);
                 match result {
-                    Ok(convos) => {
+                    Ok(mut convos) => {
+                        if offer {
+                            convos.retain(|c| c.id != self.conversation_id);
+                        }
                         if convos.is_empty() {
-                            self.system_message("No saved conversations.".to_string());
+                            if !offer {
+                                self.system_message("No saved conversations.".to_string());
+                            }
                         } else {
                             self.overlay = Overlay::ConversationPicker {
                                 selected: 0,
@@ -971,7 +1050,9 @@ Tab toggles the cockpit pane. `t` (on empty input) toggles tool expansion.";
                         }
                     }
                     Err(e) => {
-                        self.system_message(format!("Failed to list conversations: {}", e));
+                        if !offer {
+                            self.system_message(format!("Failed to list conversations: {}", e));
+                        }
                     }
                 }
                 self.convos_rx = None;
@@ -1244,6 +1325,10 @@ Tab toggles the cockpit pane. `t` (on empty input) toggles tool expansion.";
                     self.tool_calls_this_turn = 0;
                     if let Some(conv_id) = self.switch_pending.take() {
                         self.initiate_switch_load(conv_id);
+                    } else {
+                        // Turn ended — any interjection that arrived too late
+                        // to be drained gets its own fresh turn now.
+                        self.deliver_pending_interjections();
                     }
                     return;
                 }
@@ -1260,6 +1345,8 @@ Tab toggles the cockpit pane. `t` (on empty input) toggles tool expansion.";
             self.tool_calls_this_turn = 0;
             if let Some(conv_id) = self.switch_pending.take() {
                 self.initiate_switch_load(conv_id);
+            } else {
+                self.deliver_pending_interjections();
             }
         }
 
@@ -2803,7 +2890,7 @@ fn draw_overlay(f: &mut Frame, state: &ChatState, full_area: Rect, input_area: R
             let inner_width = (width as usize).saturating_sub(4);
             let mut lines: Vec<Line<'static>> = Vec::new();
             lines.push(Line::from(Span::styled(
-                " Conversations — ↑↓ select · Enter switch · Esc cancel",
+                " Conversations — ↑↓ select · Enter resume · n new · Esc dismiss",
                 Style::default().fg(state.palette.agent_dim).add_modifier(Modifier::ITALIC),
             )));
 

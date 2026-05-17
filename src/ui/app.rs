@@ -328,6 +328,12 @@ impl App {
         self.agent_status.name = agent_name.to_string();
 
         if changed {
+            // Cancel any in-flight turn before dropping the chat surface —
+            // otherwise the turn keeps running orphaned and resurfaces as
+            // "she's doing the same message again" on a later /resume.
+            if let Some(chat) = &self.chat {
+                chat.cancel_active_turn();
+            }
             self.chat = None;
             self.chat_error = None;
             self.settings = None;
@@ -1142,6 +1148,12 @@ impl App {
                             chat.accept_conversation_pick();
                             return;
                         }
+                        KeyCode::Char('n') => {
+                            // Keep the fresh conversation connect() already made.
+                            chat.overlay = Overlay::None;
+                            chat.system_message("New conversation.".to_string());
+                            return;
+                        }
                         KeyCode::Esc => {
                             chat.overlay = Overlay::None;
                             return;
@@ -1247,7 +1259,10 @@ impl App {
                 // Chat — lazily connect to a backend on first entry.
                 if self.chat.is_none() {
                     match ChatState::connect(self.config.clone(), &self.agent_pref).await {
-                        Ok(c) => {
+                        Ok(mut c) => {
+                            // Fresh chat surface (first entry, or after an
+                            // agent switch): offer resume-or-new.
+                            c.offer_resume_or_new();
                             self.chat = Some(c);
                             self.chat_error = None;
                         }
