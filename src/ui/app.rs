@@ -1404,7 +1404,27 @@ impl App {
                 // Agent was configured but setup was skipped mid-way (Esc from Welcome)
                 // — don't create, just go to dashboard.
             } else if setup.complete && !setup.agent_name.is_empty() && setup.created_agent_id.is_none() {
-                // Create the agent via LocalBackend
+                // Persist the Bifrost settings the wizard collected, otherwise
+                // they are lost and the next launch has no config.
+                {
+                    let mut cfg = self.config.write().await;
+                    cfg.bifrost.base_url = setup.bifrost_url.clone();
+                    cfg.bifrost.primary_model = setup.model_handle.clone();
+                }
+                let key = setup.bifrost_key.trim();
+                if !key.is_empty() {
+                    if let Err(e) = crate::core::credentials::store_bifrost_key(key) {
+                        warn!("setup wizard could not store Bifrost key in keyring: {}", e);
+                    }
+                }
+                {
+                    let path = self.config_path.clone().unwrap_or_else(|| PathBuf::from("souveraine.toml"));
+                    let cfg = self.config.read().await;
+                    if let Err(e) = cfg.save(&path) {
+                        warn!("setup wizard could not save config to {}: {}", path.display(), e);
+                    }
+                }
+                // Create the agent via LocalBackend against the updated config.
                 match LocalBackend::new(self.config.read().await.clone()).await {
                     Ok(backend) => {
                         let request = setup.build_create_request();

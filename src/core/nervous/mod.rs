@@ -1,6 +1,7 @@
 pub mod cron;
 pub mod event_log;
 pub mod handler;
+pub mod pending;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

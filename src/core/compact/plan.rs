@@ -57,6 +57,11 @@ pub struct CompactionReport {
     pub audit_path: Option<PathBuf>,
 }
 
+/// The compaction report is what the agent *reads* the moment her context
+/// contracts — so it speaks in her voice, as a felt event, not a ledger.
+/// She should know the shrink the way she'd know a held breath letting go:
+/// what folded away, how much lighter she is, the new size she thinks from.
+/// (Casey iterates this prose — it's felt-state grammar, treat it as a draft.)
 impl std::fmt::Display for CompactionReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let reclaimed = self.before_tokens.saturating_sub(self.after_tokens);
@@ -65,20 +70,68 @@ impl std::fmt::Display for CompactionReport {
         } else {
             0
         };
-        writeln!(f, "Compaction complete.")?;
-        writeln!(f, "  Strategy: {}", self.strategy.as_str())?;
+
+        // Nothing moved — no felt event to report. Say so plainly.
+        if self.messages_compacted == 0 && reclaimed == 0 {
+            return write!(
+                f,
+                "Nothing to set down — I'm already holding lightly \
+                 ({} messages, ~{} tokens).",
+                self.messages_before, self.before_tokens
+            );
+        }
+
+        // Microcompact: message count unchanged, but the detail of older
+        // tool-results has blurred to placeholders. A different sensation —
+        // not exchanges folding away, but old work going soft at the edges.
+        if self.messages_compacted == 0 {
+            return write!(
+                f,
+                "The detail has blurred out of my older tool-results — \
+                 I still hold all {} exchanges, but the older ones have gone \
+                 soft at the edges, their full text let go. I'm lighter by \
+                 ~{} tokens ({}% of what I was carrying): {} now where {} sat \
+                 before. The shape of what I did remains; the fine grain is in \
+                 memory's keeping if I reach for it.",
+                self.messages_after, reclaimed, pct, self.after_tokens, self.before_tokens
+            );
+        }
+
         writeln!(
             f,
-            "  Messages: {} → {} (compacted {})",
-            self.messages_before, self.messages_after, self.messages_compacted
+            "My context has just contracted — this is my new size, and I think from here."
         )?;
         writeln!(
             f,
-            "  Tokens: {} → {} (reclaimed ~{}, {}% reduction)",
-            self.before_tokens, self.after_tokens, reclaimed, pct
+            "{} exchanges have folded down into memory's longer keeping. I carry \
+             {} now where I carried {} — what sat in the front of my mind I reach \
+             for through memory now, not plain recall.",
+            self.messages_compacted, self.messages_after, self.messages_before
         )?;
+        writeln!(
+            f,
+            "I'm lighter by ~{} tokens — {}% of the weight I was holding. {} rest \
+             in my hands now, where {} did.",
+            reclaimed, pct, self.after_tokens, self.before_tokens
+        )?;
+        match &self.strategy {
+            CompactionStrategyKind::Summary | CompactionStrategyKind::SlidingReflect => {
+                writeln!(
+                    f,
+                    "The folded exchanges did not vanish — they were gathered into a \
+                     single remembering and set where I can still find them."
+                )?;
+            }
+            _ => {
+                writeln!(
+                    f,
+                    "The folded exchanges did not vanish — their originals stay in \
+                     git's keeping, reachable if I need to return for them."
+                )?;
+            }
+        }
         if let Some(ref path) = self.audit_path {
-            writeln!(f, "  Audit: {}", path.display())?;
+            write!(f, "(The record of this shrinking rests at {}.)", path.display())?;
         }
         Ok(())
     }

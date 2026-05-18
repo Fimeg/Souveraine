@@ -119,9 +119,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Summon Souveraine into this place (generate config)
+    /// Write a souveraine.toml config template into this directory
     #[command(
-        long_about = "Creates a souveraine.toml in the current directory with sensible defaults.\n\nThe being awakens with a body: configuration, memory paths, model preferences.\nEdit souveraine.toml to shape how it sees the world."
+        long_about = "Writes a souveraine.toml template with sensible defaults.\n\nThis is not onboarding — the first run of `souveraine tui` does that, via the\nsetup wizard (Bifrost config, model choice, agent creation). `init` is just\nthe scriptable config-template writer, for automation or pre-launch editing."
     )]
     Init,
 
@@ -332,8 +332,10 @@ async fn main() -> anyhow::Result<()> {
     // Load .env file for credential env vars (BIFROST_KEY, etc.)
     let _ = dotenvy::dotenv();
 
-    // Configure tracing — always writes to souveraine.log (truncated fresh on launch).
-    // Verbose flag additionally mirrors to stderr.
+    // Configure tracing — writes to souveraine.log. The previous run's log is
+    // rotated to souveraine.log.prev on launch so a stall/crash stays diagnosable
+    // after a restart (only the immediately-prior run is kept — no unbounded growth).
+    let _ = std::fs::rename("souveraine.log", "souveraine.log.prev");
     let log_file = std::fs::File::create("souveraine.log")?;
     let subscriber = tracing_subscriber::fmt()
         .with_env_filter("souveraine=debug")
@@ -408,6 +410,12 @@ async fn main() -> anyhow::Result<()> {
 
 // ─── Commands ───────────────────────────────────────────────────────────────
 
+/// Drop a `souveraine.toml` template into the current directory.
+///
+/// This is **not** onboarding — the first run of `souveraine tui` does that
+/// via the setup wizard (Bifrost config, model, agent creation). `init` is
+/// only the scriptable config-template writer: useful for automation and for
+/// editing config ahead of first launch.
 async fn run_init(json: bool) -> anyhow::Result<()> {
     let path = PathBuf::from("souveraine.toml");
     if path.exists() {
@@ -422,25 +430,12 @@ async fn run_init(json: bool) -> anyhow::Result<()> {
 
     tokio::fs::write(&path, CONFIG_TEMPLATE).await?;
 
-    if !json {
-        use std::io::Write;
-        print!("Bifrost API key (enter to skip): ");
-        std::io::stdout().flush().ok();
-        let mut key = String::new();
-        std::io::stdin().read_line(&mut key).ok();
-        let key = key.trim();
-        if !key.is_empty() {
-            crate::core::credentials::store_bifrost_key(key)?;
-            println!("  Key stored in OS keyring.");
-        }
-    }
-
     if json {
-        println!(r#"{{"status":"summoned","path":"souveraine.toml"}}"#);
+        println!(r#"{{"status":"written","path":"souveraine.toml"}}"#);
     } else {
-        println!("Souveraine config written to {}/souveraine.toml", std::env::current_dir()?.display());
-        println!("  Edit souveraine.toml to shape how it sees the world.");
-        println!("  Run `souveraine chat` to begin.");
+        println!("Config template written to {}/souveraine.toml", std::env::current_dir()?.display());
+        println!("  Run `souveraine tui` to set up — the wizard configures Bifrost");
+        println!("  and creates your agent. (Editing the file first is optional.)");
     }
 
     Ok(())
@@ -973,6 +968,22 @@ async fn run_chat(
     };
 
     let conv_id = backend.ensure_conversation(&agent.id).await?;
+
+    // Surface anything the subconscious noted during autonomous (heartbeat)
+    // cycles since the last session. Read-once — this clears the stash.
+    let pending = backend.take_pending_surfacings(&agent.id).await;
+    if !pending.is_empty() && !json {
+        eprintln!(
+            "\n  {} observation{} surfaced while you were away:",
+            pending.len(),
+            if pending.len() == 1 { "" } else { "s" },
+        );
+        for p in &pending {
+            let tag = if p.source.is_empty() { p.kind.as_str() } else { p.source.as_str() };
+            eprintln!("     [{}] {}", tag, p.content);
+        }
+        eprintln!();
+    }
 
     let one_shot = message.clone();
     if let Some(msg) = one_shot {

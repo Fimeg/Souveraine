@@ -209,4 +209,17 @@ pub trait Backend: Send + Sync {
         let _ = (agent_id, model);
         Ok(())
     }
+
+    /// Drain heartbeat surfacings stashed since the last session. When the
+    /// CronSensor fires a background turn while no UI is connected, the
+    /// subconscious's surfacings are stashed to disk; this returns and clears
+    /// them so the TUI/CLI can show what happened during the autonomous
+    /// cycle. Default: empty (RemoteBackend — the stash is server-side; a
+    /// pickup API lands later). LocalBackend overrides.
+    async fn take_pending_surfacings(
+        &self,
+        _agent_id: &str,
+    ) -> Vec<crate::core::nervous::pending::PendingSurfacing> {
+        Vec::new()
+    }
 }

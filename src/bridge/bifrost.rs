@@ -245,6 +245,7 @@ pub struct CompletionResult {
     pub content: String,
     pub reasoning: Option<String>,
     pub tool_calls: Vec<ParsedToolCall>,
+    pub finish_reason: Option<String>,
     pub usage: Option<Usage>,
 }
 
@@ -292,6 +293,21 @@ pub enum InferenceStrain {
         model: String,
         body: String,
     },
+}
+
+/// A Bifrost upstream timeout (`504` with `request_timed_out` / `"type":"timeout"`)
+/// is *deterministic* — the same slow model on the same request will time out
+/// again. Retrying it the full 6 times just multiplies one ~30s failure into a
+/// multi-minute stall that was never going to succeed. Cap those at a single
+/// retry (2 attempts total). Genuine transient blips — `503` overloaded,
+/// connection resets, `429` — keep the full retry budget.
+fn retry_cap(body: &str, max_retries: u32) -> u32 {
+    let b = body.to_ascii_lowercase();
+    if b.contains("request_timed_out") || b.contains("\"type\":\"timeout\"") {
+        1
+    } else {
+        max_retries
+    }
 }
 
 fn classify_status(status: reqwest::StatusCode, body: &str) -> ErrorClass {
@@ -511,7 +527,7 @@ impl BifrostClient {
                 .context("Failed to read Bifrost error body")?;
 
             match classify_status(status, &body_text) {
-                ErrorClass::Transient if attempt < policy.max_retries => {
+                ErrorClass::Transient if attempt < retry_cap(&body_text, policy.max_retries) => {
                     let delay = retry_after.unwrap_or_else(|| jittered_delay(attempt, policy));
                     warn!(
                         "Bifrost {} on {} (attempt {}), retrying in {:?}",
@@ -572,6 +588,7 @@ impl BifrostClient {
             content,
             reasoning,
             tool_calls,
+            finish_reason: choice.finish_reason.clone(),
             usage: parsed.usage,
         })
     }

@@ -93,6 +93,14 @@ impl AgentInventory {
         self.memfs_dir.join(agent_id).join("memory")
     }
 
+    /// Per-agent data directory: `~/.souveraine/agents/{id}/`. The parent of
+    /// the memfs (`memory/`), `conversations/`, and `seed/`. Runtime state
+    /// that is *not* memory — e.g. the pending heartbeat-surfacings queue —
+    /// lives here so it never churns the git-tracked memfs.
+    pub fn agent_data_dir(&self, agent_id: &str) -> PathBuf {
+        self.memfs_dir.join(agent_id)
+    }
+
     /// Return the filesystem path to a subconscious agent's memory directory.
     pub fn subconscious_memory_root(&self, primary_id: &str) -> PathBuf {
         let sub_id = format!("{}-sub", primary_id);

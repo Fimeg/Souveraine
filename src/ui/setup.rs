@@ -294,7 +294,7 @@ impl SetupState {
             complete: false,
             bifrost_url: "http://10.10.20.120:3360".to_string(),
             bifrost_key: String::new(),
-            agent_name: "Ani".to_string(),
+            agent_name: "Souveraine".to_string(),
             model_handle: default_model.to_string(),
             models_rx: None,
             models_fetching: false,

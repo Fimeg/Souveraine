@@ -724,6 +724,14 @@ impl Backend for LocalBackend {
         tracing::info!(agent = %agent_id, model = %model, "agent llm_config model updated via settings");
         Ok(())
     }
+
+    async fn take_pending_surfacings(
+        &self,
+        agent_id: &str,
+    ) -> Vec<crate::core::nervous::pending::PendingSurfacing> {
+        let dir = self.server.agents.agent_data_dir(agent_id);
+        crate::core::nervous::pending::take(&dir).await
+    }
 }
 
 #[async_trait]
@@ -744,10 +752,72 @@ impl crate::core::nervous::handler::TurnInjector for LocalBackend {
             None => self.ensure_conversation(agent_id).await?,
         };
         let stream = self.send(&conv_id, text).await?;
-        // Drain the stream in the background — no UI is listening.
+        // Drain the stream in the background — no UI is listening. But the
+        // subconscious's N+1 pass runs inside this turn, and what she
+        // surfaces (a commitment, a reflection, an archivist synthesis)
+        // would otherwise vanish with the drained events. Collect those and
+        // stash them so the next TUI/CLI session shows the human what
+        // happened during the autonomous cycle.
+        let server = self.server.clone();
+        let agent_id = agent_id.to_string();
         tokio::spawn(async move {
+            use crate::core::nervous::pending::PendingSurfacing;
             let mut s = stream;
-            while s.next().await.is_some() {}
+            let mut stashed: Vec<PendingSurfacing> = Vec::new();
+            while let Some(ev) = s.next().await {
+                match ev {
+                    Ok(BackendEvent::Surfacing { source, content, priority }) => {
+                        // Skip the no-op heartbeat sentinel — the subconscious
+                        // always queues a low "pass complete, no anomalies"
+                        // item so the UI shows the pass ran. That is noise to
+                        // resurface on connect; only stash real observations.
+                        if priority.eq_ignore_ascii_case("low")
+                            && content.contains("no anomalies detected")
+                        {
+                            continue;
+                        }
+                        stashed.push(PendingSurfacing {
+                            kind: "surfacing".to_string(),
+                            source,
+                            content,
+                            priority,
+                            at: chrono::Utc::now(),
+                        });
+                    }
+                    Ok(BackendEvent::Reflection(content)) => {
+                        stashed.push(PendingSurfacing {
+                            kind: "reflection".to_string(),
+                            source: String::new(),
+                            content,
+                            priority: String::new(),
+                            at: chrono::Utc::now(),
+                        });
+                    }
+                    Ok(BackendEvent::Archivist { synthesis, .. }) => {
+                        stashed.push(PendingSurfacing {
+                            kind: "archivist".to_string(),
+                            source: String::new(),
+                            content: synthesis,
+                            priority: String::new(),
+                            at: chrono::Utc::now(),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            if !stashed.is_empty() {
+                let dir = server.agents.agent_data_dir(&agent_id);
+                match crate::core::nervous::pending::append(&dir, &stashed).await {
+                    Ok(()) => tracing::info!(
+                        agent = %agent_id,
+                        count = stashed.len(),
+                        "stashed heartbeat surfacings for next session"
+                    ),
+                    Err(e) => tracing::warn!(
+                        "pending heartbeat surfacings stash failed: {}", e
+                    ),
+                }
+            }
         });
         Ok(())
     }
@@ -1017,6 +1087,36 @@ async fn run_turn(
         // Emit reasoning trace if present
         if let Some(reasoning) = &response.reasoning {
             let _ = tx.send(Ok(BackendEvent::Reasoning(reasoning.clone()))).await;
+        }
+
+        // ── Truncation: the agent hit her output ceiling ─────────
+        // Some models don't signal "length" in finish_reason and just stop
+        // evolving after the first pass (e.g. kimi-k2.6). In that case the
+        // model already finished and the turn is done.
+        // But when finish_reason IS "length", the agent was physically cut
+        // off mid-thought. Inject a felt signal so she knows why her words
+        // ended and can choose differently — tighten, or use a tool, or
+        // admit the ceiling rather than mistake it for silence.
+        let was_truncated = response.finish_reason.as_deref() == Some("length");
+
+        if was_truncated && response.tool_calls.is_empty() {
+            // Stream the truncated content before we tell her it was clipped,
+            // so she recognises her own words in the signal.
+            let chars: Vec<char> = response.content.chars().collect();
+            for chunk in chars.chunks(10) {
+                let s: String = chunk.iter().collect();
+                let _ = tx.send(Ok(BackendEvent::Token(s.clone()))).await;
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            }
+            messages.push(BifrostMessage::text("assistant", response.content.clone()));
+            messages.push(BifrostMessage::text(
+                "system",
+                "My output just hit its ceiling — I was cut off mid-flow, not \
+                 finished. If I was in the middle of something, I can continue \
+                 from here more tightly. If I had more to say, the room is still \
+                 mine."
+            ));
+            continue;
         }
 
         if response.tool_calls.is_empty() {

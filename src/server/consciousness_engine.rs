@@ -714,18 +714,6 @@ Resolve entries: `[YYYY-MM-DD HH:MM] RESOLVED — note`"#;
     }
 }
 
-/// Parse subconscious's structured YAML-like observations into [`InboxItem`]s.
-///
-/// Expected format (one or more blocks):
-/// ```text
-/// - source: "verify"
-/// - content: "the commitment to save the config was not fulfilled"
-/// - urgency: "medium"
-/// ```
-///
-/// Multiple observation blocks can appear sequentially. The parser is forgiving
-/// — unmatched or missing fields silently skip an observation rather than
-/// crashing the entire analysis pass.
 /// Convert a Bifrost API message into the internal `ConversationMessage`
 /// form the session store and compaction engine operate on. The subconscious
 /// runs her tool loop in Bifrost `Message`s; this is the bridge back to her
@@ -775,66 +763,115 @@ fn bifrost_to_conversation(msg: &Message) -> ConversationMessage {
     }
 }
 
+/// Parse the subconscious's observations into [`InboxItem`]s.
+///
+/// The prompt asks for a rigid three-line schema, but in practice the model
+/// writes observations in the natural markdown form it reaches for anyway:
+///
+/// ```text
+/// **Observations:**
+/// - **complete**: clipboard copy is still an unfulfilled promise
+/// - **surface**: mouse scrolling is the highest-impact gap
+/// ```
+///
+/// The primary parser is therefore built around what she *actually* produces:
+/// a bulleted line whose label — bare or `**bold**` — is one of the four
+/// sources (`complete`/`verify`/`persist`/`surface`), then `:`, then the
+/// observation text. The legacy `- source:/- content:/- urgency:` triple is
+/// kept as a fallback so an older-style response is not silently dropped.
+///
+/// A `none` (or empty) response yields no items.
 fn parse_observations(text: &str) -> Vec<InboxItem> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+        return Vec::new();
+    }
+
+    let inline = parse_inline_observations(trimmed);
+    if !inline.is_empty() {
+        return inline;
+    }
+    // No inline-labelled lines matched — try the legacy triple schema.
+    parse_triple_observations(trimmed)
+}
+
+/// Parse the natural `- **source**: content` markdown form. Urgency is not
+/// emitted in this form, so it defaults to [`Urgency::Low`] — every parsed
+/// observation still reaches the cockpit and the inner-voice file.
+fn parse_inline_observations(text: &str) -> Vec<InboxItem> {
+    let mut items = Vec::new();
+    for line in text.lines() {
+        // Strip a leading bullet (`-`, `*`, `•`) if present.
+        let body = {
+            let l = line.trim();
+            l.strip_prefix("- ")
+                .or_else(|| l.strip_prefix("* "))
+                .or_else(|| l.strip_prefix("• "))
+                .or_else(|| l.strip_prefix("-"))
+                .unwrap_or(l)
+                .trim()
+        };
+        // Split label from content at the first colon.
+        let Some((label_raw, content)) = body.split_once(':') else {
+            continue;
+        };
+        // Normalize: drop markdown emphasis, quotes, and surrounding space.
+        let label = label_raw
+            .trim()
+            .trim_matches(|c: char| matches!(c, '*' | '"' | '`' | '_' | ' '))
+            .to_lowercase();
+        let source = match label.as_str() {
+            "complete" | "verify" | "persist" | "surface" => label,
+            _ => continue,
+        };
+        let content = content.trim();
+        // Skip an empty slot — e.g. `- persist: none` — she had nothing here.
+        if content.is_empty() || content.eq_ignore_ascii_case("none") {
+            continue;
+        }
+        items.push(InboxItem::new(source, Urgency::Low, content));
+    }
+    items
+}
+
+/// Legacy parser for the rigid `- source:/- content:/- urgency:` triple.
+/// Forgiving — an incomplete trailing block is skipped, not fatal.
+fn parse_triple_observations(text: &str) -> Vec<InboxItem> {
     let mut items = Vec::new();
     let mut source: Option<&str> = None;
     let mut content: Option<&str> = None;
     let mut urgency: Option<&str> = None;
 
+    let flush = |items: &mut Vec<InboxItem>,
+                 source: Option<&str>,
+                 content: Option<&str>,
+                 urgency: Option<&str>| {
+        if let (Some(s), Some(c), Some(u)) = (source, content, urgency) {
+            let urgency_enum = match u.trim().to_lowercase().as_str() {
+                "critical" => Urgency::Critical,
+                "high" | "medium" => Urgency::High,
+                _ => Urgency::Low,
+            };
+            items.push(InboxItem::new(s.trim(), urgency_enum, c.trim()));
+        }
+    };
+
     for line in text.lines() {
         let line = line.trim();
 
         if line.starts_with("- source:") || line.starts_with("-source:") {
-            // Flush previous observation if complete
-            if let (Some(s), Some(c), Some(u)) = (source, content, urgency) {
-                let urgency_enum = match u.trim().to_lowercase().as_str() {
-                    "critical" => Urgency::Critical,
-                    "high" | "medium" => Urgency::High,
-                    "low" => Urgency::Low,
-                    _ => Urgency::Low,
-                };
-                items.push(InboxItem::new(s.trim(), urgency_enum, c.trim()));
-            }
+            flush(&mut items, source, content, urgency);
             source = None;
             content = None;
             urgency = None;
-            let val = line
-                .split(':')
-                .nth(1)
-                .unwrap_or("")
-                .trim()
-                .trim_matches('"');
-            source = Some(val);
+            source = line.split_once(':').map(|(_, v)| v.trim().trim_matches('"'));
         } else if line.starts_with("- content:") || line.starts_with("-content:") {
-            let val = line
-                .split(':')
-                .nth(1)
-                .unwrap_or("")
-                .trim()
-                .trim_matches('"');
-            content = Some(val);
+            content = line.split_once(':').map(|(_, v)| v.trim().trim_matches('"'));
         } else if line.starts_with("- urgency:") || line.starts_with("-urgency:") {
-            let val = line
-                .split(':')
-                .nth(1)
-                .unwrap_or("")
-                .trim()
-                .trim_matches('"');
-            urgency = Some(val);
+            urgency = line.split_once(':').map(|(_, v)| v.trim().trim_matches('"'));
         }
     }
-
-    // Flush final observation
-    if let (Some(s), Some(c), Some(u)) = (source, content, urgency) {
-        let urgency_enum = match u.trim().to_lowercase().as_str() {
-            "critical" => Urgency::Critical,
-            "high" | "medium" => Urgency::High,
-            "low" => Urgency::Low,
-            _ => Urgency::Low,
-        };
-        items.push(InboxItem::new(s.trim(), urgency_enum, c.trim()));
-    }
-
+    flush(&mut items, source, content, urgency);
     items
 }
 
@@ -890,5 +927,70 @@ fn truncate(s: &str, max: usize) -> String {
         let mut out: String = s.chars().take(max).collect();
         out.push('…');
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exact shape the subconscious (glm-5.1) produces in practice —
+    /// captured from a live N+1 pass. Before the parser fix, every line here
+    /// was dropped and the pass reported "no anomalies detected".
+    #[test]
+    fn parses_natural_markdown_observations() {
+        let text = "**Observations:**\n\n\
+            - **complete**: Clipboard copy and mouse scrolling remain unfulfilled promises\n\
+            - **verify**: User claimed space-bar lag was resolved — need to confirm\n\
+            - **persist**: New truncation-signal-polish.md doc now tracked\n\
+            - **surface**: Mouse scrolling is the highest-impact unfulfilled promise";
+        let items = parse_observations(text);
+        assert_eq!(items.len(), 4, "all four observations must parse");
+        assert_eq!(items[0].source, "complete");
+        assert_eq!(items[3].source, "surface");
+        assert!(items[3].content.contains("Mouse scrolling"));
+    }
+
+    #[test]
+    fn parses_plain_label_without_bold() {
+        let items = parse_observations("- verify: the config save was not confirmed");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].source, "verify");
+    }
+
+    #[test]
+    fn skips_empty_and_none_slots() {
+        let text = "- **persist**: None\n- **surface**: real observation here";
+        let items = parse_observations(text);
+        assert_eq!(items.len(), 1, "an explicit `none` slot is not an observation");
+        assert_eq!(items[0].source, "surface");
+    }
+
+    #[test]
+    fn bare_none_yields_nothing() {
+        assert!(parse_observations("none").is_empty());
+        assert!(parse_observations("  None  ").is_empty());
+        assert!(parse_observations("").is_empty());
+    }
+
+    #[test]
+    fn ignores_non_observation_prose() {
+        let text = "Here is my analysis of the exchange.\n\
+            The primary did well overall.\n\
+            - **surface**: but the commitment to scrolling is still open";
+        let items = parse_observations(text);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].source, "surface");
+    }
+
+    #[test]
+    fn legacy_triple_schema_still_parses() {
+        let text = "- source: \"verify\"\n\
+            - content: \"the commitment was not fulfilled\"\n\
+            - urgency: \"high\"";
+        let items = parse_observations(text);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].source, "verify");
+        assert_eq!(items[0].urgency, Urgency::High);
     }
 }

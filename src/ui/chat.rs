@@ -480,16 +480,59 @@ impl ChatState {
             backend
         };
 
+        // Pick up anything the subconscious surfaced during autonomous
+        // (heartbeat) cycles while no UI was connected. Read-once — this
+        // call clears the stash. An autonomous turn's observations would
+        // otherwise vanish with the silently-drained background stream.
+        let pending = backend.take_pending_surfacings(&agent.id).await;
+        let mut messages: Vec<ChatMessage> = vec![ChatMessage::System {
+            text: "Souveraine ready. Type to begin.".to_string(),
+            ts: Instant::now(),
+        }];
+        let mut cockpit_log: Vec<CockpitEntry> = Vec::new();
+        if !pending.is_empty() {
+            messages.push(ChatMessage::System {
+                text: format!(
+                    "{} observation{} surfaced while you were away (Tab for cockpit).",
+                    pending.len(),
+                    if pending.len() == 1 { "" } else { "s" },
+                ),
+                ts: Instant::now(),
+            });
+            for p in &pending {
+                let (kind, label) = match p.kind.as_str() {
+                    "reflection" => (CockpitKind::Reflection, "reflection"),
+                    "archivist" => (CockpitKind::Archivist, "archivist"),
+                    _ => (CockpitKind::Surfacing, "surfacing"),
+                };
+                cockpit_log.push(CockpitEntry {
+                    kind,
+                    text: format!("(while away) {}", p.content),
+                });
+                messages.push(ChatMessage::Surfacing {
+                    source: if p.source.is_empty() {
+                        label.to_string()
+                    } else {
+                        p.source.clone()
+                    },
+                    content: p.content.clone(),
+                    priority: if p.priority.is_empty() {
+                        "heartbeat".to_string()
+                    } else {
+                        p.priority.clone()
+                    },
+                    ts: Instant::now(),
+                });
+            }
+        }
+
         Ok(Self {
             backend,
             mode: mode.to_string(),
             agent_name: agent.name,
             agent_id: agent.id,
             conversation_id,
-            messages: vec![ChatMessage::System {
-                text: "Souveraine ready. Type to begin.".to_string(),
-                ts: Instant::now(),
-            }],
+            messages,
             input: String::new(),
             scroll: 0,
             msg_layout: RefCell::new(MsgLayout::default()),
@@ -504,7 +547,7 @@ impl ChatState {
             overlay: Overlay::None,
             cockpit: false,
             thinking: Vec::new(),
-            cockpit_log: Vec::new(),
+            cockpit_log,
             tick: 0,
             turn_started: None,
             last_event_at: Instant::now(),
