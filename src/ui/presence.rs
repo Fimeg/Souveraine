@@ -60,7 +60,7 @@ use ratatui::{
 
 use std::path::Path;
 
-use crate::ui::animation::{Animator, colors};
+use crate::ui::animation::Animator;
 use crate::ui::component::TuiEvent;
 use crate::ui::portrait;
 

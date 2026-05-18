@@ -116,7 +116,7 @@ impl SubagentRunner for LocalSubagentRunner {
         let warning_2_threshold = app_config.subagent.warning_2_threshold;
 
         // Create a temporary conversation for the subagent
-        let conv_id = self.server.sessions.create(&params.parent_agent_id);
+        let _conv_id = self.server.sessions.create(&params.parent_agent_id);
 
         // Build system prompt with delegation context and dual-state awareness
         let system_prompt = format!(
@@ -291,6 +291,11 @@ pub struct LocalBackend {
     /// CronSensors read this to pause firing while a conversation is active —
     /// scheduled events shouldn't interrupt presence.
     active_sessions: Arc<AtomicU32>,
+    /// Drives non-terminal surfaces (Matrix, mobile, …) off the EventBus.
+    /// Constructed empty; sensoria are registered and `run_all`'d in a
+    /// later matrix-sensorium phase.
+    #[allow(dead_code)]
+    sensorium: Arc<tokio::sync::Mutex<crate::core::sensorium::SensoriumCoordinator>>,
 }
 
 impl LocalBackend {
@@ -329,6 +334,9 @@ impl LocalBackend {
             event_bus: event_bus.clone(),
             seed_id,
             active_sessions: active_sessions.clone(),
+            sensorium: Arc::new(tokio::sync::Mutex::new(
+                crate::core::sensorium::SensoriumCoordinator::new(),
+            )),
         };
 
         // Spawn one CronSensor per agent (each agent owns its own schedules
@@ -391,6 +399,9 @@ impl LocalBackend {
             server,
             seed_id,
             active_sessions: Arc::new(AtomicU32::new(0)),
+            sensorium: Arc::new(tokio::sync::Mutex::new(
+                crate::core::sensorium::SensoriumCoordinator::new(),
+            )),
         }
     }
 
@@ -992,6 +1003,14 @@ async fn run_turn(
     let mut last_keepalive = Instant::now();
     const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
+    // Announce this turn's lifecycle onto the nervous system so any
+    // sensorium (Matrix, mobile) can drive itself off the event stream.
+    let dispatcher = crate::core::nervous::turn_dispatcher::TurnEventDispatcher::new(
+        event_bus.clone(),
+        conversation_id.clone(),
+        None,
+    );
+
     loop {
         // Cancellation is a signal, not enforcement — we check it on round
         // boundaries (between Bifrost calls, after tools have completed) so
@@ -1090,6 +1109,7 @@ async fn run_turn(
 
         // Emit reasoning trace if present
         if let Some(reasoning) = &response.reasoning {
+            dispatcher.emit_reasoning(reasoning);
             let _ = tx.send(Ok(BackendEvent::Reasoning(reasoning.clone()))).await;
         }
 
@@ -1164,6 +1184,7 @@ async fn run_turn(
                     }
                     send_res = tx.send(Ok(BackendEvent::Token(s.clone()))) => {
                         if send_res.is_err() { return Ok(()); }
+                        dispatcher.emit_segment(&s);
                         streamed.push_str(&s);
                     }
                 }
@@ -1230,9 +1251,11 @@ async fn run_turn(
         // Execute each tool and stream results back — now with per-agent context
         for tc in &response.tool_calls {
             let input_str = tc.arguments.to_string();
+            dispatcher.emit_tool_start(&tc.name, &tc.id);
             let result =
                 crate::core::tools::execute_tool_with_context(&tc.name, &input_str, &tool_ctx)
                     .await;
+            dispatcher.emit_tool_end(&tc.name, &tc.id, result.is_error);
 
             let output = if result.is_error {
                 format!("Error: {}", result.output)
@@ -1307,6 +1330,14 @@ async fn run_turn(
         // Continue loop — model will see tool results and respond
     }
 
+    // The primary pass is settled — either it ran to completion, or the
+    // human raised a hand. Announce which onto the nervous system.
+    if interrupted {
+        dispatcher.emit_interrupted("the human raised a hand");
+    } else {
+        dispatcher.emit_primary_complete();
+    }
+
     // If the user pressed Esc, commit the partial text with a marker the
     // agent will read on her next turn. The interrupt is a signal in her
     // own context — same shape as a pressure warning, not a hidden harness
@@ -1342,6 +1373,9 @@ async fn run_turn(
         }
         return Ok(());
     }
+
+    // The turn's user-facing output is committed — a surface can finalise.
+    dispatcher.emit_turn_finish();
 
     // Energy balance: scan the agent's task list and compute the generative /
     // consumptive ratio. Written to system/dynamic/energy-balance.md so the
@@ -1590,7 +1624,7 @@ async fn write_energy_balance(server: &Arc<SouveraineServer>, agent_id: &str, ev
                     None => continue,
                 };
 
-                let mut completed = false;
+                let mut status: Option<&str> = None;
                 let mut energy: Option<&str> = None;
                 let mut momentum: Option<&str> = None;
 
@@ -1599,7 +1633,7 @@ async fn write_energy_balance(server: &Arc<SouveraineServer>, agent_id: &str, ev
                         let key = key.trim();
                         let val = val.trim().trim_matches('"');
                         match key {
-                            "completed" => completed = val == "true",
+                            "status" => status = Some(val),
                             "energy" => energy = Some(val),
                             "momentum" => momentum = Some(val),
                             _ => {}
@@ -1607,7 +1641,9 @@ async fn write_energy_balance(server: &Arc<SouveraineServer>, agent_id: &str, ev
                     }
                 }
 
-                if !completed {
+                // Only live commitments weigh on the energy balance —
+                // done and cancelled ones have been set down.
+                if matches!(status, Some("pending") | Some("in_progress")) {
                     match energy {
                         Some("generative") => generative += 1,
                         _ => consumptive += 1,

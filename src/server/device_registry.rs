@@ -4,7 +4,6 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::Arc;
 
 fn default_role() -> String {
     "hearth".to_string()

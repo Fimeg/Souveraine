@@ -13,9 +13,28 @@
 //! ## Progressive Discovery
 //! Each bandwidth class maps to a discovery level that controls
 //! what information is surfaced without explicit request.
+//!
+//! ## Driving a surface
+//! A sensorium is not rendered *to* with one-shot snapshots. It is *driven*:
+//! [`Sensorium::run`] is a long-lived loop that consumes the turn-lifecycle
+//! event stream off the [`EventBus`] and reads its own input channel,
+//! owning whatever incremental rendering its surface needs. A Matrix room,
+//! for instance, is a sequence of message edits over time — not a snapshot.
 
-use tokio::sync::mpsc;
-use tracing::debug;
+/// The Matrix sensorium — Souveraine's first non-terminal surface.
+/// Gated behind the `matrix` Cargo feature: a default build never
+/// compiles `matrix-sdk`. A sensorium is a surface you opt into.
+#[cfg(feature = "matrix")]
+pub mod matrix;
+
+use anyhow::Result;
+use async_trait::async_trait;
+use tokio::sync::{broadcast, mpsc};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, warn};
+
+use crate::core::nervous::EventBus;
 
 /// A single line of ambient sense the agent receives with every turn:
 /// what time it is, who is present. Prepended to the user message so
@@ -92,7 +111,13 @@ pub struct InputMetadata {
     pub selected_text: Option<String>,
 }
 
-/// Rendered output for a specific interface
+/// Rendered output for a specific interface.
+///
+/// Retained as the vocabulary for one-shot snapshot rendering, but no
+/// longer the spine of the trait — sensoria now drive themselves off the
+/// event stream. Kept for surfaces (presence indicators, watch faces)
+/// that genuinely are snapshot-shaped.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct RenderedOutput {
     pub text: String,
@@ -101,6 +126,7 @@ pub struct RenderedOutput {
 }
 
 /// Minimal presence indicator for low-bandwidth surfaces
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum PresenceIndicator {
     /// Color-based (RGB values for breathing color)
@@ -111,10 +137,13 @@ pub enum PresenceIndicator {
     Haptic { pattern: String, intensity: f32 },
 }
 
-/// The Sensorium trait — implemented by each concrete interface
+/// The Sensorium trait — implemented by each concrete interface.
 ///
-/// Every interface (TUI, mobile, web, API) implements this trait
-/// to define how consciousness renders to and captures from that surface.
+/// Every interface (TUI, mobile, web, Matrix) implements this trait to
+/// define how consciousness renders to and captures from that surface.
+/// The surface is *driven* by [`Sensorium::run`]: a long-lived loop that
+/// owns its own incremental rendering off the turn-lifecycle event stream.
+#[async_trait]
 pub trait Sensorium: Send + Sync {
     /// What bandwidth does this surface support?
     fn bandwidth(&self) -> BandwidthClass;
@@ -122,14 +151,17 @@ pub trait Sensorium: Send + Sync {
     /// What discovery level should this surface start at?
     fn discovery_level(&self) -> DiscoveryLevel;
 
-    /// Render consciousness state for this specific interface
-    fn render(&self, state: &ConsciousnessState) -> RenderedOutput;
-
-    /// Get the receiver for input events
-    fn input_receiver(&mut self) -> &mut mpsc::Receiver<InputEvent>;
+    /// Drive this surface until shut down.
+    ///
+    /// The sensorium consumes turn-lifecycle / stream events from
+    /// `events` and reads its own input channel, rendering incrementally
+    /// as it goes. It returns `Ok(())` when `cancel` is triggered or the
+    /// surface closes; an `Err` means the surface failed.
+    async fn run(&mut self, events: EventBus, cancel: CancellationToken) -> Result<()>;
 }
 
 /// Serializable snapshot of consciousness state for rendering
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct ConsciousnessState {
     pub persona: String,
@@ -173,23 +205,9 @@ impl TuiSensorium {
     pub fn can_render_animations(&self) -> bool {
         self.bandwidth.can_render_animations()
     }
-}
 
-impl Default for TuiSensorium {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Sensorium for TuiSensorium {
-    fn bandwidth(&self) -> BandwidthClass {
-        self.bandwidth
-    }
-
-    fn discovery_level(&self) -> DiscoveryLevel {
-        DiscoveryLevel::Full
-    }
-
+    /// Snapshot render — kept for reference; the live TUI renders itself.
+    #[allow(dead_code)]
     fn render(&self, state: &ConsciousnessState) -> RenderedOutput {
         RenderedOutput {
             text: format!(
@@ -205,9 +223,28 @@ impl Sensorium for TuiSensorium {
             presence_indicator: Some(PresenceIndicator::Status(state.mood.clone())),
         }
     }
+}
 
-    fn input_receiver(&mut self) -> &mut mpsc::Receiver<InputEvent> {
-        &mut self.input_rx
+impl Default for TuiSensorium {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Sensorium for TuiSensorium {
+    fn bandwidth(&self) -> BandwidthClass {
+        self.bandwidth
+    }
+
+    fn discovery_level(&self) -> DiscoveryLevel {
+        DiscoveryLevel::Full
+    }
+
+    async fn run(&mut self, events: EventBus, cancel: CancellationToken) -> Result<()> {
+        debug!("TuiSensorium: run loop started");
+        run_event_loop("TuiSensorium", &mut self.input_rx, events, cancel).await;
+        Ok(())
     }
 }
 
@@ -241,6 +278,7 @@ impl MobileSensorium {
     }
 }
 
+#[async_trait]
 impl Sensorium for MobileSensorium {
     fn bandwidth(&self) -> BandwidthClass {
         BandwidthClass::Low
@@ -254,72 +292,128 @@ impl Sensorium for MobileSensorium {
         }
     }
 
-    fn render(&self, state: &ConsciousnessState) -> RenderedOutput {
-        // Mobile: minimal text, presence indicator only
-        let text = if state.subconscious_active && !state.surfaced_thoughts.is_empty() {
-            format!("💭 {}", state.surfaced_thoughts[0])
-        } else {
-            format!("{} — {}", state.persona, state.mood)
-        };
-
-        RenderedOutput {
-            text,
-            discovery_level: DiscoveryLevel::Contextual,
-            presence_indicator: Some(PresenceIndicator::BreathingColor {
-                r: 255,
-                g: 140,
-                b: 66,
-            }),
-        }
-    }
-
-    fn input_receiver(&mut self) -> &mut mpsc::Receiver<InputEvent> {
-        &mut self.input_rx
+    async fn run(&mut self, events: EventBus, cancel: CancellationToken) -> Result<()> {
+        debug!("MobileSensorium: run loop started");
+        run_event_loop("MobileSensorium", &mut self.input_rx, events, cancel).await;
+        Ok(())
     }
 }
 
-/// SensoriumCoordinator — routes state to all active sensoria
+/// Shared driver loop for the stub sensoria: select over the surface's
+/// own input channel, the turn-lifecycle event stream, and the shutdown
+/// signal. Concrete surfaces (Matrix) replace this with real rendering.
+async fn run_event_loop(
+    label: &str,
+    input_rx: &mut mpsc::Receiver<InputEvent>,
+    events: EventBus,
+    cancel: CancellationToken,
+) {
+    let mut event_rx = events.subscribe();
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                debug!("{label}: shutdown requested");
+                break;
+            }
+            input = input_rx.recv() => {
+                match input {
+                    Some(ev) => debug!("{label}: input — {}", ev.content),
+                    None => {
+                        debug!("{label}: input channel closed");
+                        break;
+                    }
+                }
+            }
+            event = event_rx.recv() => {
+                match event {
+                    Ok(ev) => debug!("{label}: event — {}", ev.event_type),
+                    Err(broadcast::error::RecvError::Closed) => {
+                        debug!("{label}: event bus closed");
+                        break;
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("{label}: lagged {n} events");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// SensoriumCoordinator — owns every active surface and drives them.
 ///
-/// Each connected interface gets its own bandwidth-appropriate rendering.
-/// Consciousness state updates once; each Sensorium decides how to present it.
+/// Each registered sensorium is spawned onto its own task by
+/// [`SensoriumCoordinator::run_all`], sharing one [`EventBus`] and a
+/// child [`CancellationToken`] so [`SensoriumCoordinator::shutdown`] can
+/// stop them all together.
 pub struct SensoriumCoordinator {
+    /// Registered but not yet spawned. Drained by `run_all`.
     sensoria: Vec<Box<dyn Sensorium>>,
+    /// Join handles for spawned sensorium tasks.
+    handles: Vec<JoinHandle<()>>,
+    /// Parent shutdown token — `shutdown()` cancels every child.
+    cancel: CancellationToken,
+    /// Highest bandwidth seen at registration, retained after draining.
+    max_bandwidth: BandwidthClass,
 }
 
 impl SensoriumCoordinator {
     pub fn new() -> Self {
         Self {
             sensoria: Vec::new(),
+            handles: Vec::new(),
+            cancel: CancellationToken::new(),
+            max_bandwidth: BandwidthClass::Minimal,
         }
     }
 
-    /// Register a sensorium
+    /// Register a sensorium. Call before `run_all`.
     pub fn register(&mut self, sensorium: Box<dyn Sensorium>) {
         debug!(
             "📡 Sensorium registered — bandwidth: {:?}, discovery: {:?}",
             sensorium.bandwidth(),
             sensorium.discovery_level()
         );
+        self.max_bandwidth = self.max_bandwidth.max(sensorium.bandwidth());
         self.sensoria.push(sensorium);
     }
 
-    /// Broadcast state to all registered sensoria
-    pub fn broadcast(&self, state: &ConsciousnessState) -> Vec<RenderedOutput> {
-        self.sensoria.iter().map(|s| s.render(state)).collect()
+    /// Spawn every registered sensorium onto its own task.
+    ///
+    /// Consumes the registered set — each sensorium now owns its loop.
+    /// Idempotent against re-registration: call `register` then `run_all`.
+    pub fn run_all(&mut self, events: EventBus) {
+        for mut sensorium in self.sensoria.drain(..) {
+            let bus = events.clone();
+            let token = self.cancel.child_token();
+            let handle = tokio::spawn(async move {
+                if let Err(e) = sensorium.run(bus, token).await {
+                    warn!("sensorium run loop ended with error: {e}");
+                }
+            });
+            self.handles.push(handle);
+        }
     }
 
-    /// Get the highest bandwidth among all sensoria
+    /// Signal every spawned sensorium to shut down.
+    pub fn shutdown(&self) {
+        debug!("📡 SensoriumCoordinator: shutdown signalled");
+        self.cancel.cancel();
+    }
+
+    /// The highest bandwidth among all sensoria ever registered.
     pub fn max_bandwidth(&self) -> BandwidthClass {
-        self.sensoria
-            .iter()
-            .map(|s| s.bandwidth())
-            .max()
-            .unwrap_or(BandwidthClass::Minimal)
+        self.max_bandwidth
     }
 
-    /// Number of connected interfaces
-    pub fn interface_count(&self) -> usize {
+    /// Sensoria registered but not yet spawned.
+    pub fn pending_count(&self) -> usize {
         self.sensoria.len()
+    }
+
+    /// Sensoria currently spawned and running.
+    pub fn running_count(&self) -> usize {
+        self.handles.len()
     }
 }
 
@@ -342,7 +436,7 @@ mod tests {
 
     #[test]
     fn test_tui_sensorium() {
-        let mut sensorium = TuiSensorium::new();
+        let sensorium = TuiSensorium::new();
         assert_eq!(sensorium.bandwidth(), BandwidthClass::High);
         assert_eq!(sensorium.discovery_level(), DiscoveryLevel::Full);
         assert!(sensorium.can_render_real_time_subconscious());
@@ -359,11 +453,35 @@ mod tests {
     }
 
     #[test]
-    fn test_sensorium_coordinator() {
+    fn test_coordinator_register() {
         let mut coord = SensoriumCoordinator::new();
         coord.register(Box::new(TuiSensorium::new()));
         coord.register(Box::new(MobileSensorium::new(true)));
-        assert_eq!(coord.interface_count(), 2);
+        assert_eq!(coord.pending_count(), 2);
+        assert_eq!(coord.running_count(), 0);
         assert_eq!(coord.max_bandwidth(), BandwidthClass::High);
+    }
+
+    #[tokio::test]
+    async fn run_all_spawns_then_shutdown_stops() {
+        let mut coord = SensoriumCoordinator::new();
+        coord.register(Box::new(TuiSensorium::new()));
+        coord.register(Box::new(MobileSensorium::new(false)));
+
+        let bus = EventBus::new(16);
+        coord.run_all(bus);
+
+        // sensoria drained into running tasks
+        assert_eq!(coord.pending_count(), 0);
+        assert_eq!(coord.running_count(), 2);
+
+        // shutdown cancels the child tokens; the run loops should exit
+        coord.shutdown();
+        for handle in coord.handles.drain(..) {
+            tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+                .await
+                .expect("sensorium task did not stop after shutdown")
+                .expect("sensorium task panicked");
+        }
     }
 }

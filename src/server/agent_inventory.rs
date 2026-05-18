@@ -1,9 +1,8 @@
-use crate::api::models::{AgentState, AgentSummary, CreateAgentRequest, LlmConfig, MemoryConfig, MemoryBlock, SouveraineConfig, UpdateAgentRequest};
+use crate::api::models::{AgentState, AgentSummary, CreateAgentRequest, MemoryConfig, MemoryBlock, SouveraineConfig, UpdateAgentRequest};
 use chrono::Utc;
 use dashmap::DashMap;
 use sqlx::SqlitePool;
 use std::path::PathBuf;
-use std::sync::Arc;
 use uuid::Uuid;
 
 fn hostname_or_unknown() -> String {

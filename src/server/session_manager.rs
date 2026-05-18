@@ -128,11 +128,11 @@ impl SessionManager {
         conversation_id
     }
 
-    pub fn get(&self, conversation_id: &str) -> Option<dashmap::mapref::one::Ref<String, Session>> {
+    pub fn get(&self, conversation_id: &str) -> Option<dashmap::mapref::one::Ref<'_, String, Session>> {
         self.sessions.get(conversation_id)
     }
 
-    pub fn get_mut(&self, conversation_id: &str) -> Option<dashmap::mapref::one::RefMut<String, Session>> {
+    pub fn get_mut(&self, conversation_id: &str) -> Option<dashmap::mapref::one::RefMut<'_, String, Session>> {
         self.sessions.get_mut(conversation_id)
     }
 
@@ -236,7 +236,7 @@ impl SessionManager {
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", conversation_id))?;
 
         let agent_id = source.agent_id.clone();
-        let mut messages = source.messages.clone();
+        let messages = source.messages.clone();
         drop(source); // release the DashMap ref
 
         let forked_id = Uuid::new_v4().to_string();

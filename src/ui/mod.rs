@@ -17,7 +17,3 @@ pub mod setup;
 pub mod voice;
 
 pub use app::App;
-pub use cockpit_panel::CockpitPane;
-pub use health_panel::HealthPane;
-pub use component::{Component, Scene, SceneLayout, TuiEvent};
-pub use presence::{Position, Posture, Presence};

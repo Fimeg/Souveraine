@@ -124,6 +124,23 @@ hex = "0.4"
 once_cell = "1.21.4"
 glob = "0.3"
 
+# Matrix sensorium — optional surface. matrix-sdk is only compiled in when
+# the `matrix` feature is enabled; a default build never links it.
+# matrix-sdk 0.17 always uses rustls (no tls feature flag).
+# NOTE: `e2e-encryption` disabled for Phase 3 — it pulls matrix-sdk-sqlite
+# → rusqlite → libsqlite3-sys 0.35, conflicting with sqlx 0.7's
+# libsqlite3-sys 0.26 (both `links = "sqlite3"`). Phase 3 uses the
+# in-memory store; e2ee + sqlite store return in Phase 6.
+matrix-sdk = { version = "0.17", optional = true, default-features = false }
+
+
+
+
+
+
+
+
+
 [dev-dependencies]
 tokio-test = "0.4"
 colored = "2"
@@ -149,3 +166,5 @@ figlet-rs = ["dep:figlet-rs"]
 cowsay = ["dep:cowsay"]
 tauri-desktop = ["dep:tauri", "dep:tauri-plugin-shell"]
 rgp = ["dep:ratatui-ratty"]
+# Matrix sensorium — opt-in surface. `cargo build --features matrix`.
+matrix = ["dep:matrix-sdk"]

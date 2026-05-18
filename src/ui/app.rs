@@ -31,14 +31,14 @@ use crate::core::config::ConsciousnessConfig;
 use crate::ui::chat::{ChatState, draw as draw_chat};
 use crate::ui::cockpit_panel::CockpitPane;
 use crate::ui::health_panel::HealthPane;
-use crate::ui::presence::{Posture, Presence, draw_overlay as draw_presence_overlay};
+use crate::ui::presence::{Posture, Presence};
 use crate::ui::color_support::rgb;
 use crate::ui::component::{Component, Scene, SceneLayout, TuiEvent};
-use crate::ui::setup::{SetupFlow, SetupState};
+use crate::ui::setup::SetupState;
 use crate::backend::BackendEvent;
 use crate::ui::settings::SettingsAction;
 
-use ratatui_image::{picker::Picker, protocol::{Protocol, StatefulProtocol}, Image, Resize, StatefulImage};
+use ratatui_image::{picker::Picker, protocol::{Protocol, StatefulProtocol}, Resize, StatefulImage};
 
 #[cfg(feature = "figlet-rs")]
 use figlet_rs::FIGlet;
@@ -1092,7 +1092,7 @@ impl App {
                         let backend = chat.backend.clone();
                         let (tx, rx) = tokio::sync::oneshot::channel();
                         chat.switch_rx = Some(rx);
-                        let agent_id = chat.agent_id.clone();
+                        let _agent_id = chat.agent_id.clone();
                         tokio::spawn(async move {
                             match backend.load_conversation(&forked_id).await {
                                 Ok(messages) => {
@@ -1705,7 +1705,7 @@ impl App {
             Err(e) => { tracing::warn!(path = %path.display(), error = %e, "card image open failed"); return; }
         };
         // Pull the `image` crate into scope for resize_to_fill on the render path.
-        use image::DynamicImage;
+        
         let dyn_img = portrait_cover_crop(dyn_img, 2, 3);
         let proto = picker.new_resize_protocol(dyn_img.clone());
         let agent_id = agent_id.to_string();
@@ -2098,8 +2098,8 @@ impl App {
     }
 
     fn draw(&mut self, frame: &mut Frame) {
-        let area = frame.size();
-        let layout = match self.current_screen {
+        let _area = frame.size();
+        let _layout = match self.current_screen {
             Screen::Chat => {
                 SceneLayout::ChatWithSidebar { sidebar_ratio: 0.3, sidebar_open: false }
             }

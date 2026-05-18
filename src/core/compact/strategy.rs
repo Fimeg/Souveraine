@@ -220,7 +220,7 @@ impl CompactionStrategy for MicrocompactStrategy {
     async fn plan(
         &self,
         messages: &[ConversationMessage],
-        config: &AgentCompactionConfig,
+        _config: &AgentCompactionConfig,
         counter: &TokenCounter,
     ) -> anyhow::Result<CompactionPlan> {
         use crate::core::session::ContentBlock;

@@ -6,4 +6,3 @@ pub mod bifrost;
 pub mod model_router;
 
 pub use bifrost::BifrostClient;
-pub use model_router::ModelRouter;

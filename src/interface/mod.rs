@@ -8,5 +8,5 @@
 /// This module re-exports the available surfaces.
 /// Feature-gating will be added when CLI and Web are implemented.
 pub mod tui {
-    pub use crate::ui::*;
+    
 }

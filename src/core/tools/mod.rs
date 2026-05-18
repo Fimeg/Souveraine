@@ -19,7 +19,7 @@ pub mod subagent;
 pub mod todo;
 pub mod write;
 
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;

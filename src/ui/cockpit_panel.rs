@@ -427,8 +427,8 @@ impl Component for CockpitPane {
         frame.render_widget(para, top);
 
         // ── Divider row ───────────────────────────────────────────────
-        let divider_text = "─ inner voice ".to_string()
-            + &"─".repeat((chunks[1].width as usize).saturating_sub(14));
+        let repeat_count = (chunks[1].width as usize).saturating_sub(14);
+        let divider_text = format!("─ inner voice {}", "─".repeat(repeat_count));
         let divider = Paragraph::new(Line::from(Span::styled(
             divider_text,
             Style::default().fg(self.palette.agent_dim),

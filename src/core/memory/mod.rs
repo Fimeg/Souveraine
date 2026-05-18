@@ -22,7 +22,6 @@
 //! - Paths are relative to the agent's memory directory
 
 use anyhow::{anyhow, Context, Result};
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
@@ -339,7 +338,7 @@ impl MemoryRepo {
     pub async fn append(&self, label: &str, content: &str) -> Result<()> {
         let path = self.resolve_path(label);
 
-        let frontmatter = if path.exists() {
+        let _frontmatter = if path.exists() {
             let existing = tokio::fs::read_to_string(&path).await?;
             let parsed = parse_memory_file(&existing)?;
             if parsed.frontmatter.read_only.as_deref() == Some("true") {

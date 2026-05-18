@@ -1,7 +1,7 @@
 use crate::server::SouveraineServer;
 use axum::{
     middleware,
-    routing::{get, post, patch, delete},
+    routing::{get, post},
     Router,
 };
 use std::sync::Arc;

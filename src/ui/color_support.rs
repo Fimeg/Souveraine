@@ -87,7 +87,7 @@ fn color_distance(r1: u8, g1: u8, b1: u8, r2: u8, g2: u8, b2: u8) -> u32 {
 }
 
 fn rgb_to_xterm256(r: u8, g: u8, b: u8) -> u8 {
-    let gray_avg = (r as u16 + g as u16 + b as u16) / 3;
+    let _gray_avg = (r as u16 + g as u16 + b as u16) / 3;
     let is_grayish = (r as i16 - g as i16).unsigned_abs() < 15
         && (g as i16 - b as i16).unsigned_abs() < 15
         && (r as i16 - b as i16).unsigned_abs() < 15;

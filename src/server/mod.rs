@@ -1,11 +1,11 @@
 use crate::bridge::BifrostClient;
-use crate::core::compact::{CompactionEngine, CompactionConfig, DefaultCompactionEngine, UtcClock};
+use crate::core::compact::{CompactionEngine, DefaultCompactionEngine, UtcClock};
 use crate::core::config::ConsciousnessConfig;
 use crate::core::identity::SeedId;
 use crate::server::gitea_memory::GiteaMemory;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use tokio::sync::RwLock;
 
 pub mod agent_inventory;
@@ -381,4 +381,3 @@ impl SouveraineServer {
     }
 }
 
-pub use conversation::{ServerConversation, ServerTurnResult};

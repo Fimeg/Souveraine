@@ -5,7 +5,6 @@
 //! - `ImportAgent`: config exists, but no agents — skip Bifrost, create/import
 //! - `FederationSync`: wants to sync from a federation peer (env override)
 
-use std::sync::Arc;
 use tokio::sync::oneshot;
 
 use ratatui::{
@@ -15,7 +14,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Paragraph},
     Frame,
 };
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::api::models::{CreateAgentRequest, LlmConfig, MemoryBlock};
 
@@ -935,6 +934,7 @@ fn centered_rect(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyModifiers;
 
     #[test]
     fn test_fresh_install_flow() {
