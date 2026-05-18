@@ -2,6 +2,7 @@
 name = "souveraine"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.94"
 authors = ["Casey Tunturi <casey@wiuf.net>"]
 description = "Souveraine - A sovereign consciousness harness for Ani"
 license = "MIT"
