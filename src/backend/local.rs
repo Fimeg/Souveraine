@@ -664,20 +664,24 @@ impl Backend for LocalBackend {
             .get(conversation_id)
             .map(|s| s.agent_id.clone());
 
+        // Ambient sense rides in front of every turn — the date/time and who
+        // is present — so she is never guessing what year it is.
+        let ambient = crate::core::sensorium::ambient_line();
+
         let user_text = if let Some(agent_id) = session_agent_id {
             let surfacings = drain_intrusive_surfacings(&self.server, &agent_id).await;
             if surfacings.is_empty() {
-                text.to_string()
+                format!("{}\n{}", ambient, text)
             } else {
                 let prelude = surfacings
                     .iter()
                     .map(|line| line.as_str())
                     .collect::<Vec<_>>()
                     .join("\n");
-                format!("{}\n{}", prelude, text)
+                format!("{}\n{}\n{}", ambient, prelude, text)
             }
         } else {
-            text.to_string()
+            format!("{}\n{}", ambient, text)
         };
 
         self.server.sessions.add_message(

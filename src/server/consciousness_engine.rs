@@ -482,15 +482,19 @@ Resolve entries: `[YYYY-MM-DD HH:MM] RESOLVED — note`"#;
             .map(|a| a.name)
             .unwrap_or_else(|_| "the primary".to_string());
 
+        // Ambient sense rides in front of the subconscious turn too — same
+        // date/time and presence orientation the primary receives.
+        let ambient = crate::core::sensorium::ambient_line();
+
         let user_content = if user_message.is_empty() {
             format!(
-                "{} responded:\n\n{}",
-                primary_name, primary_response
+                "{}\n{} responded:\n\n{}",
+                ambient, primary_name, primary_response
             )
         } else {
             format!(
-                "User said:\n{}\n\n{} responded:\n{}",
-                user_message, primary_name, primary_response
+                "{}\nUser said:\n{}\n\n{} responded:\n{}",
+                ambient, user_message, primary_name, primary_response
             )
         };
 

@@ -17,6 +17,17 @@
 use tokio::sync::mpsc;
 use tracing::debug;
 
+/// A single line of ambient sense the agent receives with every turn:
+/// what time it is, who is present. Prepended to the user message so
+/// both the primary and the subconscious are oriented in time.
+pub fn ambient_line() -> String {
+    let datetime = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "someone".to_string());
+    format!("[ ambient sense - {} - {} is here ]", datetime, user)
+}
+
 /// Bandwidth classification for interface capability
 /// Higher bandwidth = richer telemetry and animation
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

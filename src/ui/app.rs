@@ -515,18 +515,25 @@ impl App {
                         };
                     }
                     Event::Mouse(m) => {
-                        // Left-click on a message bubble copies it to the
-                        // clipboard (the ⧉ in the bubble title is the cue).
-                        if self.current_screen == Screen::Chat
-                            && matches!(
-                                m.kind,
-                                crossterm::event::MouseEventKind::Down(
-                                    crossterm::event::MouseButton::Left
-                                )
-                            )
-                        {
+                        use crossterm::event::{MouseButton, MouseEventKind};
+                        if self.current_screen == Screen::Chat {
                             if let Some(chat) = self.chat.as_mut() {
-                                chat.copy_message_at(m.column, m.row);
+                                match m.kind {
+                                    // Left-click on a message bubble copies it
+                                    // to the clipboard (the cue in the title).
+                                    MouseEventKind::Down(MouseButton::Left) => {
+                                        chat.copy_message_at(m.column, m.row);
+                                    }
+                                    // Wheel rides the same scroll field the
+                                    // arrow keys move — a notch is three lines.
+                                    MouseEventKind::ScrollUp => {
+                                        chat.scroll = chat.scroll.saturating_add(3);
+                                    }
+                                    MouseEventKind::ScrollDown => {
+                                        chat.scroll = chat.scroll.saturating_sub(3);
+                                    }
+                                    _ => {}
+                                }
                             }
                         }
                     }

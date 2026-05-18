@@ -2276,8 +2276,25 @@ fn draw_messages(f: &mut Frame, state: &ChatState, area: Rect) {
     // notices, raw text, anything that bypassed bubble pre-wrap) gets
     // wrapped here. After this, `lines.len()` equals the visible line
     // count — Paragraph's wrap becomes a no-op and scroll math holds.
+    //
+    // Wrapping can split one pre-wrap line into several, which shifts every
+    // line index that follows. `span_spans` was recorded against the
+    // pre-wrap buffer, so build a prefix-sum remap from pre-wrap index to
+    // post-wrap index and translate the spans — otherwise a mouse click
+    // lands on the wrong bubble (or none).
     let visible_width = area.width.saturating_sub(0) as usize;
-    let lines = markdown::wrap_lines(lines, visible_width);
+    let mut wrap_remap: Vec<usize> = Vec::with_capacity(lines.len() + 1);
+    let mut wrapped_lines: Vec<Line<'static>> = Vec::with_capacity(lines.len());
+    for line in lines {
+        wrap_remap.push(wrapped_lines.len());
+        wrapped_lines.extend(markdown::wrap_line(line, visible_width));
+    }
+    wrap_remap.push(wrapped_lines.len());
+    let lines = wrapped_lines;
+    for (_, s, e) in span_spans.iter_mut() {
+        *s = wrap_remap.get(*s).copied().unwrap_or(*s);
+        *e = wrap_remap.get(*e).copied().unwrap_or(*e);
+    }
 
     // Trim trailing empty lines from the count (each bubble appends a
     // blank separator; the last one shouldn't push the final real line
