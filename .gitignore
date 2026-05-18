@@ -51,3 +51,7 @@ voice-recording-*.mp3
 # Web assets (if present)
 web/dist/
 souveraine.log
+souveraine.log.prev
+
+# Filed-away stray working files — kept on disk, out of the repo
+/docs/archive/strays/
