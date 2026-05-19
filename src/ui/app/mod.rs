@@ -297,7 +297,7 @@ impl App {
         if matches!(event, TuiEvent::AtmosphereChanged(_)
             | TuiEvent::MoodChanged(_)
             | TuiEvent::SubconsciousPass(_)
-            | TuiEvent::PressureChanged(_)
+            | TuiEvent::PressureChanged(..)
         ) {
             self.sync_palette();
         } else if matches!(event, TuiEvent::Tick(_)) && self.presence.lerp_t < 1.0 {
@@ -375,8 +375,8 @@ impl App {
                         BackendEvent::CompactionWarning { pressure, tier } => {
                             self.dispatch(TuiEvent::CompactionWarning { pressure, tier });
                         }
-                        BackendEvent::ContextPressure(p) => {
-                            self.dispatch(TuiEvent::PressureChanged(p));
+                        BackendEvent::ContextPressure(p, limit) => {
+                            self.dispatch(TuiEvent::PressureChanged(p, limit));
                         }
                         BackendEvent::InferenceStrain { attempt, status, .. } => {
                             self.dispatch(TuiEvent::InferenceStrain { attempt, status });
@@ -949,6 +949,10 @@ impl App {
             // Not plain `t` — that would block starting sentences with "t".
             KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 chat.tool_cards_expanded = !chat.tool_cards_expanded;
+            }
+            // `Ctrl+Shift+V` pastes an image from the system clipboard.
+            KeyCode::Char('V') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                chat.paste_clipboard_image();
             }
             KeyCode::Char(c) => {
                 if chat.input.len() < 8_192 {

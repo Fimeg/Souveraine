@@ -296,6 +296,7 @@ mod tests {
             archivist_threshold: 0.7,
             archivist_interval: 100,
             preferred_for: vec![TaskType::Synthesis],
+            supports_images: true,
         });
         map
     }

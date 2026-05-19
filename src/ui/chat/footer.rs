@@ -10,6 +10,10 @@ use super::ChatState;
 
 pub fn draw_footer(f: &mut Frame, state: &ChatState, area: Rect) {
     let pressure_pct = (state.pressure * 100.0) as u16;
+    let ctx_display = match state.context_limit {
+        Some(limit) => format!("ctx {}% of {}", pressure_pct, limit),
+        None => format!("ctx {}%", pressure_pct),
+    };
     let cockpit_hint = if state.cockpit { "Tab close cockpit" } else { "Tab cockpit" };
     let tool_hint = if state.tool_cards_expanded { "CTRL+T collapse tools" } else { "CTRL+T expand tools" };
     let mut spans = vec![
@@ -20,7 +24,7 @@ pub fn draw_footer(f: &mut Frame, state: &ChatState, area: Rect) {
         Span::raw("│  "),
         Span::styled(format!("conv {}", short(&state.conversation_id)), Style::default().fg(state.palette.agent_dim)),
         Span::raw("  │  "),
-        Span::styled(format!("ctx {}%", pressure_pct), Style::default().fg(state.palette.agent_dim)),
+        Span::styled(ctx_display, Style::default().fg(state.palette.agent_dim)),
     ];
     if state.scroll > 0 {
         spans.push(Span::raw("  │  "));

@@ -5,8 +5,10 @@ use crate::core::identity::SeedId;
 use crate::server::gitea_memory::GiteaMemory;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
-use tokio::sync::RwLock;
+use std::sync::Mutex as StdMutex;
+use tokio::sync::{Mutex, RwLock};
 
 pub mod agent_inventory;
 pub mod consciousness_engine;
@@ -60,6 +62,15 @@ pub struct SouveraineServer {
     /// This instance's Ed25519 public key hex — used to filter self-announcements
     /// from the device registry. Loaded at construction; None if seed unavailable.
     pub local_seed_id: Option<String>,
+    /// Manages every active surface (TUI, Matrix, mobile, etc.).
+    /// Each sensorium runs in its own task, sharing the EventBus.
+    /// Register via `register_sensorium()`; `shutdown()` cancels all.
+    pub sensorium: Arc<Mutex<crate::core::sensorium::SensoriumCoordinator>>,
+    /// Maps surface chat/room IDs (Matrix room IDs, etc.) to Souveraine
+    /// conversation IDs. Lives beside the SensoriumCoordinator because
+    /// inbound surface messages need conversation resolution before they
+    /// can be turned into turns.
+    pub surface_conversations: Arc<StdMutex<HashMap<String, String>>>,
 }
 
 pub struct ServerConfig {
@@ -301,7 +312,27 @@ impl SouveraineServer {
             device_registry,
             summon_handler,
             local_seed_id,
+            sensorium: Arc::new(Mutex::new(crate::core::sensorium::SensoriumCoordinator::new())),
+            surface_conversations: Arc::new(StdMutex::new(HashMap::new())),
         })
+    }
+
+    /// Register a sensorium on the coordinator and spawn its run loop.
+    ///
+    /// Each sensorium gets its own task, a shared EventBus subscription,
+    /// and a child CancellationToken. `shutdown_sensoria` cancels all of
+    /// them. Can be called at any time — the coordinator drains registered
+    /// sensoria on `run_all` and accepts new ones afterward.
+    pub async fn register_sensorium(&self, sensorium: Box<dyn crate::core::sensorium::Sensorium>) {
+        let mut coord = self.sensorium.lock().await;
+        coord.register(sensorium);
+        coord.run_all(self.event_bus.clone());
+    }
+
+    /// Shut down all running sensorium tasks.
+    pub async fn shutdown_sensoria(&self) {
+        let coord = self.sensorium.lock().await;
+        coord.shutdown();
     }
 
     pub async fn run(&self) -> anyhow::Result<()> {

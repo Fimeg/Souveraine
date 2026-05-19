@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::time::Instant;
 
+use base64::Engine;
 use ratatui::layout::Rect;
 use tokio::sync::mpsc;
 
@@ -8,7 +9,7 @@ use crate::backend::BackendEvent;
 
 use super::{
     BtwForkEvent, BtwState, ChatMessage, ChatState, CockpitEntry, CockpitKind,
-    MsgLayout, Overlay, SlashDef, ToolResultBlock, TurnPhase, SLASH_COMMANDS,
+    ImageAttachment, MsgLayout, Overlay, SlashDef, ToolResultBlock, TurnPhase, SLASH_COMMANDS,
 };
 
 impl ChatState {
@@ -119,6 +120,18 @@ impl ChatState {
                                 }
                                 _ => {}
                             }
+                            // Backfill image blocks as Image chat messages
+                            for block in &msg.blocks {
+                                if let crate::core::session::ContentBlock::Image { media_type, .. } = block {
+                                    self.messages.push(ChatMessage::Image {
+                                        media_type: media_type.clone(),
+                                        label: "[Image from history]".to_string(),
+                                        data: String::new(), // not re-rendered from history
+                                        dimensions: None,
+                                        ts: Instant::now(),
+                                    });
+                                }
+                            }
                         }
                         self.system_message(format!(
                             "Resumed conversation {} ({} messages)",
@@ -224,9 +237,10 @@ impl ChatState {
                     });
                     self.pending_consciousness.push(BackendEvent::CompactionWarning { pressure, tier });
                 }
-                BackendEvent::ContextPressure(p) => {
+                BackendEvent::ContextPressure(p, limit) => {
                     self.pressure = p;
-                    self.pending_consciousness.push(BackendEvent::ContextPressure(p));
+                    self.context_limit = Some(limit);
+                    self.pending_consciousness.push(BackendEvent::ContextPressure(p, limit));
                 }
                 BackendEvent::InferenceStrain { attempt, status, model } => {
                     let text = if status == 0 {
@@ -514,6 +528,94 @@ impl ChatState {
         self.input.insert_str(self.input_cursor, text);
         self.input_cursor += text.len();
         self.update_completion();
+    }
+
+    /// Paste an image from the system clipboard.
+    /// Spawns a blocking thread for clipboard access via arboard.
+    pub fn paste_clipboard_image(&mut self) {
+        let result = std::thread::spawn(|| -> Result<ImageAttachment, String> {
+            let mut clipboard = arboard::Clipboard::new().map_err(|e| format!("clipboard open: {e}"))?;
+            let img_data = clipboard.get_image().map_err(|e| format!("clipboard get image: {e}"))?;
+            let width = img_data.width;
+            let height = img_data.height;
+            let bytes = img_data.bytes.to_vec();
+            let img = image::RgbaImage::from_raw(width as u32, height as u32, bytes)
+                .ok_or_else(|| "image::RgbaImage::from_raw failed".to_string())?;
+            let mut png_buf = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut png_buf, image::ImageFormat::Png)
+                .map_err(|e| format!("png encode: {e}"))?;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(png_buf.into_inner());
+            let file_size = (width * height * 4) as usize;
+            Ok(ImageAttachment {
+                label: String::new(), // set below
+                media_type: "image/png".to_string(),
+                data: b64,
+                file_size,
+            })
+        }).join();
+
+        match result {
+            Ok(Ok(mut attachment)) => {
+                let idx = self.attached_images.len() + 1;
+                attachment.label = format!("[Image #{idx}]");
+                let size_kb = attachment.file_size / 1024;
+                self.system_message(format!("*[image pasted — {}KB]*",
+                    size_kb,
+                ));
+                self.attached_images.push(attachment);
+            }
+            Ok(Err(e)) => {
+                self.system_message(format!("*[clipboard image failed: {e}]*"));
+            }
+            Err(_) => {
+                self.system_message("*[clipboard access failed]*".to_string());
+            }
+        }
+    }
+
+    /// Attach an image from a file path.
+    pub fn attach_image_from_path(&mut self, path: &str) {
+        let resolved = std::path::PathBuf::from(shellexpand::tilde(path).as_ref());
+        if !resolved.exists() {
+            self.system_message(format!("*[file not found: {}]*", resolved.display()));
+            return;
+        }
+
+        let extension = resolved.extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+
+        let media_type = match extension.as_str() {
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            _ => {
+                self.system_message(format!("*[unsupported image format: .{}]*", extension));
+                return;
+            }
+        };
+
+        let bytes = match std::fs::read(&resolved) {
+            Ok(b) => b,
+            Err(e) => {
+                self.system_message(format!("*[read failed: {e}]*"));
+                return;
+            }
+        };
+
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let idx = self.attached_images.len() + 1;
+        let label = format!("[Image #{idx}]");
+        let size_kb = bytes.len() / 1024;
+        self.attached_images.push(ImageAttachment {
+            label: label.clone(),
+            media_type: media_type.to_string(),
+            data: b64,
+            file_size: bytes.len(),
+        });
+        self.system_message(format!("*[{label} attached — {size_kb}KB]*"));
     }
 
     pub fn toggle_cockpit(&mut self) {

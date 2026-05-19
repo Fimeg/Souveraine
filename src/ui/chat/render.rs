@@ -163,7 +163,8 @@ fn msg_entry_ts(msg: &ChatMessage) -> Option<Instant> {
         | ChatMessage::Assistant { ts, .. }
         | ChatMessage::Surfacing { ts, .. }
         | ChatMessage::System { ts, .. }
-        | ChatMessage::Interjection { ts, .. } => Some(*ts),
+        | ChatMessage::Interjection { ts, .. }
+        | ChatMessage::Image { ts, .. } => Some(*ts),
         _ => None,
     }
 }
@@ -432,6 +433,17 @@ fn draw_messages(f: &mut Frame, state: &ChatState, area: Rect) {
                     Span::styled(format!("  {} {}  ", glyph, label),
                         Style::default().fg(color).add_modifier(Modifier::BOLD)),
                     Span::styled(text.clone(), Style::default().fg(color).add_modifier(Modifier::ITALIC)),
+                ]));
+                lines.push(Line::from(""));
+            }
+            ChatMessage::Image { media_type, label, dimensions, .. } => {
+                let dim_str = dimensions.map(|(w,h)| format!("{}x{}", w, h)).unwrap_or_default();
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled("🖼", Style::default().fg(state.palette.user_accent)),
+                    Span::raw(" "),
+                    Span::styled(label.clone(), Style::default().fg(state.palette.user_accent).add_modifier(Modifier::BOLD)),
+                    Span::styled(format!(" · {}", media_type), Style::default().fg(state.palette.agent_dim)),
                 ]));
                 lines.push(Line::from(""));
             }

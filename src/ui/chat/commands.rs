@@ -12,7 +12,7 @@ use crate::bridge::bifrost::BifrostClient;
 use crate::core::config::ConsciousnessConfig;
 
 use super::{
-    BtwForkEvent, BtwState, ChatMessage, ChatMode, ChatState, TurnPhase,
+    BtwForkEvent, BtwState, ChatMessage, ChatMode, ChatState, ImageAttachment, TurnPhase,
 };
 
 impl ChatState {
@@ -28,6 +28,7 @@ impl ChatState {
   /code              Shift to code posture (tools expanded, ≡ prompt)
   /chat              Shift to conversation posture (tools collapsed)
   /outfit <name>     Change agent's outfit (empty to reset)
+  /attach <path>     Attach an image file for vision-enabled models
   !<command>         Run a shell command (Linux/macOS)
 
 Esc during a turn shows the raise-hand dialog (signal, not kill — she sees *[raised hand]*).
@@ -35,7 +36,7 @@ You can also type while she works — Enter raises your hand (she sees it next r
 Tab toggles the cockpit pane. `t` (on empty input) toggles tool expansion.";
 
     pub fn submit(&mut self) -> bool {
-        if self.input.trim().is_empty() {
+        if self.input.trim().is_empty() && self.attached_images.is_empty() {
             return false;
         }
 
@@ -64,13 +65,32 @@ Tab toggles the cockpit pane. `t` (on empty input) toggles tool expansion.";
         }
 
         if self.busy {
-            self.enqueue_interjection(trimmed);
+            let mut interjection = trimmed;
+            for img in &self.attached_images {
+                interjection.push_str(&format!("\n[attached image: {}]", img.media_type));
+            }
+            self.attached_images.clear();
+            self.enqueue_interjection(interjection);
             return true;
         }
 
         let text = trimmed;
+        let images = std::mem::take(&mut self.attached_images);
         self.messages.push(ChatMessage::User { text: text.clone(), ts: Instant::now() });
-        self.spawn_turn(text);
+        for img in &images {
+            self.messages.push(ChatMessage::Image {
+                media_type: img.media_type.clone(),
+                label: img.label.clone(),
+                data: img.data.clone(),
+                dimensions: None,
+                ts: Instant::now(),
+            });
+        }
+        if images.is_empty() {
+            self.spawn_turn(text);
+        } else {
+            self.spawn_turn_with_images(text, images);
+        }
         true
     }
 
@@ -92,6 +112,52 @@ Tab toggles the cockpit pane. `t` (on empty input) toggles tool expansion.";
         let interject_queue = self.pending_interjections.clone();
         tokio::spawn(async move {
             match backend.send_with_signals(&conv_id, &text, cancel, interject_queue).await {
+                Ok(mut stream) => {
+                    while let Some(ev) = stream.next().await {
+                        match ev {
+                            Ok(e) => {
+                                if tx.send(e).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(err) => {
+                                let _ = tx
+                                    .send(BackendEvent::Token(format!("\n[error] {}\n", err)))
+                                    .await;
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    let _ = tx
+                        .send(BackendEvent::Token(format!("\n[connect error] {}\n", err)))
+                        .await;
+                }
+            }
+            let _ = tx.send(BackendEvent::Done).await;
+        });
+    }
+
+    /// Submit a turn with attached images.
+    pub fn spawn_turn_with_images(&mut self, text: String, images: Vec<ImageAttachment>) {
+        self.busy = true;
+        self.tool_calls_this_turn = 0;
+        self.phase = TurnPhase::Thinking;
+        self.turn_started = Some(Instant::now());
+        self.last_event_at = Instant::now();
+
+        let (tx, rx) = mpsc::channel::<BackendEvent>(64);
+        self.turn_rx = Some(rx);
+
+        let cancel = CancellationToken::new();
+        self.cancel_token = Some(cancel.clone());
+
+        let backend = self.backend.clone();
+        let conv_id = self.conversation_id.clone();
+        let interject_queue = self.pending_interjections.clone();
+        tokio::spawn(async move {
+            match backend.send_with_signals_and_images(&conv_id, &text, images, cancel, interject_queue).await {
                 Ok(mut stream) => {
                     while let Some(ev) = stream.next().await {
                         match ev {
@@ -211,6 +277,16 @@ Tab toggles the cockpit pane. `t` (on empty input) toggles tool expansion.";
                 self.system_message("Returned to default appearance.".to_string());
             } else {
                 self.system_message(format!("Changed to **{name}** outfit."));
+            }
+            return true;
+        }
+
+        if trimmed.starts_with("/attach ") {
+            let path = trimmed.strip_prefix("/attach ").unwrap().trim().to_string();
+            if !path.is_empty() {
+                self.attach_image_from_path(&path);
+            } else {
+                self.system_message("Usage: /attach <path> — attach an image file".to_string());
             }
             return true;
         }

@@ -20,7 +20,7 @@ pub fn draw_cockpit(f: &mut Frame, state: &ChatState, area: Rect) {
         subconscious: panes[1],
     };
 
-    let thinking_window = panes[0].height as usize;
+    let thinking_window = panes[0].height.saturating_sub(2) as usize;
     let thinking_max = state.thinking.len().saturating_sub(thinking_window);
     let thinking_scroll = (state.thinking_scroll.get() as usize).min(thinking_max);
     state.thinking_scroll.set(thinking_scroll as u16);

@@ -24,6 +24,64 @@ pub struct BifrostClient {
     retry_policy: RetryPolicy,
 }
 
+/// A single part in the OpenAI content array (for multimodal messages).
+/// When content is an array, each element has a `type` discriminator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentPart {
+    Text { text: String },
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: ImageUrlSource },
+}
+
+/// Source for an image URL content part — always a data URI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageUrlSource {
+    pub url: String,
+}
+
+/// Content value that can be either a plain string or a multimodal part array.
+/// Uses `#[serde(untagged)]` so both wire shapes deserialize correctly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ContentValue {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+impl Default for ContentValue {
+    fn default() -> Self {
+        Self::Text(String::new())
+    }
+}
+
+impl ContentValue {
+    /// Extract the text content: for `Text` returns the string directly;
+    /// for `Parts`, joins all text parts together.
+    pub fn as_text(&self) -> String {
+        match self {
+            ContentValue::Text(t) => t.clone(),
+            ContentValue::Parts(parts) => {
+                let mut text = String::new();
+                for part in parts {
+                    if let ContentPart::Text { text: t } = part {
+                        text.push_str(t);
+                    }
+                }
+                text
+            }
+        }
+    }
+
+    /// True if the content is empty (no text and no parts).
+    pub fn is_empty(&self) -> bool {
+        match self {
+            ContentValue::Text(t) => t.is_empty(),
+            ContentValue::Parts(parts) => parts.is_empty(),
+        }
+    }
+}
+
 /// A message in OpenAI chat format.
 ///
 /// For plain user/assistant/system turns, only `role` and `content` are set
@@ -34,10 +92,13 @@ pub struct BifrostClient {
 /// - tool result: `role = "tool"`, `tool_call_id = Some(id)`, `name = Some(fn)`
 ///
 /// Skipping the empty optionals on the wire keeps unrelated providers happy.
+///
+/// For multimodal messages, `content` may be `ContentValue::Parts` — an array of
+/// `ContentPart` variants (text + image_url parts) in the OpenAI format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: String,
-    pub content: String,
+    pub content: ContentValue,
     /// Tool calls emitted by the assistant (OpenAI tool-use schema).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub tool_calls: Option<Vec<MessageToolCall>>,
@@ -54,7 +115,18 @@ impl Message {
     pub fn text(role: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             role: role.into(),
-            content: content.into(),
+            content: ContentValue::Text(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    /// Multimodal user message with text + image content parts.
+    pub fn multimodal_user(text: impl Into<String>, parts: Vec<ContentPart>) -> Self {
+        Self {
+            role: "user".to_string(),
+            content: ContentValue::Parts(parts),
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -65,7 +137,7 @@ impl Message {
     pub fn assistant_tool_calls(content: impl Into<String>, calls: Vec<MessageToolCall>) -> Self {
         Self {
             role: "assistant".to_string(),
-            content: content.into(),
+            content: ContentValue::Text(content.into()),
             tool_calls: Some(calls),
             tool_call_id: None,
             name: None,
@@ -80,7 +152,7 @@ impl Message {
     ) -> Self {
         Self {
             role: "tool".to_string(),
-            content: content.into(),
+            content: ContentValue::Text(content.into()),
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
             name: Some(name.into()),

@@ -780,7 +780,7 @@ fn bifrost_to_conversation(msg: &Message) -> ConversationMessage {
             blocks: vec![ContentBlock::ToolResult {
                 tool_use_id: tool_use_id.clone(),
                 tool_name: msg.name.clone().unwrap_or_default(),
-                output: msg.content.clone(),
+                output: msg.content.as_text(),
                 is_error: false,
             }],
             usage: None,
@@ -790,7 +790,7 @@ fn bifrost_to_conversation(msg: &Message) -> ConversationMessage {
 
     let mut blocks = Vec::new();
     if !msg.content.is_empty() {
-        blocks.push(ContentBlock::Text { text: msg.content.clone() });
+        blocks.push(ContentBlock::Text { text: msg.content.as_text() });
     }
     if let Some(calls) = &msg.tool_calls {
         for c in calls {

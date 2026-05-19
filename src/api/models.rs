@@ -46,7 +46,13 @@ pub struct LlmConfig {
     /// if it arrives too quickly. Default 500ms.
     #[serde(default = "default_inter_round_delay")]
     pub inter_round_delay_ms: u64,
+    /// Whether this model supports image inputs (vision).
+    /// When false, images are stripped to text markers before sending.
+    #[serde(default = "default_supports_images")]
+    pub supports_images: bool,
 }
+
+fn default_supports_images() -> bool { true }
 
 fn default_context_window() -> u32 {
     128000

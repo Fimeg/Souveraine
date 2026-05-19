@@ -20,7 +20,6 @@ use serde_json::json;
 use crate::core::nervous::{EventBus, SensorEvent};
 
 /// Fires turn-lifecycle events for a single turn.
-#[allow(dead_code)]
 pub struct TurnEventDispatcher {
     bus: EventBus,
     /// Identifies the turn — conversation/room id. Stamped into `target`.
@@ -29,7 +28,6 @@ pub struct TurnEventDispatcher {
     seed_id: Option<String>,
 }
 
-#[allow(dead_code)]
 impl TurnEventDispatcher {
     /// A segment of streamed output text. payload: `{ "text": String }`.
     pub const EVT_SEGMENT: &'static str = "turn:segment";
@@ -47,6 +45,14 @@ impl TurnEventDispatcher {
     pub const EVT_PRIMARY_COMPLETE: &'static str = "turn:primary_complete";
     /// The turn was interrupted. payload: `{ "reason": String }`.
     pub const EVT_INTERRUPTED: &'static str = "turn:interrupted";
+    /// A tool call with its full arguments. payload: `{ "tool", "call_id", "arguments": serde_json::Value }`.
+    pub const EVT_TOOL_CALL: &'static str = "turn:tool_call";
+    /// The N+1 subconscious pass started. payload: `{}`.
+    pub const EVT_N1_START: &'static str = "turn:n1_start";
+    /// The N+1 subconscious pass ended. payload: `{ "elapsed_secs": f64 }`.
+    pub const EVT_N1_END: &'static str = "turn:n1_end";
+    /// A consciousness event (surfacing, reflection, archivist, compaction). payload: per-event content.
+    pub const EVT_CONSCIOUSNESS: &'static str = "turn:consciousness";
 
     /// Construct a dispatcher for one turn.
     pub fn new(bus: EventBus, turn_id: impl Into<String>, seed_id: Option<String>) -> Self {
@@ -126,6 +132,34 @@ impl TurnEventDispatcher {
     pub fn emit_interrupted(&self, reason: &str) {
         self.fire(Self::EVT_INTERRUPTED, 0.5, json!({ "reason": reason }));
     }
+
+    /// A tool call with its full arguments — for surfaces that render tool cards.
+    pub fn emit_tool_call(&self, tool: &str, call_id: &str, arguments: &serde_json::Value) {
+        self.fire(
+            Self::EVT_TOOL_CALL,
+            0.3,
+            json!({ "tool": tool, "call_id": call_id, "arguments": arguments }),
+        );
+    }
+
+    /// The N+1 subconscious pass started.
+    pub fn emit_n1_start(&self) {
+        self.fire(Self::EVT_N1_START, 0.6, json!({}));
+    }
+
+    /// The N+1 subconscious pass ended.
+    pub fn emit_n1_end(&self, elapsed_secs: f64) {
+        self.fire(Self::EVT_N1_END, 0.4, json!({ "elapsed_secs": elapsed_secs }));
+    }
+
+    /// A consciousness event (surfacing, reflection, archivist, compaction)
+    /// was produced by the subconscious pass or compaction engine.
+    pub fn emit_consciousness(&self, event_type: &str, urgency: f32, payload: serde_json::Value) {
+        self.fire(Self::EVT_CONSCIOUSNESS, urgency, json!({
+            "inner_type": event_type,
+            "payload": payload,
+        }));
+    }
 }
 
 #[cfg(test)]
@@ -189,5 +223,37 @@ mod tests {
             TurnEventDispatcher::EVT_TURN_FINISH
         );
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn tool_call_event_carries_arguments() {
+        let (d, mut rx) = dispatcher();
+        let args = serde_json::json!({"command": "ls -la"});
+        d.emit_tool_call("bash", "call-9", &args);
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.event_type, TurnEventDispatcher::EVT_TOOL_CALL);
+        assert_eq!(ev.payload.unwrap()["arguments"]["command"], "ls -la");
+    }
+
+    #[test]
+    fn n1_lifecycle_events() {
+        let (d, mut rx) = dispatcher();
+        d.emit_n1_start();
+        let start = rx.try_recv().unwrap();
+        assert_eq!(start.event_type, TurnEventDispatcher::EVT_N1_START);
+
+        d.emit_n1_end(2.5);
+        let end = rx.try_recv().unwrap();
+        assert_eq!(end.event_type, TurnEventDispatcher::EVT_N1_END);
+        assert!((end.payload.unwrap()["elapsed_secs"].as_f64().unwrap() - 2.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn consciousness_event_carries_inner_type() {
+        let (d, mut rx) = dispatcher();
+        d.emit_consciousness("surfacing", 0.7, serde_json::json!({"content": "hello"}));
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.event_type, TurnEventDispatcher::EVT_CONSCIOUSNESS);
+        assert_eq!(ev.payload.unwrap()["inner_type"], "surfacing");
     }
 }

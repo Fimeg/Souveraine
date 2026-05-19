@@ -39,6 +39,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::backend::{Backend, BackendEvent};
 use crate::core::config::ConsciousnessConfig;
+pub use crate::core::session::ImageAttachment;
 
 #[derive(Debug, Clone)]
 enum BtwForkEvent {
@@ -224,6 +225,7 @@ pub const SLASH_COMMANDS: &[SlashDef] = &[
     SlashDef { name: "/code",   hint: "Shift to code posture (tools expanded, ≡ prompt)" },
     SlashDef { name: "/chat",   hint: "Shift to conversation posture (tools collapsed)" },
     SlashDef { name: "/outfit", hint: "Change agent appearance (outfit name)" },
+    SlashDef { name: "/attach", hint: "Attach an image file" },
 ];
 
 #[derive(Debug, Clone)]
@@ -255,6 +257,13 @@ pub enum ChatMessage {
         result: Option<ToolResultBlock>,
         ts: Instant,
         expanded: bool,
+    },
+    Image {
+        media_type: String,
+        label: String,
+        data: String,
+        dimensions: Option<(u32, u32)>,
+        ts: Instant,
     },
 }
 
@@ -302,6 +311,8 @@ pub struct ChatState {
     pub messages: Vec<ChatMessage>,
     pub input: String,
     pub input_cursor: usize,
+    /// Images attached to the current input, not yet submitted.
+    pub attached_images: Vec<ImageAttachment>,
     pub scroll: u16,
     pub msg_layout: RefCell<MsgLayout>,
     pub copy_flash: Option<Instant>,
@@ -313,6 +324,9 @@ pub struct ChatState {
     pub phase: TurnPhase,
     pub pending_interjections: crate::backend::InterjectionQueue,
     pub pressure: f32,
+    /// Total context window size (e.g. 262_000 for kimi-k2.6).
+    /// None until the first pressure event arrives.
+    pub context_limit: Option<usize>,
     pub overlay: Overlay,
     pub cockpit: bool,
     pub thinking: Vec<String>,
@@ -432,6 +446,7 @@ impl ChatState {
             messages,
             input: String::new(),
             input_cursor: 0,
+            attached_images: Vec::new(),
             scroll: 0,
             msg_layout: RefCell::new(MsgLayout::default()),
             copy_flash: None,
@@ -442,6 +457,7 @@ impl ChatState {
             phase: TurnPhase::Idle,
             pending_interjections: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             pressure: 0.0,
+            context_limit: None,
             overlay: Overlay::None,
             cockpit: false,
             thinking: Vec::new(),

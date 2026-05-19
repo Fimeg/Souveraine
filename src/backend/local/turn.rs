@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::bridge::bifrost::{ChatCompletionRequest, Message as BifrostMessage};
+use crate::bridge::bifrost::{ChatCompletionRequest, ContentPart, ImageUrlSource, Message as BifrostMessage};
 use crate::bridge::model_router::TokenCounter;
 use crate::core::compact::CompactionEngine;
 use crate::core::nervous::EventBus;
@@ -33,9 +33,21 @@ pub(super) async fn run_turn(
     cancel: CancellationToken,
     interject: crate::backend::InterjectionQueue,
 ) -> Result<()> {
+    // Load the agent first so we know supports_images before building messages.
+    let agent_id = {
+        let session = server
+            .sessions
+            .get(&conversation_id)
+            .ok_or_else(|| anyhow::anyhow!("Session not found: {}", conversation_id))?;
+        session.agent_id.clone()
+    };
+
+    let agent = server.agents.get(&agent_id).await?;
+    let supports_images = agent.llm_config.supports_images;
+
     // Snapshot history for the Bifrost call, then drop the dashmap ref before
     // any await — `Ref` is not Send across awaits.
-    let (agent_id, initial_messages) = {
+    let initial_messages = {
         let session = server
             .sessions
             .get(&conversation_id)
@@ -44,28 +56,75 @@ pub(super) async fn run_turn(
             .messages
             .iter()
             .map(|m| {
-                let content = m
-                    .blocks
-                    .iter()
-                    .filter_map(|b| match b {
-                        ContentBlock::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
                 let role = match m.role {
                     MessageRole::System => "system",
                     MessageRole::User => "user",
                     MessageRole::Assistant => "assistant",
                     MessageRole::Tool => "tool",
                 };
-                BifrostMessage::text(role, content)
+
+                // If the model doesn't support images, strip Image blocks
+                // and replace with text markers.
+                if !supports_images {
+                    let has_images = m.blocks.iter().any(|b| matches!(b, ContentBlock::Image { .. }));
+                    if has_images {
+                        let mut text_parts: Vec<&str> = Vec::new();
+                        for b in &m.blocks {
+                            match b {
+                                ContentBlock::Text { text } => text_parts.push(text.as_str()),
+                                ContentBlock::Image { media_type, .. } => {
+                                    text_parts.push("");
+                                }
+                                _ => {}
+                            }
+                        }
+                        let content = text_parts.join("\n");
+                        // Append text markers for stripped images
+                        let img_count = m.blocks.iter().filter(|b| matches!(b, ContentBlock::Image { .. })).count();
+                        let mut enriched = content;
+                        for _ in 0..img_count {
+                            enriched.push_str("\n[Image: attached by user]");
+                        }
+                        return BifrostMessage::text(role, enriched);
+                    }
+                }
+
+                // Check if this message has image content blocks
+                let has_images = m.blocks.iter().any(|b| matches!(b, ContentBlock::Image { .. }));
+
+                if has_images {
+                    // Build multimodal content parts (OpenAI multi-part format)
+                    let parts: Vec<ContentPart> = m.blocks.iter().filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(ContentPart::Text { text: text.clone() }),
+                        ContentBlock::Image { media_type, data } => {
+                            let url = format!("data:{media_type};base64,{data}");
+                            Some(ContentPart::ImageUrl { image_url: ImageUrlSource { url } })
+                        }
+                        _ => None,
+                    }).collect();
+
+                    let text_content = m.blocks.iter().filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    }).collect::<Vec<_>>().join("\n");
+
+                    BifrostMessage::multimodal_user(text_content, parts)
+                } else {
+                    let content = m
+                        .blocks
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    BifrostMessage::text(role, content)
+                }
             })
             .collect();
-        (session.agent_id.clone(), messages)
+        messages
     };
-
-    let agent = server.agents.get(&agent_id).await?;
     let max_rounds = agent.llm_config.max_tool_rounds;
     let model = agent.llm_config.model.clone();
     let temperature = agent.llm_config.temperature;
@@ -189,7 +248,7 @@ pub(super) async fn run_turn(
             "LLM call starting"
         );
         let max_tokens = pressure_to_max_tokens(pressure, output_limit);
-        let _ = tx.send(Ok(BackendEvent::ContextPressure(pressure))).await;
+        let _ = tx.send(Ok(BackendEvent::ContextPressure(pressure, context_limit))).await;
 
         let req = ChatCompletionRequest {
             model: model.clone(),
@@ -379,6 +438,7 @@ pub(super) async fn run_turn(
         for tc in &response.tool_calls {
             let input_str = tc.arguments.to_string();
             dispatcher.emit_tool_start(&tc.name, &tc.id);
+            dispatcher.emit_tool_call(&tc.name, &tc.id, &tc.arguments);
             let result =
                 crate::core::tools::execute_tool_with_context(&tc.name, &input_str, &tool_ctx)
                     .await;
@@ -556,16 +616,7 @@ pub(super) async fn run_turn(
     // (for active-turn TUI consumers) and the EventBus (for firehose
     // subscribers — background turns, federated peers, Summon listeners).
     let _ = tx.send(Ok(BackendEvent::SubconsciousPass(true))).await;
-    event_bus.send(crate::core::nervous::SensorEvent {
-        sensor_name: "consciousness".into(),
-        timestamp: chrono::Utc::now(),
-        event_type: "subconscious_pass_start".into(),
-        target: Some(agent_id.clone()),
-        urgency: 0.2,
-        payload: None,
-        seed_id: None,
-        reply_to: None,
-    });
+    dispatcher.emit_n1_start();
 
     let pass_start = Instant::now();
     // Snapshot the session before the N+1 await. `PrimaryComplete` has already
@@ -594,16 +645,7 @@ pub(super) async fn run_turn(
     // Always release the Thinking posture, even on failure — otherwise the
     // face stays stuck inward when the pass errors out.
     let _ = tx.send(Ok(BackendEvent::SubconsciousPass(false))).await;
-    event_bus.send(crate::core::nervous::SensorEvent {
-        sensor_name: "consciousness".into(),
-        timestamp: chrono::Utc::now(),
-        event_type: "subconscious_pass_end".into(),
-        target: Some(agent_id.clone()),
-        urgency: 0.1,
-        payload: None,
-        seed_id: None,
-        reply_to: None,
-    });
+    dispatcher.emit_n1_end(pass_elapsed.as_secs_f64());
 
     let events = pass_result?;
 

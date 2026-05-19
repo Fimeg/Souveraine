@@ -14,6 +14,7 @@ pub mod credentials;
 pub mod voice;
 pub mod conversation;
 pub mod identity;
+pub mod image;
 pub mod nervous;
 pub mod memory;
 pub mod prompt;

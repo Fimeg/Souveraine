@@ -192,6 +192,9 @@ fn render_segment_for_summary(messages: &[ConversationMessage]) -> String {
                     out.push_str(&format!("[{} <- tool_result:{}] {}{}\n", role, tool_name, prefix, output));
                 }
                 ContentBlock::Reasoning { .. } => {}
+                ContentBlock::Image { media_type, .. } => {
+                    out.push_str(&format!("[{}] [Image: {}]\n", role, media_type));
+                }
             }
         }
     }

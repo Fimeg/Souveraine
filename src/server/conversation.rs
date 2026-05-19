@@ -5,7 +5,7 @@
 //! - Persists to SQLite
 //! - Can be enhanced later with full tool-calling
 
-use crate::bridge::bifrost::{BifrostClient, ChatCompletionRequest, Message as BifrostMessage};
+use crate::bridge::bifrost::{BifrostClient, ChatCompletionRequest, ContentPart, ImageUrlSource, Message as BifrostMessage};
 use crate::core::session::{ContentBlock, ConversationMessage, Session};
 
 pub struct ServerConversation {
@@ -41,11 +41,32 @@ impl ServerConversation {
                 crate::core::session::MessageRole::Assistant => "assistant",
                 crate::core::session::MessageRole::Tool => "tool",
             };
-            let content = m.blocks.iter().filter_map(|b| match b {
-                ContentBlock::Text { text } => Some(text.as_str()),
-                _ => None,
-            }).collect::<Vec<_>>().join("\n");
-            BifrostMessage::text(role, content)
+
+            let has_images = m.blocks.iter().any(|b| matches!(b, ContentBlock::Image { .. }));
+
+            if has_images {
+                let parts: Vec<ContentPart> = m.blocks.iter().filter_map(|b| match b {
+                    ContentBlock::Text { text } => Some(ContentPart::Text { text: text.clone() }),
+                    ContentBlock::Image { media_type, data } => {
+                        let url = format!("data:{media_type};base64,{data}");
+                        Some(ContentPart::ImageUrl { image_url: ImageUrlSource { url } })
+                    }
+                    _ => None,
+                }).collect();
+
+                let text_content = m.blocks.iter().filter_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                }).collect::<Vec<_>>().join("\n");
+
+                BifrostMessage::multimodal_user(text_content, parts)
+            } else {
+                let content = m.blocks.iter().filter_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                }).collect::<Vec<_>>().join("\n");
+                BifrostMessage::text(role, content)
+            }
         }).collect();
 
         // Call Bifrost

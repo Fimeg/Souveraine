@@ -18,7 +18,6 @@ pub use subagent::LocalSubagentRunner;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -28,11 +27,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::bridge::bifrost::{ChatCompletionRequest, Message as BifrostMessage};
 use crate::bridge::model_router::TokenCounter;
-use crate::core::compact::CompactionEngine;
+use crate::core::session::{ContentBlock, ConversationMessage, ImageAttachment, MessageRole};
 use crate::core::config::ConsciousnessConfig;
 use crate::core::identity::SeedId;
 use crate::core::nervous::EventBus;
-use crate::core::session::{ContentBlock, ConversationMessage, MessageRole};
 use crate::core::tools::defs::{SubagentParams, SubagentRunner, ToolContext};
 use crate::server::{ConsciousnessEvent, SouveraineServer};
 
@@ -55,7 +53,7 @@ fn pressure_to_max_tokens(pressure: f32, output_limit: u32) -> Option<u32> {
 /// agent's `llm_config.context_window` (Constitution V.3 — per-model
 /// physics, no hardcoded 128K).
 fn bifrost_pressure(counter: &TokenCounter, messages: &[BifrostMessage], context_limit: usize) -> f32 {
-    let tokens: usize = messages.iter().map(|m| counter.count(&m.content)).sum();
+    let tokens: usize = messages.iter().map(|m| counter.count(&m.content.as_text())).sum();
     let limit = context_limit.max(1);
     (tokens as f32 / limit as f32).min(1.0)
 }
@@ -76,11 +74,7 @@ fn bump_on_strain(delay: &AtomicU64, status: u16) {
 #[derive(Clone)]
 pub struct LocalBackend {
     server: Arc<SouveraineServer>,
-    event_bus: EventBus,
-    seed_id: Arc<SeedId>,
     active_sessions: Arc<AtomicU32>,
-    sensorium: Arc<tokio::sync::Mutex<crate::core::sensorium::SensoriumCoordinator>>,
-    surface_conversations: Arc<std::sync::Mutex<HashMap<String, String>>>,
 }
 
 impl LocalBackend {
@@ -89,23 +83,11 @@ impl LocalBackend {
             .await
             .context("LocalBackend: SouveraineServer init")?;
         let event_bus = server.event_bus.clone();
-
         let base = config
             .memory
             .base_path
             .clone()
             .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".souveraine"));
-
-        // Load or generate the seed identity (trust root)
-        let seed_dir = SeedId::default_dir(&base);
-        let seed_id = Arc::new(
-            SeedId::load_or_generate(&seed_dir)
-                .context("SeedId init")?,
-        );
-        tracing::info!(
-            pubkey = %seed_id.public_key_hex(),
-            "seed identity loaded"
-        );
 
         // Spawn the persistent event log (firehose to disk)
         let events_dir = base.join("events");
@@ -116,13 +98,7 @@ impl LocalBackend {
         let active_sessions = Arc::new(AtomicU32::new(0));
         let backend = Self {
             server: Arc::new(server),
-            event_bus: event_bus.clone(),
-            seed_id,
             active_sessions: active_sessions.clone(),
-            sensorium: Arc::new(tokio::sync::Mutex::new(
-                crate::core::sensorium::SensoriumCoordinator::new(),
-            )),
-            surface_conversations: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
 
         // Spawn one CronSensor per agent (each agent owns its own schedules
@@ -186,30 +162,10 @@ impl LocalBackend {
     }
 
     pub fn from_server(server: Arc<SouveraineServer>) -> Self {
-        let base = dirs::home_dir().unwrap_or_default().join(".souveraine");
-        let seed_id = Arc::new(
-            SeedId::load_or_generate(&SeedId::default_dir(&base))
-                .unwrap_or_else(|_| SeedId::generate()),
-        );
-        let event_bus = server.event_bus.clone();
         Self {
-            event_bus,
             server,
-            seed_id,
             active_sessions: Arc::new(AtomicU32::new(0)),
-            sensorium: Arc::new(tokio::sync::Mutex::new(
-                crate::core::sensorium::SensoriumCoordinator::new(),
-            )),
-            surface_conversations: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
-    }
-
-    pub fn event_bus(&self) -> &EventBus {
-        &self.event_bus
-    }
-
-    pub fn seed_id(&self) -> &SeedId {
-        &self.seed_id
     }
 
     /// Underlying agent inventory — used by the TUI dashboard to pull a
@@ -234,15 +190,12 @@ impl LocalBackend {
         &self,
         sensorium: Box<dyn crate::core::sensorium::Sensorium>,
     ) {
-        let mut coord = self.sensorium.lock().await;
-        coord.register(sensorium);
-        coord.run_all(self.event_bus.clone());
+        self.server.register_sensorium(sensorium).await;
     }
 
     /// Shut down all running sensorium tasks.
     pub async fn shutdown_sensoria(&self) {
-        let coord = self.sensorium.lock().await;
-        coord.shutdown();
+        self.server.shutdown_sensoria().await;
     }
 
     /// Build the greeting line describing the agent's current visual state
@@ -538,6 +491,68 @@ impl Backend for LocalBackend {
         Ok(ReceiverStream::new(rx).boxed())
     }
 
+    async fn send_with_signals_and_images(
+        &self,
+        conversation_id: &str,
+        text: &str,
+        images: Vec<ImageAttachment>,
+        cancel: CancellationToken,
+        interject: crate::backend::InterjectionQueue,
+    ) -> Result<BoxStream<'static, Result<BackendEvent>>> {
+        let session_agent_id = self
+            .server
+            .sessions
+            .get(conversation_id)
+            .map(|s| s.agent_id.clone());
+
+        let ambient = crate::core::sensorium::ambient_line();
+
+        let user_text = if let Some(agent_id) = session_agent_id {
+            let surfacings = consciousness::drain_intrusive_surfacings(&self.server, &agent_id).await;
+            if surfacings.is_empty() {
+                format!("{}\n{}", ambient, text)
+            } else {
+                let prelude = surfacings
+                    .iter()
+                    .map(|line| line.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("{}\n{}\n{}", ambient, prelude, text)
+            }
+        } else {
+            format!("{}\n{}", ambient, text)
+        };
+
+        let image_blocks: Vec<ContentBlock> = images.iter().map(|img| {
+            ContentBlock::Image {
+                media_type: img.media_type.clone(),
+                data: img.data.clone(),
+            }
+        }).collect();
+
+        self.server.sessions.add_message(
+            conversation_id,
+            ConversationMessage::user_with_images(&user_text, image_blocks),
+        )?;
+
+        let (tx, rx) = mpsc::channel::<Result<BackendEvent>>(64);
+        let server = self.server.clone();
+        let conv_id = conversation_id.to_string();
+        let event_bus = self.event_bus.clone();
+        let active = self.active_sessions.clone();
+
+        active.fetch_add(1, Ordering::Relaxed);
+        tokio::spawn(async move {
+            if let Err(e) = turn::run_turn(server, conv_id, &tx, event_bus, cancel, interject).await {
+                let _ = tx.send(Err(e)).await;
+            }
+            let _ = tx.send(Ok(BackendEvent::Done)).await;
+            active.fetch_sub(1, Ordering::Relaxed);
+        });
+
+        Ok(ReceiverStream::new(rx).boxed())
+    }
+
     async fn update_agent_model(&self, agent_id: &str, model: &str) -> Result<()> {
         // Load current llm_config so we only change the model field —
         // context_window, temperature, tool rounds stay as they were.
@@ -551,6 +566,7 @@ impl Backend for LocalBackend {
                 temperature: current.llm_config.temperature,
                 max_tool_rounds: current.llm_config.max_tool_rounds,
                 inter_round_delay_ms: current.llm_config.inter_round_delay_ms,
+                supports_images: current.llm_config.supports_images,
             }),
             memory_blocks: None,
             tools: None,

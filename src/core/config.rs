@@ -78,6 +78,10 @@ pub struct ConsciousnessConfig {
     /// TUI interface settings (stale timeout, etc.)
     #[serde(default)]
     pub tui: TuiConfig,
+
+    /// Image input configuration for multimodal (vision) support.
+    #[serde(default)]
+    pub image: ImageConfig,
 }
 
 // ── Agent (top-level) ──
@@ -525,7 +529,58 @@ pub struct ModelConfig {
     pub archivist_interval: usize,
     #[serde(default)]
     pub preferred_for: Vec<TaskType>,
+    /// Whether this model supports image inputs (vision).
+    #[serde(default = "default_supports_images")]
+    pub supports_images: bool,
 }
+
+// ── Image (multimodal input) ──
+
+/// Configuration for the image resize pipeline applied to multimodal inputs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageConfig {
+    /// Maximum image width in pixels after resize. Default 2000.
+    #[serde(default = "default_image_max_width")]
+    pub max_width: u32,
+    /// Maximum image height in pixels after resize. Default 2000.
+    #[serde(default = "default_image_max_height")]
+    pub max_height: u32,
+    /// Maximum pixel count (w * h) after resize. Default 25MP.
+    #[serde(default = "default_image_max_pixels")]
+    pub max_pixels: u32,
+    /// Maximum encoded file size in bytes. Default 5MB.
+    #[serde(default = "default_image_max_bytes")]
+    pub max_bytes: usize,
+    /// JPEG/WebP quality for encode pass (1-100). Default 85.
+    #[serde(default = "default_image_jpeg_quality")]
+    pub jpeg_quality: u8,
+    /// Supported inbound media types.
+    #[serde(default)]
+    pub supported_types: Vec<String>,
+}
+
+impl Default for ImageConfig {
+    fn default() -> Self {
+        Self {
+            max_width: 2000,
+            max_height: 2000,
+            max_pixels: 25_000_000,
+            max_bytes: 5 * 1024 * 1024,
+            jpeg_quality: 85,
+            supported_types: vec![
+                "image/png".to_string(),
+                "image/jpeg".to_string(),
+                "image/webp".to_string(),
+            ],
+        }
+    }
+}
+
+fn default_image_max_width() -> u32 { 2000 }
+fn default_image_max_height() -> u32 { 2000 }
+fn default_image_max_pixels() -> u32 { 25_000_000 }
+fn default_image_max_bytes() -> usize { 5 * 1024 * 1024 }
+fn default_image_jpeg_quality() -> u8 { 85 }
 
 // ── Agent Reflection Settings ──
 
@@ -559,6 +614,7 @@ impl Default for ConsciousnessConfig {
             voice: VoiceConfig::default(),
             agent: AgentConfig::default(),
             tui: TuiConfig::default(),
+            image: ImageConfig::default(),
         }
     }
 }
@@ -843,6 +899,7 @@ impl ConsciousnessConfig {
 // ── Default helper fns ──
 
 fn default_true() -> bool { true }
+fn default_supports_images() -> bool { true }
 fn default_3() -> usize { 3 }
 fn default_25() -> usize { 25 }
 fn default_3u32() -> u32 { 3 }
@@ -888,6 +945,7 @@ fn default_models() -> HashMap<String, ModelConfig> {
         archivist_threshold: 0.7,
         archivist_interval: 100,
         preferred_for: vec![TaskType::Conversation],
+        supports_images: true,
     });
     m.insert("deepseek-v4-pro".to_string(), ModelConfig {
         provider: "bifrost".to_string(),
@@ -897,6 +955,7 @@ fn default_models() -> HashMap<String, ModelConfig> {
         archivist_threshold: 0.7,
         archivist_interval: 75,
         preferred_for: vec![TaskType::Conversation, TaskType::Reflection],
+        supports_images: true,
     });
     m
 }

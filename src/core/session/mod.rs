@@ -28,6 +28,21 @@ pub enum ContentBlock {
     ToolUse { id: String, name: String, input: String },
     ToolResult { tool_use_id: String, tool_name: String, output: String, is_error: bool },
     Reasoning { reasoning: String },
+    Image { media_type: String, data: String },
+}
+
+/// An image attached to the current input, before submission.
+/// Used by the TUI input pipeline and carried through to the Backend trait.
+#[derive(Debug, Clone)]
+pub struct ImageAttachment {
+    /// Display label (e.g. "[Image #1]").
+    pub label: String,
+    /// MIME type (e.g. "image/png").
+    pub media_type: String,
+    /// Base64-encoded image data.
+    pub data: String,
+    /// File size in bytes before encoding.
+    pub file_size: usize,
 }
 
 /// Token usage metadata
@@ -99,6 +114,18 @@ impl ConversationMessage {
             timestamp: Some(Utc::now()),
         }
     }
+
+    /// User message with text and image content blocks.
+    pub fn user_with_images(text: impl Into<String>, images: Vec<ContentBlock>) -> Self {
+        let mut blocks = vec![ContentBlock::Text { text: text.into() }];
+        blocks.extend(images);
+        Self {
+            role: MessageRole::User,
+            blocks,
+            usage: None,
+            timestamp: Some(Utc::now()),
+        }
+    }
 }
 
 /// A complete conversation session
@@ -152,6 +179,7 @@ impl Session {
                 ContentBlock::ToolUse { name, input, .. } => (name.len() + input.len()) / 4 + 1,
                 ContentBlock::ToolResult { tool_name, output, .. } => (tool_name.len() + output.len()) / 4 + 1,
                 ContentBlock::Reasoning { reasoning } => reasoning.len() / 4 + 1,
+                ContentBlock::Image { data, .. } => data.len() / 4 + 1,
             }).sum::<usize>()
         }).sum()
     }
@@ -229,6 +257,15 @@ impl Session {
                             format!("[Reasoning]: {reasoning}"),
                         ));
                     }
+                    ContentBlock::Image { media_type, .. } => {
+                        // Cross-turn context: image is a text marker, not the
+                        // full base64 payload. The per-turn path in run_turn
+                        // sends the actual image data as ContentPart::ImageUrl.
+                        messages.push(crate::bridge::bifrost::Message::text(
+                            "user",
+                            format!("[Image: {media_type}]"),
+                        ));
+                    }
                 }
             }
         }
@@ -264,6 +301,6 @@ mod tests {
         let msgs = session.to_bifrost_messages();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].role, "user");
-        assert_eq!(msgs[0].content, "hello");
+        assert_eq!(msgs[0].content.as_text(), "hello");
     }
 }

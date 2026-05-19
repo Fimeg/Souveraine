@@ -61,7 +61,7 @@ ratatui = { version = "0.30", features = ["crossterm"] }  # TUI framework with c
 unicode-width = "0.1"
 arboard = { version = "3", features = ["wayland-data-control"] }  # Clipboard — click-to-copy a message bubble
 colored = "2"       # Color gradients and effects
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }  # Per-agent portraits (assets/portrait.{png,jpg})
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }  # Per-agent portraits (assets/portrait.{png,jpg}) + multimodal images
 ratatui-image = "11"  # Real photo rendering in TUI (kitty/sixel/halfblock)
 ratatui-ratty = { version = "0.2", optional = true }  # Inline 3D graphics via Ratty Graphics Protocol
 

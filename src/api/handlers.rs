@@ -1,6 +1,6 @@
 use crate::api::models::*;
 use crate::server::SouveraineServer;
-use crate::core::session::ConversationMessage;
+use crate::core::session::{ContentBlock, ConversationMessage};
 use axum::{
     extract::{Path, Query, State, WebSocketUpgrade, ws::WebSocket},
     response::{Json, Sse},
@@ -196,20 +196,37 @@ async fn handle_conversation_stream(
 
     let agent_id = session.agent_id.clone();
     let messages: Vec<_> = session.messages.iter().map(|m| {
-        // Convert ConversationMessage to Bifrost Message
-        let content = m.blocks.first().map(|b| match b {
-            crate::core::session::ContentBlock::Text { text } => text.clone(),
-            _ => String::new(),
-        }).unwrap_or_default();
-        
         let role = match m.role {
             crate::core::session::MessageRole::System => "system",
             crate::core::session::MessageRole::User => "user",
             crate::core::session::MessageRole::Assistant => "assistant",
             crate::core::session::MessageRole::Tool => "tool",
         };
-        
-        crate::bridge::bifrost::Message::text(role, content)
+
+        let has_images = m.blocks.iter().any(|b| matches!(b, ContentBlock::Image { .. }));
+
+        if has_images {
+            use crate::bridge::bifrost::{ContentPart, ImageUrlSource};
+            let parts: Vec<ContentPart> = m.blocks.iter().filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(ContentPart::Text { text: text.clone() }),
+                ContentBlock::Image { media_type, data } => {
+                    let url = format!("data:{media_type};base64,{data}");
+                    Some(ContentPart::ImageUrl { image_url: ImageUrlSource { url } })
+                }
+                _ => None,
+            }).collect();
+            let text_content = m.blocks.iter().filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            }).collect::<Vec<_>>().join("\n");
+            crate::bridge::bifrost::Message::multimodal_user(text_content, parts)
+        } else {
+            let content = m.blocks.first().map(|b| match b {
+                ContentBlock::Text { text } => text.clone(),
+                _ => String::new(),
+            }).unwrap_or_default();
+            crate::bridge::bifrost::Message::text(role, content)
+        }
     }).collect();
     drop(session);
 

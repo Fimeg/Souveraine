@@ -269,7 +269,7 @@ impl Component for HealthPane {
 
     fn handle_event(&mut self, event: &TuiEvent) -> bool {
         match event {
-            TuiEvent::PressureChanged(p) => { self.pressure = *p; true }
+            TuiEvent::PressureChanged(p, _limit) => { self.pressure = *p; true }
             TuiEvent::CompactionWarning { pressure, tier } => {
                 self.pressure = *pressure;
                 self.last_compaction = Some((*tier, Self::timestamp_now()));

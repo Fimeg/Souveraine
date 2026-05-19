@@ -12,6 +12,8 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use tokio_util::sync::CancellationToken;
 
+use crate::core::session::ImageAttachment;
+
 /// Shared queue for mid-turn user interjections. Producer is the
 /// chat input (`ChatState.enqueue_interjection`); consumer is the
 /// backend's turn loop, which drains the queue between LLM rounds
@@ -78,7 +80,7 @@ pub enum BackendEvent {
     /// Continuous context pressure update (sub-threshold).
     /// Fires every round so the TUI ctx counter reflects live state
     /// rather than only updating when a warning crosses a threshold.
-    ContextPressure(f32),
+    ContextPressure(f32, usize),
     /// Inference strain — the voice is hoarse, providers are slow.
     /// Correlates to health over time.
     InferenceStrain {
@@ -199,6 +201,24 @@ pub trait Backend: Send + Sync {
         _interject: InterjectionQueue,
     ) -> Result<BoxStream<'static, Result<BackendEvent>>> {
         self.send_with_cancel(conversation_id, text, cancel).await
+    }
+
+    /// Send with signals + attached images. Default impl converts images
+    /// to text markers and delegates to send_with_signals; LocalBackend
+    /// overrides to actually embed ContentBlock::Image parts.
+    async fn send_with_signals_and_images(
+        &self,
+        conversation_id: &str,
+        text: &str,
+        images: Vec<ImageAttachment>,
+        cancel: CancellationToken,
+        interject: InterjectionQueue,
+    ) -> Result<BoxStream<'static, Result<BackendEvent>>> {
+        let mut enriched = text.to_string();
+        for img in &images {
+            enriched.push_str(&format!("\n[Image: {}]", img.media_type));
+        }
+        self.send_with_signals(conversation_id, &enriched, cancel, interject).await
     }
 
     /// Push an llm_config update to the agent record. LocalBackend writes

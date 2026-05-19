@@ -125,7 +125,7 @@ impl crate::core::nervous::handler::TurnInjector for LocalBackend {
         // conversation. The lock scope is carefully bounded to avoid
         // holding a !Send MutexGuard across the .await below.
         let conv_id = {
-            let map = self.surface_conversations.lock().unwrap();
+            let map = self.server.surface_conversations.lock().unwrap();
             if let Some(id) = map.get(conversation_id) {
                 Some(id.clone())
             } else {
@@ -136,7 +136,8 @@ impl crate::core::nervous::handler::TurnInjector for LocalBackend {
             Some(id) => id,
             None => {
                 let id = self.ensure_conversation(agent_id).await?;
-                self.surface_conversations
+                self.server
+                    .surface_conversations
                     .lock()
                     .unwrap()
                     .insert(conversation_id.to_string(), id.clone());

@@ -338,7 +338,7 @@ impl Presence {
                 self.sync_atmosphere();
                 true
             }
-            TuiEvent::PressureChanged(p) => {
+            TuiEvent::PressureChanged(p, _limit) => {
                 if *p >= 0.85 {
                     self.posture = Posture::Yawning;
                     self.sync_atmosphere();
@@ -575,9 +575,9 @@ mod tests {
     #[test]
     fn pressure_triggers_yawn_at_threshold() {
         let mut p = Presence::new("Annie");
-        p.handle_event(&TuiEvent::PressureChanged(0.5));
+        p.handle_event(&TuiEvent::PressureChanged(0.5, 128_000));
         assert_eq!(p.posture, Posture::Idle);
-        p.handle_event(&TuiEvent::PressureChanged(0.9));
+        p.handle_event(&TuiEvent::PressureChanged(0.9, 128_000));
         assert_eq!(p.posture, Posture::Yawning);
     }
 
