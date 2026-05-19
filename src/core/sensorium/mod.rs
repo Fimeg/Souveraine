@@ -137,12 +137,39 @@ pub enum PresenceIndicator {
     Haptic { pattern: String, intensity: f32 },
 }
 
+/// Result of an outbound send — carries the surface's message id so the
+/// caller can correlate and eventually edit the message.
+#[derive(Debug, Clone)]
+pub struct OutboundResult {
+    pub message_id: String,
+}
+
 /// The Sensorium trait — implemented by each concrete interface.
 ///
 /// Every interface (TUI, mobile, web, Matrix) implements this trait to
 /// define how consciousness renders to and captures from that surface.
 /// The surface is *driven* by [`Sensorium::run`]: a long-lived loop that
 /// owns its own incremental rendering off the turn-lifecycle event stream.
+///
+/// ## Required methods
+///
+/// | Method | ChannelAdapter equivalent | Purpose |
+/// |--------|--------------------------|---------|
+/// | `run` | `start` + lifecycle hooks | Long-lived driver loop consuming turn events off the EventBus |
+/// | `send_message` | `sendMessage` | Send a rendered turn to the surface (Matrix message, email body, etc.) |
+/// | `send_direct_reply` | `sendDirectReply` | Bypass-agent reply for pairing, errors, non-conversational signals |
+///
+/// ## Optional hooks (default no-ops)
+///
+/// | Method | ChannelAdapter equivalent | Purpose |
+/// |--------|--------------------------|---------|
+/// | `prepare_inbound_message` | `prepareInboundMessage` | Enrich an inbound message with surface-specific context (thread history, geolocation) |
+///
+/// ## Lifecycle
+///
+/// `stop` and `is_running` have defaults. The CancellationToken passed to
+/// `run` owns the real shutdown signal; `stop` is for surfaces that need
+/// a graceful disconnect handshake (Matrix: leave room, IRC: QUIT, etc.).
 #[async_trait]
 pub trait Sensorium: Send + Sync {
     /// What bandwidth does this surface support?
@@ -153,11 +180,46 @@ pub trait Sensorium: Send + Sync {
 
     /// Drive this surface until shut down.
     ///
-    /// The sensorium consumes turn-lifecycle / stream events from
-    /// `events` and reads its own input channel, rendering incrementally
-    /// as it goes. It returns `Ok(())` when `cancel` is triggered or the
-    /// surface closes; an `Err` means the surface failed.
+    /// The sensorium consumes turn-lifecycle events from the EventBus
+    /// and renders them incrementally to the surface. It returns `Ok(())`
+    /// when `cancel` is triggered or the surface closes; an `Err` means
+    /// the surface failed.
     async fn run(&mut self, events: EventBus, cancel: CancellationToken) -> Result<()>;
+
+    /// Send an outbound message to the surface — the rendered turn output.
+    ///
+    /// `chat_id` identifies the target chat/room/conversation on this
+    /// surface. Returns a surface-specific message id so the turn loop
+    /// can edit the same message incrementally (Matrix `m.replace` edits).
+    async fn send_message(&self, chat_id: &str, text: &str) -> Result<OutboundResult>;
+
+    /// Direct reply that bypasses the agent — for pairing codes, error
+    /// messages, and non-conversational signals the surface needs to send
+    /// without going through the turn loop.
+    async fn send_direct_reply(&self, chat_id: &str, text: &str) -> Result<OutboundResult>;
+
+    /// True if the surface is connected, synced, and receiving events.
+    fn is_running(&self) -> bool {
+        true
+    }
+
+    /// Graceful stop. Default is a no-op — the CancellationToken passed to
+    /// `run` handles shutdown. Override for surfaces that need a disconnect
+    /// handshake (Matrix: leave room, IRC: QUIT, WebSocket: close frame).
+    async fn stop(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Enrich an inbound message with surface-specific context before it
+    /// is routed to the agent.
+    ///
+    /// Called by the `SensoriumInputHandler` after receiving a
+    /// `sensorium:input` event from this sensorium's surface. The sensorium
+    /// can attach thread history, geolocation, attachment metadata, or
+    /// any other context the agent needs to understand the message.
+    async fn prepare_inbound_message(&self, _msg: &mut InputEvent) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Serializable snapshot of consciousness state for rendering
@@ -246,6 +308,18 @@ impl Sensorium for TuiSensorium {
         run_event_loop("TuiSensorium", &mut self.input_rx, events, cancel).await;
         Ok(())
     }
+
+    async fn send_message(&self, _chat_id: &str, text: &str) -> Result<OutboundResult> {
+        // TUI doesn't render through send_message — it renders directly
+        // via the ratatui frame. This is a no-op that logs for debugging.
+        debug!("TuiSensorium::send_message (no-op): {text}");
+        Ok(OutboundResult { message_id: String::new() })
+    }
+
+    async fn send_direct_reply(&self, _chat_id: &str, text: &str) -> Result<OutboundResult> {
+        debug!("TuiSensorium::send_direct_reply (no-op): {text}");
+        Ok(OutboundResult { message_id: String::new() })
+    }
 }
 
 /// Concrete Sensorium for mobile (low bandwidth, contextual)
@@ -296,6 +370,20 @@ impl Sensorium for MobileSensorium {
         debug!("MobileSensorium: run loop started");
         run_event_loop("MobileSensorium", &mut self.input_rx, events, cancel).await;
         Ok(())
+    }
+
+    async fn send_message(&self, chat_id: &str, text: &str) -> Result<OutboundResult> {
+        debug!("MobileSensorium::send_message: {chat_id} {text}");
+        Ok(OutboundResult {
+            message_id: String::new(),
+        })
+    }
+
+    async fn send_direct_reply(&self, chat_id: &str, text: &str) -> Result<OutboundResult> {
+        debug!("MobileSensorium::send_direct_reply: {chat_id} {text}");
+        Ok(OutboundResult {
+            message_id: String::new(),
+        })
     }
 }
 

@@ -32,7 +32,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use matrix_sdk::{
     ruma::events::room::message::{
-        MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent,
+        MessageType, OriginalSyncRoomMessageEvent,
     },
     Room, RoomState,
 };
@@ -78,6 +78,8 @@ pub struct MatrixSensorium {
     /// Outbound turn state, one entry per active room. Shared because the
     /// streaming turn model (Phase 5) will mutate it from several tasks.
     turns: Arc<Mutex<HashMap<String, MatrixTurn>>>,
+    /// Agent ID to route inbound messages to. Set at registration time.
+    agent_id: String,
 }
 
 impl MatrixSensorium {
@@ -90,12 +92,14 @@ impl MatrixSensorium {
         account: impl Into<String>,
         auth: MatrixAuth,
         store_root: impl Into<PathBuf>,
+        agent_id: impl Into<String>,
     ) -> Self {
         Self {
             account: account.into(),
             store_root: store_root.into(),
             auth: Some(auth),
             turns: Arc::new(Mutex::new(HashMap::new())),
+            agent_id: agent_id.into(),
         }
     }
 
@@ -107,7 +111,8 @@ impl MatrixSensorium {
     ///
     /// Returns `None` if no saved session exists and the login env vars
     /// are not set — i.e. there is nothing to connect with.
-    pub fn from_env(store_root: impl Into<PathBuf>) -> Option<Self> {
+    pub fn from_env(store_root: impl Into<PathBuf>, agent_id: impl Into<String>) -> Option<Self> {
+        let agent_id = agent_id.into();
         let store_root = store_root.into();
         let user = std::env::var("MATRIX_USER").ok();
         // Account slug: localpart of the user id, or "default".
@@ -119,7 +124,7 @@ impl MatrixSensorium {
 
         let dir = account_dir(&store_root, &account);
         if let Some(record) = load_session_record(&dir) {
-            return Some(Self::new(account, MatrixAuth::Restore(record), store_root));
+            return Some(Self::new(account, MatrixAuth::Restore(record), store_root, agent_id));
         }
 
         let homeserver = std::env::var("MATRIX_HOMESERVER").ok()?;
@@ -131,7 +136,7 @@ impl MatrixSensorium {
             password,
             device_name: "Souveraine".to_string(),
         };
-        Some(Self::new(account, auth, store_root))
+        Some(Self::new(account, auth, store_root, agent_id))
     }
 
     /// Handle one turn-lifecycle event off the [`EventBus`].
@@ -204,10 +209,51 @@ impl Sensorium for MatrixSensorium {
         save_session_record(&dir, &record)?;
 
         // ── Inbound: register handlers before sync ───────────────────
-        // Phase 3 spike scaffolding: answer `!ping` so a human can confirm
-        // the wire is live from any Element client. Phase 4 replaces this
-        // with room-message → InputEvent → conversation routing.
-        matrix_client.add_event_handler(on_room_message_ping);
+        // Fire `sensorium:input` onto the EventBus for every room
+        // message so the SensoriumInputHandler picks it up and routes
+        // it to the backend. This is the seam — same as letta-code's
+        // `adapter.onMessage = (msg) => registry.handleInboundMessage(msg)`.
+        let bus = events.clone();
+        let account = self.account.clone();
+        let agent_id = self.agent_id.clone();
+        matrix_client.add_event_handler(
+            move |event: OriginalSyncRoomMessageEvent, room: Room| {
+                let bus = bus.clone();
+                let account = account.clone();
+                let agent_id = agent_id.clone();
+                async move {
+                    if room.state() != RoomState::Joined {
+                        return;
+                    }
+                    if event.sender.as_str() == room.own_user_id().as_str() {
+                        return;
+                    }
+                    let MessageType::Text(text) = event.content.msgtype else {
+                        return;
+                    };
+                    let body = text.body.trim().to_string();
+                    if body.is_empty() {
+                        return;
+                    }
+
+                    bus.send(crate::core::nervous::SensorEvent {
+                        sensor_name: format!("matrix/{account}"),
+                        timestamp: chrono::Utc::now(),
+                        event_type: "sensorium:input".into(),
+                        target: Some(room.room_id().to_string()),
+                        urgency: 0.3,
+                        payload: Some(serde_json::json!({
+                            "text": body,
+                            "agent_id": agent_id,
+                            "sender": event.sender.as_str(),
+                            "message_id": event.event_id.as_str(),
+                        })),
+                        seed_id: None,
+                        reply_to: None,
+                    });
+                }
+            },
+        );
 
         // ── Drive /sync on its own task ──────────────────────────────
         let sync_cancel = cancel.child_token();
@@ -252,29 +298,37 @@ impl Sensorium for MatrixSensorium {
         info!("matrix sensorium: stopped");
         Ok(())
     }
-}
 
-/// Inbound spike handler: reply `pong` to a `!ping` in any joined room.
-///
-/// This is Phase 3 transport proof, not the real inbound path. Phase 4
-/// turns inbound room messages into `InputEvent`s routed to a conversation.
-async fn on_room_message_ping(event: OriginalSyncRoomMessageEvent, room: Room) {
-    if room.state() != RoomState::Joined {
-        return;
+    async fn send_message(&self, chat_id: &str, text: &str) -> Result<super::OutboundResult> {
+        // Find the room, send a text message.
+        // This is the wire that Phase 5's streaming edits build on —
+        // first chunk creates a new message, subsequent deltas edit it.
+        //
+        // TODO: when we don't have direct room access from the sensorium
+        // itself (it lives in the run loop), this needs matrix_client to be
+        // shared. For now, stubbed — the transport spike sends via the
+        // event handler path.
+        debug!("matrix::send_message: {chat_id} ({})", text.len());
+        Ok(super::OutboundResult {
+            message_id: String::new(),
+        })
     }
-    // Never answer our own messages.
-    if event.sender.as_str() == room.own_user_id().as_str() {
-        return;
+
+    async fn send_direct_reply(&self, chat_id: &str, text: &str) -> Result<super::OutboundResult> {
+        debug!("matrix::send_direct_reply: {chat_id} {text}");
+        Ok(super::OutboundResult {
+            message_id: String::new(),
+        })
     }
-    let MessageType::Text(text) = event.content.msgtype else {
-        return;
-    };
-    if text.body.trim() != "!ping" {
-        return;
+
+    fn is_running(&self) -> bool {
+        true
     }
-    debug!("matrix: !ping from {} in {}", event.sender, room.room_id());
-    let reply = RoomMessageEventContent::text_plain("pong — Souveraine's Matrix sensorium is live");
-    if let Err(e) = room.send(reply).await {
-        warn!("matrix: failed to send pong: {e}");
+
+    async fn stop(&self) -> Result<()> {
+        // Matrix needs to leave rooms / close the sync connection,
+        // but the CancellationToken in `run` handles the actual
+        // shutdown. `stop` is a signal, not the mechanism.
+        Ok(())
     }
 }

@@ -106,10 +106,26 @@ impl SubconsciousInbox {
         Self { repo, primary_repo: Some(primary_repo) }
     }
 
-    /// Ensure the three boxes exist. Idempotent.
+    /// Ensure the three boxes exist and are readable. Idempotent.
+    ///
+    /// A box that exists but no longer parses as a valid item list —
+    /// legacy prose, a hand-edit, a format migration imported from an
+    /// older era — silently breaks every surfacing path that runs
+    /// through [`SubconsciousInbox::read_items`]. `init` heals such a
+    /// box by rewriting it empty, so no subconscious — this one or any
+    /// created in the future — is ever left mute by a stale file.
     pub async fn init(&self) -> Result<()> {
         for path in [PENDING, INTRUSIVE, SENT] {
             if !self.repo.root().join(path).exists() {
+                self.write_items(path, &[]).await?;
+                continue;
+            }
+            if let Err(e) = self.parse_box(path).await {
+                tracing::warn!(
+                    "subconscious box {} is unreadable ({}); healing to empty",
+                    path,
+                    e
+                );
                 self.write_items(path, &[]).await?;
             }
         }
@@ -207,7 +223,30 @@ impl SubconsciousInbox {
 
     // ─── internals ─────────────────────────────────────────────────────────
 
+    /// Read items from a box. Resilient by design: a box that cannot be
+    /// parsed (legacy format, corruption, hand-edit) degrades to empty
+    /// rather than propagating an error that would kill `queue`,
+    /// `next_to_surface`, and every other surfacing path. The substrate
+    /// must not fall mute because one file went strange — `init` heals
+    /// such a box on the next startup.
     async fn read_items(&self, path: &str) -> Result<Vec<InboxItem>> {
+        match self.parse_box(path).await {
+            Ok(items) => Ok(items),
+            Err(e) => {
+                tracing::warn!(
+                    "subconscious box {} unreadable, treating as empty: {}",
+                    path,
+                    e
+                );
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    /// Strict parse of a box file. Returns `Err` when the file exists but
+    /// its body is not a valid YAML list of [`InboxItem`]s — `init` uses
+    /// this to decide whether a box needs healing.
+    async fn parse_box(&self, path: &str) -> Result<Vec<InboxItem>> {
         if !self.repo.root().join(path).exists() {
             return Ok(Vec::new());
         }
@@ -272,6 +311,39 @@ mod tests {
         assert!(repo.root().join(INTRUSIVE).exists());
         assert!(repo.root().join(SENT).exists());
         assert!(repo.root().join(INNER_VOICE).exists());
+    }
+
+    #[tokio::test]
+    async fn init_heals_a_corrupt_box_and_pipeline_survives() {
+        let (_d, repo) = make_repo();
+        repo.init().await.unwrap();
+
+        // A legacy / corrupt box: frontmatter + prose body that is not a
+        // YAML item list — exactly what a Letta-era import or a hand-edit
+        // leaves behind. Before the fix this killed every surfacing path.
+        repo.write(
+            PENDING,
+            "---\ndescription: legacy box\n---\n[2026-03-26 04:50] low — old prose entry\n",
+        )
+        .await
+        .unwrap();
+
+        // A corrupt box must degrade to empty, not error out the pipeline.
+        let inbox = SubconsciousInbox::new(repo.clone());
+        assert!(
+            inbox.get_pending().await.unwrap().is_empty(),
+            "read_items must treat a corrupt box as empty, not propagate an error"
+        );
+
+        // init heals it — afterwards it parses clean and queue works.
+        inbox.init().await.unwrap();
+        inbox
+            .queue(InboxItem::new("n1", Urgency::Low, "after heal"))
+            .await
+            .unwrap();
+        let pending = inbox.get_pending().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].content, "after heal");
     }
 
     #[tokio::test]

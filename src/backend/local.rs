@@ -11,6 +11,7 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -292,10 +293,11 @@ pub struct LocalBackend {
     /// scheduled events shouldn't interrupt presence.
     active_sessions: Arc<AtomicU32>,
     /// Drives non-terminal surfaces (Matrix, mobile, …) off the EventBus.
-    /// Constructed empty; sensoria are registered and `run_all`'d in a
-    /// later matrix-sensorium phase.
-    #[allow(dead_code)]
     sensorium: Arc<tokio::sync::Mutex<crate::core::sensorium::SensoriumCoordinator>>,
+    /// Maps surface-level chat identifiers (e.g. Matrix room IDs) to
+    /// Souveraine conversation IDs. Populated lazily by
+    /// `inject_surface_turn` as new surfaces connect.
+    surface_conversations: Arc<std::sync::Mutex<HashMap<String, String>>>,
 }
 
 impl LocalBackend {
@@ -337,6 +339,7 @@ impl LocalBackend {
             sensorium: Arc::new(tokio::sync::Mutex::new(
                 crate::core::sensorium::SensoriumCoordinator::new(),
             )),
+            surface_conversations: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
 
         // Spawn one CronSensor per agent (each agent owns its own schedules
@@ -380,9 +383,21 @@ impl LocalBackend {
             sh.set_injector(injector.clone());
         }
         let mut handler =
-            crate::core::nervous::handler::HeartbeatHandler::new(event_bus.subscribe(), injector);
+            crate::core::nervous::handler::HeartbeatHandler::new(event_bus.subscribe(), injector.clone());
         tokio::spawn(async move { handler.run().await });
         tracing::info!("heartbeat handler spawned");
+
+        // Spawn the sensorium input handler — subscribes to
+        // `sensorium:input` events from non-terminal surfaces (Matrix,
+        // email, federation) and injects turns on their behalf.
+        // Same pattern as HeartbeatHandler; identical wiring.
+        let mut input_handler =
+            crate::core::nervous::handler::SensoriumInputHandler::new(
+                event_bus.subscribe(),
+                injector,
+            );
+        tokio::spawn(async move { input_handler.run().await });
+        tracing::info!("sensorium input handler spawned");
 
         Ok(backend)
     }
@@ -402,6 +417,7 @@ impl LocalBackend {
             sensorium: Arc::new(tokio::sync::Mutex::new(
                 crate::core::sensorium::SensoriumCoordinator::new(),
             )),
+            surface_conversations: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -423,6 +439,27 @@ impl LocalBackend {
     /// reach in here for the consciousness engine and session manager.
     pub fn server(&self) -> Arc<crate::server::SouveraineServer> {
         self.server.clone()
+    }
+
+    /// Register a sensorium on the coordinator and spawn its run loop.
+    ///
+    /// Each sensorium gets its own task, a shared EventBus subscription,
+    /// and a child CancellationToken. `shutdown_sensoria` cancels all of
+    /// them. Can be called at any time — the coordinator drains registered
+    /// sensoria on `run_all` and accepts new ones afterward.
+    pub async fn register_sensorium(
+        &self,
+        sensorium: Box<dyn crate::core::sensorium::Sensorium>,
+    ) {
+        let mut coord = self.sensorium.lock().await;
+        coord.register(sensorium);
+        coord.run_all(self.event_bus.clone());
+    }
+
+    /// Shut down all running sensorium tasks.
+    pub async fn shutdown_sensoria(&self) {
+        let coord = self.sensorium.lock().await;
+        coord.shutdown();
     }
 
     /// Build the greeting line describing the agent's current visual state
@@ -831,6 +868,65 @@ impl crate::core::nervous::handler::TurnInjector for LocalBackend {
                     Err(e) => tracing::warn!(
                         "pending heartbeat surfacings stash failed: {}", e
                     ),
+                }
+            }
+        });
+        Ok(())
+    }
+
+    /// Surface-initiated turn injection. Called by the
+    /// [`SensoriumInputHandler`] when a `sensorium:input` event arrives.
+    ///
+    /// Unlike background turns, the turn's output events are NOT drained
+    /// here — `run_turn` already fires them onto the EventBus as `turn:*`
+    /// events (via `TurnEventDispatcher`). The originating sensorium's
+    /// `run` loop consumes those events for incremental rendering.
+    ///
+    /// We drain the stream only to prevent backpressure on the mpsc
+    /// channel. The EventBus is the public event system; the stream is
+    /// a TUI-internal detail.
+    async fn inject_surface_turn(
+        &self,
+        agent_id: &str,
+        conversation_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        // Resolve the surface chat ID to a Souveraine conversation ID.
+        // Matrix room IDs are not Souveraine conversation IDs — the
+        // mapping survives for the lifetime of the surface session so
+        // subsequent messages in the same room route to the same
+        // conversation. The lock scope is carefully bounded to avoid
+        // holding a !Send MutexGuard across the .await below.
+        let conv_id = {
+            let map = self.surface_conversations.lock().unwrap();
+            if let Some(id) = map.get(conversation_id) {
+                Some(id.clone())
+            } else {
+                None
+            }
+        };
+        let conv_id = match conv_id {
+            Some(id) => id,
+            None => {
+                let id = self.ensure_conversation(agent_id).await?;
+                self.surface_conversations
+                    .lock()
+                    .unwrap()
+                    .insert(conversation_id.to_string(), id.clone());
+                id
+            }
+        };
+
+        let stream = self.send(&conv_id, text).await?;
+        // Drain the stream in the background — the EventBus already carries
+        // every `turn:*` event via TurnEventDispatcher. The sensorium
+        // renders from the bus. We drain here so the mpsc channel doesn't
+        // back up.
+        tokio::spawn(async move {
+            let mut s = stream;
+            while let Some(ev) = s.next().await {
+                if ev.is_err() {
+                    break;
                 }
             }
         });

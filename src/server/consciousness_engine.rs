@@ -294,11 +294,19 @@ impl ConsciousnessEngine {
                 // Heartbeat so the UI always shows something when the
                 // subconscious pass ran, even if nothing stood out.
                 if observations.is_empty() {
-                    let _ = inbox.queue(InboxItem::new(
-                        "surface",
-                        Urgency::Low,
-                        "Subconscious pass complete — no anomalies detected.",
-                    )).await;
+                    let beat = "Subconscious pass complete — no anomalies detected.";
+                    let _ = inbox
+                        .queue(InboxItem::new("surface", Urgency::Low, beat))
+                        .await;
+                    // The heartbeat is a real surfacing — it belongs in the
+                    // inner-voice file the cockpit tails, not only in the box.
+                    // Without this the inner-voice region never updates on a
+                    // quiet pass, and quiet passes are the common case.
+                    if let Err(e) =
+                        inbox.surface_to_conscious(Urgency::Low, beat).await
+                    {
+                        tracing::warn!("inner voice heartbeat delivery failed: {}", e);
+                    }
                 }
                 for item in &observations {
                     if let Err(e) = inbox.queue(item.clone()).await {
@@ -339,6 +347,11 @@ impl ConsciousnessEngine {
         match inbox.next_to_surface().await {
             Ok(Some(item)) => {
                 let id = item.id.clone();
+                tracing::info!(
+                    source = %item.source,
+                    priority = %item.urgency.as_str(),
+                    "subconscious surfacing emitted to cockpit"
+                );
                 events.push(ConsciousnessEvent::Surfacing {
                     source: item.source.clone(),
                     content: item.content.clone(),
@@ -348,7 +361,7 @@ impl ConsciousnessEngine {
                     tracing::warn!("subconscious mark_delivered failed: {}", e);
                 }
             }
-            Ok(None) => {}
+            Ok(None) => tracing::info!("subconscious had nothing to surface this pass"),
             Err(e) => tracing::warn!("subconscious next_to_surface failed: {}", e),
         }
 
@@ -659,11 +672,40 @@ Resolve entries: `[YYYY-MM-DD HH:MM] RESOLVED — note`"#;
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         }
 
-        // If we exhausted rounds without a text response, return empty —
-        // still persist the pass so the unfinished work isn't lost.
-        tracing::warn!("subconscious exhausted {} tool rounds without a final response", SUBCONSCIOUS_MAX_TOOL_ROUNDS);
+        // Rounds exhausted without a tool-less response. Don't discard the
+        // pass — make one final call with NO tools so the subconscious is
+        // forced to put her observations into words. This is what finishes
+        // the loop: her processing reaches the surface instead of being
+        // dropped on the floor after five silent rounds.
+        tracing::warn!(
+            "subconscious used all {} tool rounds; requesting a final observation with no tools",
+            SUBCONSCIOUS_MAX_TOOL_ROUNDS
+        );
+        messages.push(Message::text(
+            "user",
+            "You've used all your tool rounds for this pass. Stop using tools \
+             now and respond with your observations — source, content, urgency, \
+             exactly as instructed. If nothing notable, respond with just: none",
+        ));
+        let final_request = ChatCompletionRequest {
+            model: model.to_string(),
+            messages: messages.clone(),
+            temperature: Some(0.3),
+            max_tokens: self.max_tokens,
+            stream: None,
+            tools: None,
+        };
+        let (final_response, _strain) = self
+            .bifrost
+            .chat_completion_with_strain(final_request)
+            .await?;
+        let content = final_response.content.trim().to_string();
+        messages.push(Message::text("assistant", final_response.content.clone()));
         self.persist_subconscious_turn(&conv_id, &messages[(history_len - 1)..]);
-        Ok(Vec::new())
+        if content.eq_ignore_ascii_case("none") || content.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(parse_observations(&content))
     }
 
     /// Compute context pressure as tokens-used / context_limit.
