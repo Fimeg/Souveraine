@@ -50,9 +50,14 @@ pub struct LlmConfig {
     /// When false, images are stripped to text markers before sending.
     #[serde(default = "default_supports_images")]
     pub supports_images: bool,
+    /// How many tool rounds between subconscious mid-turn checkpoints.
+    /// 0 disables checkpointing entirely.
+    #[serde(default = "default_checkpoint_interval")]
+    pub checkpoint_interval: u32,
 }
 
 fn default_supports_images() -> bool { true }
+fn default_checkpoint_interval() -> u32 { 10 }
 
 fn default_context_window() -> u32 {
     128000

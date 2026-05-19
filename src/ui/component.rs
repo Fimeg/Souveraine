@@ -74,6 +74,9 @@ pub enum TuiEvent {
     AtmosphereChanged(String),
     /// N+1 subconscious pass started (`true`) or finished (`false`).
     SubconsciousPass(bool),
+
+    /// Itinerary changed — agent set/advanced/cleared the route.
+    ItineraryChanged(String),
     /// Agent changed her outfit. String is the outfit name (subdirectory
     /// in expressions/), empty string clears to default.
     OutfitChanged(String),

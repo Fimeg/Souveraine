@@ -1,6 +1,5 @@
 use crate::api::models::*;
 use crate::server::SouveraineServer;
-use crate::core::session::{ContentBlock, ConversationMessage};
 use axum::{
     extract::{Path, Query, State, WebSocketUpgrade, ws::WebSocket},
     response::{Json, Sse},
@@ -191,144 +190,77 @@ async fn handle_conversation_stream(
     conversation_id: String,
     tx: mpsc::Sender<StreamEvent>,
 ) -> anyhow::Result<()> {
-    let session = server.sessions.get(&conversation_id)
-        .ok_or_else(|| anyhow::anyhow!("Session disappeared"))?;
+    use crate::backend::BackendEvent;
+    use tokio_util::sync::CancellationToken;
 
-    let agent_id = session.agent_id.clone();
-    let messages: Vec<_> = session.messages.iter().map(|m| {
-        let role = match m.role {
-            crate::core::session::MessageRole::System => "system",
-            crate::core::session::MessageRole::User => "user",
-            crate::core::session::MessageRole::Assistant => "assistant",
-            crate::core::session::MessageRole::Tool => "tool",
+    let event_bus = server.event_bus.clone();
+    let empty_interject: crate::backend::InterjectionQueue =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let cancel = CancellationToken::new();
+
+    let (be_tx, mut be_rx) = mpsc::channel::<anyhow::Result<BackendEvent>>(64);
+    let server_clone = server.clone();
+    let conv = conversation_id.clone();
+
+    tokio::spawn(async move {
+        let _ = crate::server::turn::run_turn(
+            server_clone, conv, &be_tx, event_bus,
+            cancel, empty_interject,
+        ).await;
+    });
+
+    // Drain the turn's BackendEvent stream and map to SSE events.
+    // run_turn already handles: message storage, surficing injection,
+    // EventBus dispatch, N+1 pass — none of that is needed here.
+    while let Some(result) = be_rx.recv().await {
+        let be = match result {
+            Ok(be) => be,
+            Err(_) => break,
         };
-
-        let has_images = m.blocks.iter().any(|b| matches!(b, ContentBlock::Image { .. }));
-
-        if has_images {
-            use crate::bridge::bifrost::{ContentPart, ImageUrlSource};
-            let parts: Vec<ContentPart> = m.blocks.iter().filter_map(|b| match b {
-                ContentBlock::Text { text } => Some(ContentPart::Text { text: text.clone() }),
-                ContentBlock::Image { media_type, data } => {
-                    let url = format!("data:{media_type};base64,{data}");
-                    Some(ContentPart::ImageUrl { image_url: ImageUrlSource { url } })
-                }
-                _ => None,
-            }).collect();
-            let text_content = m.blocks.iter().filter_map(|b| match b {
-                ContentBlock::Text { text } => Some(text.as_str()),
-                _ => None,
-            }).collect::<Vec<_>>().join("\n");
-            crate::bridge::bifrost::Message::multimodal_user(text_content, parts)
-        } else {
-            let content = m.blocks.first().map(|b| match b {
-                ContentBlock::Text { text } => text.clone(),
-                _ => String::new(),
-            }).unwrap_or_default();
-            crate::bridge::bifrost::Message::text(role, content)
-        }
-    }).collect();
-    drop(session);
-
-    // Get agent config
-    let agent = server.agents.get(&agent_id).await?;
-    let model = agent.llm_config.model.clone();
-
-    // Simple Bifrost call (no tool loop for now - that requires git components)
-    let req = crate::bridge::bifrost::ChatCompletionRequest {
-        model: model.clone(),
-        messages,
-        stream: Some(false),
-        max_tokens: None,
-        temperature: agent.llm_config.temperature,
-        tools: None,
-    };
-
-    match server.bifrost.chat_completion(req).await {
-        Ok(response) => {
-            let content = response.content.clone();
-            
-            // Stream the response in chunks
-            for chunk in content.chars().collect::<Vec<_>>().chunks(10) {
-                let chunk_str: String = chunk.iter().collect();
-                let _ = tx.send(StreamEvent::AssistantMessage { content: chunk_str }).await;
-                tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        let sse_event = match be {
+            BackendEvent::Token(content) => StreamEvent::AssistantMessage { content },
+            BackendEvent::Reasoning(content) => StreamEvent::ReasoningMessage { content },
+            BackendEvent::Surfacing { source, content, priority } => {
+                StreamEvent::Surfacing { source, content, priority }
             }
-            
-            // Store assistant response in session
-            let _ = server.sessions.add_message(
-                &conversation_id,
-                ConversationMessage::assistant_text(&content)
-            );
-            
-            // Run consciousness events. Snapshot the session first — holding
-            // a live ref across the N+1 pass would block concurrent writes.
-            let (n1_agent, n1_turn_count, n1_messages) = {
-                let session = server.sessions.get(&conversation_id)
-                    .ok_or_else(|| anyhow::anyhow!("Session disappeared"))?;
-                (session.agent_id.clone(), session.turn_count, session.messages.clone())
-            };
-            let events = server.consciousness
-                .on_response(&n1_agent, n1_turn_count, &n1_messages, &content)
-                .await?;
-            
-            // Inject surfacing events back into the session as system messages
-            // so the agent sees them in its context window on the next turn.
-            for event in &events {
-                if let crate::server::ConsciousnessEvent::Surfacing { source, content, priority } = event {
-                    let msg = crate::core::session::ConversationMessage {
-                        role: crate::core::session::MessageRole::System,
-                        blocks: vec![crate::core::session::ContentBlock::Text {
-                            text: format!("[surfacing: {}] {} — {}", source, content, priority),
-                        }],
-                        usage: None,
-                        timestamp: None,
-                    };
-                    let _ = server.sessions.add_message(&conversation_id, msg);
+            BackendEvent::Reflection(content) => StreamEvent::Reflection { content },
+            BackendEvent::Archivist { synthesis, pressure } => {
+                StreamEvent::Archivist { synthesis, pressure }
+            }
+            BackendEvent::CompactionWarning { pressure, tier } => {
+                StreamEvent::Archivist {
+                    synthesis: format!("compaction warning tier {} at {:.0}%", tier, pressure * 100.0),
+                    pressure,
                 }
             }
-
-            for event in events {
-                let stream_event = match &event {
-                    crate::server::ConsciousnessEvent::Surfacing { source, content, priority } => {
-                        StreamEvent::Surfacing { source: source.clone(), content: content.clone(), priority: priority.clone() }
-                    }
-                    crate::server::ConsciousnessEvent::Reflection { content } => {
-                        StreamEvent::Reflection { content: content.clone() }
-                    }
-                    crate::server::ConsciousnessEvent::Archivist { synthesis, pressure } => {
-                        StreamEvent::Archivist { synthesis: synthesis.clone(), pressure: *pressure }
-                    }
-                    crate::server::ConsciousnessEvent::CompactionWarning { pressure, tier } => {
-                        StreamEvent::Archivist {
-                            synthesis: format!("compaction warning tier {} at {:.0}%", tier, pressure * 100.0),
-                            pressure: *pressure,
-                        }
-                    }
-                };
-                let _ = tx.send(stream_event).await;
+            BackendEvent::ToolCall { id, name, arguments, .. } => {
+                StreamEvent::ToolCallMessage {
+                    tool_call: ToolCall {
+                        id,
+                        function: ToolFunction { name, arguments },
+                    },
+                }
             }
-            
-            // Update pressure
-            let mut session = server.sessions.get_mut(&conversation_id)
-                .ok_or_else(|| anyhow::anyhow!("Session disappeared"))?;
-            let pressure = server.consciousness.pressure_for_session(&session).await;
-            session.context_pressure = pressure;
-            drop(session);
-        }
-        Err(e) => {
-            eprintln!("Bifrost error: {}", e);
-            let _ = tx.send(StreamEvent::AssistantMessage { 
-                content: format!("Error: {}", e) 
-            }).await;
+            BackendEvent::ToolResult { output, is_error, .. } => {
+                StreamEvent::ToolReturnMessage {
+                    tool_return: ToolReturn {
+                        status: if is_error { "error".into() } else { "success".into() },
+                        output,
+                    },
+                }
+            }
+            // Silently skip events that have no SSE counterpart
+            _ => continue,
+        };
+        if tx.send(sse_event).await.is_err() {
+            break;
         }
     }
 
-    // Send ping at end
     let _ = tx.send(StreamEvent::Ping).await;
-
     Ok(())
 }
+
 
 // ─── Memory (memfs HTTP write path) ───────────────────────────────────────
 //

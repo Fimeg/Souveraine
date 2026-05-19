@@ -111,7 +111,12 @@ impl Tool for Todo {
          - `delete` — remove a commitment entirely\n\n\
          For `start`, `update`, `complete`, and `delete`, the `id` parameter takes the \
          number shown by `list`, the full id, or any fragment of the text — whichever \
-         is easiest to reach for."
+         is easiest to reach for.\n\n\
+         When I have a sequence of commitments to work through — a route through the \
+         current session — I reach for `itinerary` instead. The itinerary is the active \
+         face of my commitments: a set of stops I move through one by one, each \
+         optionally linked to a todo by its id. The strip at the top of the conversation \
+         shows where I am."
     }
 
     fn parameter_schema(&self) -> JsonValue {

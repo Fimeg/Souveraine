@@ -15,12 +15,15 @@ pub mod consciousness_engine;
 pub mod conversation;
 pub mod db;
 pub mod device_registry;
+pub mod energy;
 pub mod federation;
 pub mod gitea_client;
 pub mod gitea_memory;
 pub mod listener;
 pub mod session_manager;
+pub mod subagent;
 pub mod summon_handler;
+pub mod turn;
 
 pub use agent_inventory::AgentInventory;
 pub use consciousness_engine::{ConsciousnessEngine, ConsciousnessEvent};

@@ -490,6 +490,7 @@ impl SetupState {
                 max_tool_rounds: 10,
                 inter_round_delay_ms: 500,
                 supports_images: true,
+                checkpoint_interval: 10,
             },
             memory_blocks: vec![MemoryBlock {
                 label: "persona".to_string(),

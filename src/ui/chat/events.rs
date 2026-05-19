@@ -316,6 +316,9 @@ impl ChatState {
                 BackendEvent::Atmosphere(preset) => {
                     self.pending_consciousness.push(BackendEvent::Atmosphere(preset));
                 }
+                BackendEvent::Itinerary(line) => {
+                    self.itinerary_line = line;
+                }
                 BackendEvent::SubconsciousPass(active) => {
                     self.pending_consciousness.push(BackendEvent::SubconsciousPass(active));
                 }

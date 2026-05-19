@@ -445,6 +445,28 @@ pub async fn build_system_prompt_full(
         }
     }
 
+    // 5a₂. Itinerary prompt — if I have live commitments and no active
+    // itinerary, remind me I can lay one out so Casey sees where I am.
+    let dynamic_dir = memory_root.join("system").join("dynamic");
+    let itin_path = dynamic_dir.join("itinerary.md");
+    let has_itin = tokio::fs::try_exists(&itin_path).await.unwrap_or(false)
+        && tokio::fs::read_to_string(&itin_path).await
+            .ok()
+            .map(|s| s.contains("current:"))
+            .unwrap_or(false);
+
+    if !has_itin {
+        let tasks_dir = memory_root.join("tasks");
+        let live_count = count_live_todos(&tasks_dir);
+        if live_count > 0 && live_count <= 12 {
+            sections.push(format!(
+                "I have {} live commitments — I could use `itinerary` to lay them \
+                 out for Casey if now is the time for a route.",
+                live_count,
+            ));
+        }
+    }
+
     // 5b. Subconscious channel — name the inner-voice file, pending inbox,
     // and (when reachable) a glimpse of the subconscious's ledger.
     let subconscious_channel = build_subconscious_channel(memory_root, subconscious_root).await;
@@ -765,6 +787,22 @@ async fn build_synthesis_orientation(memory_root: &Path) -> String {
          in `journal/` if you need them.\n\n\
          {body}"
     )
+}
+
+/// Count live (pending / in_progress) todo files in the tasks directory.
+fn count_live_todos(tasks_dir: &std::path::Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(tasks_dir) else { return 0 };
+    entries
+        .flatten()
+        .filter(|e| e.path().extension().map(|e| e == "md").unwrap_or(false))
+        .filter(|e| {
+            std::fs::read_to_string(e.path())
+                .ok()
+                .map(|s| s.contains("status: pending") || s.contains("status: in_progress"))
+                .unwrap_or(false)
+        })
+        .take(13)
+        .count()
 }
 
 #[cfg(test)]

@@ -1,7 +1,6 @@
-use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -11,13 +10,48 @@ use crate::bridge::model_router::TokenCounter;
 use crate::core::compact::CompactionEngine;
 use crate::core::nervous::EventBus;
 use crate::core::session::{ContentBlock, ConversationMessage, MessageRole};
-use crate::core::tools::defs::{SubagentRunner, ToolContext};
-use crate::server::{ConsciousnessEvent, SouveraineServer};
+use crate::core::tools::defs::ToolContext;
+use crate::server::consciousness_engine::{ConsciousnessEvent, ConsciousnessEngine};
+use crate::server::SouveraineServer;
 
 use crate::backend::BackendEvent;
+use crate::server::energy::write_energy_balance;
+use crate::server::subagent::ServerSubagentRunner;
 
-use super::{LocalSubagentRunner, bifrost_pressure, bump_on_strain, pressure_to_max_tokens};
-use super::energy::write_energy_balance;
+/// Mirror of `ConsciousnessEngine::calculate_pressure` for the in-loop
+/// BifrostMessage shape, so we can recompute pressure as tool results
+/// accumulate inside a single turn. `context_limit` comes from the
+/// agent's `llm_config.context_window` (Constitution V.3 — per-model
+/// physics, no hardcoded 128K).
+fn bifrost_pressure(counter: &TokenCounter, messages: &[BifrostMessage], context_limit: usize) -> f32 {
+    let tokens: usize = messages.iter().map(|m| counter.count(&m.content.as_text())).sum();
+    let limit = context_limit.max(1);
+    (tokens as f32 / limit as f32).min(1.0)
+}
+
+/// Helper: bump adaptive delay when we hit a 429. No decay — once bumped,
+/// the delay stays at that level until the app restarts.
+fn bump_on_strain(delay: &AtomicU64, status: u16) {
+    if status == 429 {
+        let current = delay.load(Ordering::Relaxed);
+        let bumped = (current + 200).min(3000);
+        if bumped > current {
+            delay.store(bumped, Ordering::Relaxed);
+            tracing::info!("rate delay bumped to {}ms (429)", bumped);
+        }
+    }
+}
+
+/// Below 95%: no cap. At 95%+: scale max_tokens so context + output
+/// stays under the model's limit. The agent feels the room shrink.
+fn pressure_to_max_tokens(pressure: f32, output_limit: u32) -> Option<u32> {
+    if pressure <= 0.95 {
+        return None;
+    }
+    let remaining = (1.0 - pressure) / 0.05;
+    let ratio = remaining.max(0.0).min(1.0);
+    Some((output_limit as f32 * ratio) as u32)
+}
 
 fn pulse_text(elapsed: Duration) -> String {
     let minutes = elapsed.as_secs() / 60;
@@ -25,14 +59,14 @@ fn pulse_text(elapsed: Duration) -> String {
     format!("[{} — {} minutes in. Still going.]", stamp, minutes)
 }
 
-pub(super) async fn run_turn(
+pub(crate) async fn run_turn(
     server: Arc<SouveraineServer>,
     conversation_id: String,
-    tx: &mpsc::Sender<Result<BackendEvent>>,
+    tx: &mpsc::Sender<anyhow::Result<BackendEvent>>,
     event_bus: EventBus,
     cancel: CancellationToken,
     interject: crate::backend::InterjectionQueue,
-) -> Result<()> {
+) -> anyhow::Result<()> {
     // Load the agent first so we know supports_images before building messages.
     let agent_id = {
         let session = server
@@ -130,6 +164,15 @@ pub(super) async fn run_turn(
     let temperature = agent.llm_config.temperature;
     let inter_round_delay = Duration::from_millis(agent.llm_config.inter_round_delay_ms);
     let context_limit = agent.llm_config.context_window as usize;
+    let checkpoint_interval = agent.llm_config.checkpoint_interval;
+
+    // Capture the user message that triggered this turn (last user message in history).
+    let user_message: String = initial_messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(|m| m.content.as_text())
+        .unwrap_or_default();
 
     // Resolve the model's configured output limit + presence pulse settings.
     let (output_limit, pulse_enabled, pulse_interval) = {
@@ -149,9 +192,10 @@ pub(super) async fn run_turn(
 
     // Build per-agent ToolContext with correct memory root and subagent runner
     let memory_root = Some(server.agents.memory_root(&agent_id));
+    let memory_root_for_itin = memory_root.clone();
     let cwd = std::env::current_dir().ok();
     let env: Vec<(String, String)> = std::env::vars().collect();
-    let subagent_runner = Some(Arc::new(LocalSubagentRunner::new(server.clone())) as Arc<dyn SubagentRunner>);
+    let subagent_runner = Some(Arc::new(ServerSubagentRunner::new(server.clone())) as Arc<dyn crate::core::tools::defs::SubagentRunner>);
 
     let tool_ctx = ToolContext::for_agent(
         agent_id.clone(),
@@ -188,6 +232,9 @@ pub(super) async fn run_turn(
     let counter = TokenCounter::new();
     let mut last_keepalive = Instant::now();
     const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+    // Accumulator for mid-turn checkpoint blocks — one entry per tool call.
+    let mut checkpoint_blocks: Vec<crate::server::consciousness_engine::CheckpointToolBlock> = Vec::new();
 
     // Announce this turn's lifecycle onto the nervous system so any
     // sensorium (Matrix, mobile) can drive itself off the event stream.
@@ -450,6 +497,15 @@ pub(super) async fn run_turn(
                 result.output
             };
 
+            // Accumulate for checkpoint (capture output before moving).
+            let snippet = output.chars().take(120).collect::<String>();
+            checkpoint_blocks.push(crate::server::consciousness_engine::CheckpointToolBlock {
+                round: tool_round,
+                tool_name: tc.name.clone(),
+                result_ok: !result.is_error,
+                result_snippet: snippet,
+            });
+
             // Emit structured ToolCall + ToolResult events for the TUI to render
             // as cards (chat.rs subscribes). The old Token-text path is kept off.
             let _ = tx
@@ -495,8 +551,96 @@ pub(super) async fn run_turn(
                     .await;
             }
 
+            // If the agent called the itinerary tool, read the current
+            // itinerary and emit its route-line for the TUI header.
+            if tc.name == "itinerary" {
+                let route = memory_root_for_itin
+                    .as_ref()
+                    .and_then(|root| {
+                        let dynamic = root.join("system").join("dynamic");
+                        crate::core::tools::itinerary::load(&dynamic)
+                    })
+                    .map(|ity| ity.route_line())
+                    .unwrap_or_default();
+                if !route.is_empty() {
+                    let _ = tx
+                        .send(Ok(BackendEvent::Itinerary(route)))
+                        .await;
+                }
+            }
+
             // Bind tool result to its call by id (OpenAI tool-use schema).
             messages.push(BifrostMessage::tool_result(&tc.id, &tc.name, output));
+        }
+
+        // ── Mid-turn checkpoint ──────────────────────────────────────
+        // Every checkpoint_interval rounds, pause and let the subconscious
+        // assess whether the loop is making progress.
+        if checkpoint_interval > 0 && tool_round > 0 && tool_round % checkpoint_interval == 0 {
+            let recent: Vec<_> = checkpoint_blocks
+                .iter()
+                .rev()
+                .take(checkpoint_interval as usize * 3)
+                .cloned()
+                .collect();
+            match server
+                .consciousness
+                .mid_turn_checkpoint(&agent_id, &user_message, &recent)
+                .await
+            {
+                // ── HALT: circuit breaker ───────────────────────────
+                // Break the tool loop, run Aster with full autonomy,
+                // feed her correction back as a user message, then
+                // continue the loop so the primary course-corrects.
+                Ok(crate::server::consciousness_engine::CheckpointVerdict::Halt(reason)) => {
+                    let _ = tx
+                        .send(Ok(BackendEvent::Surfacing {
+                            source: "checkpoint".into(),
+                            content: reason.clone(),
+                            priority: "critical".into(),
+                        }))
+                        .await;
+
+                    // Commit the primary's partial output to the session
+                    // so the next LLM round picks up from here.
+                    let primary_text = if final_content.is_empty() {
+                        format!("*[subconscious HALT — {reason}]*")
+                    } else {
+                        format!("{}\n\n*[subconscious HALT — {reason}]*", final_content)
+                    };
+                    server.sessions.add_message(
+                        &conversation_id,
+                        ConversationMessage::assistant_text(&primary_text),
+                    )?;
+
+                    // Run Aster's correction pass — full tool access,
+                    // no token cap, her own voice.
+                    let correction = server
+                        .consciousness
+                        .checkpoint_correction(&agent_id, &user_message, &recent, &reason)
+                        .await
+                        .unwrap_or_else(|e| {
+                            tracing::warn!("checkpoint correction failed: {e}");
+                            format!("Aster's assessment: {reason}")
+                        });
+
+                    // Feed Aster's direction back as a user message.
+                    // The next LLM round reads it as input.
+                    let msg = format!(
+                        "*[Aster's direction — {reason}]*\n{}",
+                        correction,
+                    );
+                    messages.push(BifrostMessage::text("user", &msg));
+                    let _ = tx.send(Ok(BackendEvent::Token(msg.clone()))).await;
+                }
+
+                Ok(crate::server::consciousness_engine::CheckpointVerdict::Continue(Some(note)))
+                | Ok(crate::server::consciousness_engine::CheckpointVerdict::Unclear(Some(note))) => {
+                    let msg = format!("[subconscious: {note}]");
+                    messages.push(BifrostMessage::text("system", &msg));
+                }
+                _ => {}
+            }
         }
 
         // Brief pause between tool rounds to let rate limits cool.

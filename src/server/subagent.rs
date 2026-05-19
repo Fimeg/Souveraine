@@ -7,32 +7,32 @@ use crate::bridge::bifrost::{ChatCompletionRequest, Message as BifrostMessage};
 use crate::core::tools::defs::{SubagentParams, SubagentRunner, ToolContext};
 use crate::server::SouveraineServer;
 
-// ── LocalSubagentRunner ──────────────────────────────────────────
+// ── ServerSubagentRunner ──────────────────────────────────────────
 
-/// Implements [`SubagentRunner`] by running a full turn against the
-/// LocalBackend's server infrastructure — loading the agent from the
-/// inventory, creating a session, and running the tool-calling loop.
+/// Server-side [`SubagentRunner`]. Runs a full turn against the server
+/// infrastructure — loading the agent from the inventory, creating a session,
+/// and running the tool-calling loop.
 ///
 /// After the tool loop completes, the subagent runs its own N+1
 /// (ConsciousnessEngine::on_response) so its observations flow back into
 /// the parent agent's inbox — the dual-state is preserved even in a fork.
-pub struct LocalSubagentRunner {
+pub struct ServerSubagentRunner {
     server: Arc<SouveraineServer>,
 }
 
-impl LocalSubagentRunner {
+impl ServerSubagentRunner {
     pub fn new(server: Arc<SouveraineServer>) -> Self {
         Self { server }
     }
 }
 
 #[async_trait]
-impl SubagentRunner for LocalSubagentRunner {
+impl SubagentRunner for ServerSubagentRunner {
     async fn run_subagent(
         &self,
         params: SubagentParams,
         depth: u32,
-    ) -> Result<String, crate::core::tools::defs::ToolError> {
+    ) -> std::result::Result<String, crate::core::tools::defs::ToolError> {
         // Resolve model: use override if provided, otherwise fall back to parent
         let agent = self
             .server
@@ -89,7 +89,7 @@ impl SubagentRunner for LocalSubagentRunner {
             std::env::current_dir().ok(),
             params.memory_root.clone(),
             std::env::vars().collect(),
-            Some(Arc::new(LocalSubagentRunner::new(self.server.clone())) as Arc<dyn SubagentRunner>),
+            Some(Arc::new(ServerSubagentRunner::new(self.server.clone())) as Arc<dyn SubagentRunner>),
         );
 
         // Initial messages: system prompt + user prompt

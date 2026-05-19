@@ -11,6 +11,7 @@ pub mod defs;
 pub mod edit;
 pub mod glob;
 pub mod grep;
+pub mod itinerary;
 pub mod list_dir;
 pub mod outfit;
 pub mod read;
@@ -36,6 +37,7 @@ use self::read::Read;
 use self::subagent::Subagent;
 use self::agent::{Reach, Consult};
 use self::atmosphere::Atmosphere;
+use self::itinerary::ItineraryTool;
 use self::schedule::Schedule;
 use self::todo::Todo;
 use self::write::Write;
@@ -90,6 +92,7 @@ impl Sensorium {
                 Box::new(Atmosphere),
                 Box::new(Reach),
                 Box::new(Consult),
+                Box::new(ItineraryTool),
                 Box::new(Todo),
                 Box::new(Schedule),
             ],

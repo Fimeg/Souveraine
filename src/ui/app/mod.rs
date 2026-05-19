@@ -390,6 +390,9 @@ impl App {
                         BackendEvent::Outfit(name) => {
                             self.dispatch(TuiEvent::OutfitChanged(name));
                         }
+                        BackendEvent::Itinerary(line) => {
+                            self.dispatch(TuiEvent::ItineraryChanged(line));
+                        }
                         _ => {}
                     }
                 }

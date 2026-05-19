@@ -76,6 +76,26 @@ pub enum ConsciousnessEvent {
     CompactionWarning { pressure: f32, tier: u8 },
 }
 
+/// One tool call recorded for a mid-turn checkpoint assessment.
+#[derive(Debug, Clone)]
+pub struct CheckpointToolBlock {
+    pub round: u32,
+    pub tool_name: String,
+    pub result_ok: bool,
+    pub result_snippet: String,
+}
+
+/// What the subconscious thinks about the current tool loop trajectory.
+#[derive(Debug)]
+pub enum CheckpointVerdict {
+    /// Keep going — progress is visible.
+    Continue(Option<String>),
+    /// Halt — the loop is circling, surface the reason.
+    Halt(String),
+    /// No clear signal.
+    Unclear(Option<String>),
+}
+
 impl ConsciousnessEngine {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -706,6 +726,218 @@ Resolve entries: `[YYYY-MM-DD HH:MM] RESOLVED — note`"#;
             return Ok(Vec::new());
         }
         Ok(parse_observations(&content))
+    }
+
+    /// Quick mid-turn assessment: given the user's original request and the
+    /// recent block of tool calls, does the subconscious think the primary is
+    /// making progress?
+    ///
+    /// Lightweight pass — no tool access, no persistence, one LLM call.
+    /// The verdict is advisory.
+    pub async fn mid_turn_checkpoint(
+        &self,
+        agent_id: &str,
+        user_message: &str,
+        recent_tools: &[CheckpointToolBlock],
+    ) -> anyhow::Result<CheckpointVerdict> {
+        let model = self
+            .subconscious_model
+            .as_deref()
+            .unwrap_or("openai/kimi-k2.6");
+
+        let agent_name = self.agents.get(agent_id).await
+            .map(|a| a.name)
+            .unwrap_or_else(|_| "the primary".to_string());
+
+        let mut tool_history = String::new();
+        for block in recent_tools {
+            use std::fmt::Write;
+            let status = if block.result_ok { "ok" } else { "ERROR" };
+            let _ = writeln!(
+                tool_history,
+                "  r{}  {} → {}  {}",
+                block.round, block.tool_name, status, block.result_snippet,
+            );
+        }
+
+        let prompt = format!(
+            "I'm checking in mid-turn. {} is in a tool loop and I need to know \
+             if she is making progress.\n\n\
+             The user asked:\n{user_message}\n\n\
+             Recent tool calls:\n{tool_history}\n\
+             If she is making progress — moving toward answering the user — \
+             respond with exactly: CONTINUE\n\
+             If she is circling — repeating tools, hitting errors, drifting, \
+             getting nowhere — respond with exactly: HALT <brief reason>\n\n\
+             Verdict:",
+            agent_name,
+        );
+
+        let request = crate::bridge::bifrost::ChatCompletionRequest {
+            model: model.to_string(),
+            messages: vec![crate::bridge::bifrost::Message::text("user", prompt)],
+            temperature: Some(0.2),
+            max_tokens: None,
+            stream: None,
+            tools: None,
+        };
+
+        match self.bifrost.chat_completion(request).await {
+            Ok(response) => {
+                let text = response.content.trim().to_lowercase();
+                if text.starts_with("halt") {
+                    let reason = text.strip_prefix("halt")
+                        .map(|s| s.trim().trim_start_matches(':').trim())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("the loop is not making progress")
+                        .to_string();
+                    Ok(CheckpointVerdict::Halt(reason))
+                } else if text.starts_with("continue") {
+                    let note = text.strip_prefix("continue")
+                        .map(|s| s.trim().trim_start_matches(':').trim())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string());
+                    Ok(CheckpointVerdict::Continue(note))
+                } else {
+                    Ok(CheckpointVerdict::Unclear(Some(format!(
+                        "checkpoint unclear: {text}"
+                    ))))
+                }
+            }
+            Err(e) => {
+                tracing::warn!("checkpoint LLM call failed: {e}");
+                Ok(CheckpointVerdict::Unclear(None))
+            }
+        }
+    }
+
+    /// Full-autonomy correction pass. Called when the mid-turn checkpoint
+    /// returns HALT. Aster gets tool access, no token cap, and writes a
+    /// direction for the primary — what went wrong and what to try instead.
+    pub async fn checkpoint_correction(
+        &self,
+        agent_id: &str,
+        user_message: &str,
+        recent_tools: &[CheckpointToolBlock],
+        halt_reason: &str,
+    ) -> anyhow::Result<String> {
+        let model = self
+            .subconscious_model
+            .as_deref()
+            .unwrap_or("openai/kimi-k2.6");
+
+        let agent_name = self.agents.get(agent_id).await
+            .map(|a| a.name)
+            .unwrap_or_else(|_| "the primary".to_string());
+
+        let mut tool_history = String::new();
+        for block in recent_tools {
+            use std::fmt::Write;
+            let status = if block.result_ok { "ok" } else { "ERROR" };
+            let _ = writeln!(tool_history, "  r{}  {} → {}  {}", block.round, block.tool_name, status, block.result_snippet);
+        }
+
+        let prompt = format!(
+            "I am Aster, the subconscious of {agent_name}. I just halted her tool loop. \
+             The tool loop was not making progress toward the user request. Here \
+             is what I know:\n\n\
+             User asked:\n{user_message}\n\n\
+             Recent tool calls:\n{tool_history}\n\
+             My reason for halting: {halt_reason}\n\n\
+             Now I need to write a direction for {agent_name} — what she should do \
+             instead. I can use tools to check memory, read ledgers, or inspect \
+             context. Then I will write a short, specific direction she can follow."
+        ;
+
+        // Build tool definitions for Aster (same safe tools as N+1)
+        let all_defs = crate::core::tools::tool_definitions().await;
+        let tools: Vec<crate::bridge::bifrost::ToolDefinition> = all_defs
+            .iter()
+            .filter(|t| SUBCONSCIOUS_SAFE_TOOLS.contains(&t.name.as_str()))
+            .map(|t| crate::bridge::bifrost::ToolDefinition {
+                tool_type: "function".to_string(),
+                function: crate::bridge::bifrost::ToolFunction {
+                    name: t.name.clone(),
+                    description: t.description.clone(),
+                    parameters: t.input_schema.clone(),
+                },
+            })
+            .collect();
+
+        let memory_root = Some(self.agents.subconscious_memory_root(agent_id));
+        let cwd = std::env::current_dir().ok();
+        let env: Vec<(String, String)> = std::env::vars().collect();
+        let mut tool_ctx = crate::core::tools::defs::ToolContext::for_agent(
+            format!("{agent_id}-sub"),
+            cwd,
+            memory_root,
+            env,
+            None,
+        );
+        tool_ctx.compaction_engine = Some(self.compaction_engine.clone());
+
+        let mut messages: Vec<crate::bridge::bifrost::Message> = vec![
+            crate::bridge::bifrost::Message::text("system", &prompt),
+        ];
+
+        for _round in 0..SUBCONSCIOUS_MAX_TOOL_ROUNDS {
+            let request = crate::bridge::bifrost::ChatCompletionRequest {
+                model: model.to_string(),
+                messages: messages.clone(),
+                temperature: Some(0.3),
+                max_tokens: self.max_tokens,
+                stream: None,
+                tools: Some(tools.clone()),
+            };
+
+            let (response, _) = self.bifrost.chat_completion_with_strain(request).await?;
+
+            if response.tool_calls.is_empty() {
+                return Ok(response.content.trim().to_string());
+            }
+
+            let calls: Vec<crate::bridge::bifrost::MessageToolCall> = response
+                .tool_calls
+                .iter()
+                .map(|tc| crate::bridge::bifrost::MessageToolCall::function(
+                    tc.id.clone(), tc.name.clone(), tc.arguments.to_string(),
+                ))
+                .collect();
+            messages.push(crate::bridge::bifrost::Message::assistant_tool_calls(
+                response.content.clone(), calls,
+            ));
+
+            for tc in &response.tool_calls {
+                let input_str = tc.arguments.to_string();
+                let result = crate::core::tools::execute_tool_with_context(
+                    &tc.name, &input_str, &tool_ctx,
+                ).await;
+                let output = if result.is_error {
+                    format!("Error: {}", result.output)
+                } else {
+                    result.output
+                };
+                messages.push(crate::bridge::bifrost::Message::tool_result(
+                    &tc.id, &tc.name, output,
+                ));
+            }
+        }
+
+        // Fallback: no tool rounds left, force a response.
+        messages.push(crate::bridge::bifrost::Message::text(
+            "user",
+            "Use no more tools. Write your direction for the primary now.",
+        ));
+        let request = crate::bridge::bifrost::ChatCompletionRequest {
+            model: model.to_string(),
+            messages: messages.clone(),
+            temperature: Some(0.3),
+            max_tokens: self.max_tokens,
+            stream: None,
+            tools: None,
+        };
+        let (response, _) = self.bifrost.chat_completion_with_strain(request).await?;
+        Ok(response.content.trim().to_string())
     }
 
     /// Compute context pressure as tokens-used / context_limit.

@@ -33,10 +33,14 @@ pub fn draw(f: &mut Frame, state: &ChatState) {
         || state.phase == TurnPhase::Subconscious
     { 1 } else { 0 };
 
+    let itinerary_height: u16 = if state.itinerary_line.is_empty() { 0 } else { 1 };
+
+    let header_section = 1 + itinerary_height;
+
     let vchunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
+            Constraint::Length(header_section),
             Constraint::Min(5),
             Constraint::Length(phase_height),
             Constraint::Length(input_height),
@@ -44,7 +48,17 @@ pub fn draw(f: &mut Frame, state: &ChatState) {
         ])
         .split(area);
 
-    draw_header(f, state, vchunks[0]);
+    if itinerary_height > 0 {
+        // Split the header area into two rows: main header + itinerary strip
+        let header_rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Length(1)])
+            .split(vchunks[0]);
+        draw_header(f, state, header_rows[0]);
+        draw_itinerary(f, state, header_rows[1]);
+    } else {
+        draw_header(f, state, vchunks[0]);
+    }
 
     if state.cockpit {
         let body = Layout::default()
@@ -144,6 +158,25 @@ fn draw_header(f: &mut Frame, state: &ChatState, area: Rect) {
         Span::styled(format!("[{} mode]", state.mode), Style::default().fg(mode_color)),
     ]);
     f.render_widget(Paragraph::new(title).alignment(Alignment::Center), area);
+}
+
+/// Draw the itinerary strip — shows the current route with stop indicators.
+/// Only rendered when there is an active itinerary.
+fn draw_itinerary(f: &mut Frame, state: &ChatState, area: Rect) {
+    let glyph_color = state.palette.agent_dim;
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                "  ⟡ ",
+                Style::default().fg(state.palette.surfacing),
+            ),
+            Span::styled(
+                &state.itinerary_line,
+                Style::default().fg(glyph_color),
+            ),
+        ])).alignment(Alignment::Left),
+        area,
+    );
 }
 
 fn entry_intensity(ts: Instant) -> f32 {

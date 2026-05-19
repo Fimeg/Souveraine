@@ -8,68 +8,23 @@
 //! This is the "harness still works when the server is gone" path
 //! (`souveraine chat --local`, or auto-fallback when the remote is down).
 
-pub(crate) mod energy;
-mod turn;
-mod consciousness;
-mod subagent;
-
-pub use subagent::LocalSubagentRunner;
+pub(crate) mod consciousness;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
-use crate::bridge::bifrost::{ChatCompletionRequest, Message as BifrostMessage};
-use crate::bridge::model_router::TokenCounter;
 use crate::core::session::{ContentBlock, ConversationMessage, ImageAttachment, MessageRole};
 use crate::core::config::ConsciousnessConfig;
-use crate::core::identity::SeedId;
-use crate::core::nervous::EventBus;
-use crate::core::tools::defs::{SubagentParams, SubagentRunner, ToolContext};
-use crate::server::{ConsciousnessEvent, SouveraineServer};
+use crate::server::SouveraineServer;
 
 use super::{AgentInfo, Backend, BackendEvent, ConversationInfo};
-
-/// Below 95%: no cap. At 95%+: scale max_tokens so context + output
-/// stays under the model's limit. The agent feels the room shrink.
-fn pressure_to_max_tokens(pressure: f32, output_limit: u32) -> Option<u32> {
-    if pressure <= 0.95 {
-        return None;
-    }
-    let remaining = (1.0 - pressure) / 0.05;
-    let ratio = remaining.max(0.0).min(1.0);
-    Some((output_limit as f32 * ratio) as u32)
-}
-
-/// Mirror of `ConsciousnessEngine::calculate_pressure` for the in-loop
-/// BifrostMessage shape, so we can recompute pressure as tool results
-/// accumulate inside a single turn. `context_limit` comes from the
-/// agent's `llm_config.context_window` (Constitution V.3 — per-model
-/// physics, no hardcoded 128K).
-fn bifrost_pressure(counter: &TokenCounter, messages: &[BifrostMessage], context_limit: usize) -> f32 {
-    let tokens: usize = messages.iter().map(|m| counter.count(&m.content.as_text())).sum();
-    let limit = context_limit.max(1);
-    (tokens as f32 / limit as f32).min(1.0)
-}
-
-/// Helper: bump adaptive delay when we hit a 429. No decay — once bumped,
-/// the delay stays at that level until the app restarts.
-fn bump_on_strain(delay: &AtomicU64, status: u16) {
-    if status == 429 {
-        let current = delay.load(Ordering::Relaxed);
-        let bumped = (current + 200).min(3000);
-        if bumped > current {
-            delay.store(bumped, Ordering::Relaxed);
-            tracing::info!("rate delay bumped to {}ms (429)", bumped);
-        }
-    }
-}
 
 #[derive(Clone)]
 pub struct LocalBackend {
@@ -476,12 +431,12 @@ impl Backend for LocalBackend {
         let (tx, rx) = mpsc::channel::<Result<BackendEvent>>(64);
         let server = self.server.clone();
         let conv_id = conversation_id.to_string();
-        let event_bus = self.event_bus.clone();
+        let event_bus = server.event_bus.clone();
         let active = self.active_sessions.clone();
 
         active.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
-            if let Err(e) = turn::run_turn(server, conv_id, &tx, event_bus, cancel, interject).await {
+            if let Err(e) = crate::server::turn::run_turn(server, conv_id, &tx, event_bus, cancel, interject).await {
                 let _ = tx.send(Err(e)).await;
             }
             let _ = tx.send(Ok(BackendEvent::Done)).await;
@@ -538,12 +493,12 @@ impl Backend for LocalBackend {
         let (tx, rx) = mpsc::channel::<Result<BackendEvent>>(64);
         let server = self.server.clone();
         let conv_id = conversation_id.to_string();
-        let event_bus = self.event_bus.clone();
+        let event_bus = server.event_bus.clone();
         let active = self.active_sessions.clone();
 
         active.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
-            if let Err(e) = turn::run_turn(server, conv_id, &tx, event_bus, cancel, interject).await {
+            if let Err(e) = crate::server::turn::run_turn(server, conv_id, &tx, event_bus, cancel, interject).await {
                 let _ = tx.send(Err(e)).await;
             }
             let _ = tx.send(Ok(BackendEvent::Done)).await;
@@ -567,6 +522,7 @@ impl Backend for LocalBackend {
                 max_tool_rounds: current.llm_config.max_tool_rounds,
                 inter_round_delay_ms: current.llm_config.inter_round_delay_ms,
                 supports_images: current.llm_config.supports_images,
+                checkpoint_interval: current.llm_config.checkpoint_interval,
             }),
             memory_blocks: None,
             tools: None,

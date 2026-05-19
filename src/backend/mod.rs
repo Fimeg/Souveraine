@@ -108,6 +108,10 @@ pub enum BackendEvent {
     },
     /// Agent set an atmospheric preset for the UI chrome.
     Atmosphere(String),
+
+    /// Agent set or advanced the itinerary. The string is the route-line
+    /// representation for the header strip.
+    Itinerary(String),
     /// N+1 subconscious pass started (`true`) or finished (`false`).
     /// Presence reads this to flip into / out of `Posture::Thinking` so the
     /// face shows when the subconscious is the one looking at the conversation.

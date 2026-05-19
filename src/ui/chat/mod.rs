@@ -350,6 +350,10 @@ pub struct ChatState {
     pub render_mode: ChatMode,
     pub palette: ChatPalette,
     pub stream_buffer: String,
+
+    /// Current itinerary route-line for the header strip.
+    /// Empty string means no active itinerary.
+    pub itinerary_line: String,
 }
 
 #[derive(Debug, Clone)]
@@ -482,6 +486,7 @@ impl ChatState {
             render_mode: ChatMode::Conversation,
             palette: ChatPalette::default(),
             stream_buffer: String::new(),
+            itinerary_line: String::new(),
         })
     }
 }
