@@ -848,6 +848,34 @@ fn draw_input(f: &mut Frame, state: &ChatState, area: Rect) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let logical: Vec<&str> = state.input.split('\n').collect();
 
+    // Find the visual line index (li, chunk pos) that contains the cursor.
+    let mut cursor_byte_remaining = state.input_cursor;
+    let mut cursor_visual_line: Option<(usize, usize)> = None; // (logical_line, char_offset)
+    for (li, ll) in logical.iter().enumerate() {
+        let line_len = ll.len();
+        if cursor_byte_remaining <= line_len {
+            // Cursor is on this logical line — find which visual chunk.
+            let chars: Vec<char> = ll.chars().collect();
+            let char_offset = ll[..cursor_byte_remaining].chars().count();
+            let chunks = wrap_input_line(&chars, inner_width);
+            let mut consumed = 0;
+            for (pos, &(cs, ce)) in chunks.iter().enumerate() {
+                if char_offset < consumed + (ce - cs) || char_offset == consumed && (ce - cs) == 0 {
+                    cursor_visual_line = Some((li, consumed + cs + (char_offset - consumed)));
+                    break;
+                }
+                consumed += ce - cs;
+            }
+            // If cursor is at the very end of the logical line, it's on the last chunk.
+            if cursor_visual_line.is_none() && !chunks.is_empty() {
+                let last = chunks.len() - 1;
+                cursor_visual_line = Some((li, ll.len()));
+            }
+            break;
+        }
+        cursor_byte_remaining = cursor_byte_remaining.saturating_sub(line_len + 1); // +1 for \n
+    }
+
     for (li, logical_line) in logical.iter().enumerate() {
         let chars: Vec<char> = logical_line.chars().collect();
         let chunks = wrap_input_line(&chars, inner_width);
@@ -859,10 +887,20 @@ fn draw_input(f: &mut Frame, state: &ChatState, area: Rect) {
             } else {
                 Span::raw("   ")
             };
-            let is_last = li == logical.len() - 1 && pos == chunks.len() - 1;
-            let mut spans = vec![prefix, Span::styled(chunk, Style::default().fg(Color::White))];
-            if is_last {
+            let mut spans = vec![prefix];
+            // Check if cursor is on this visual line.
+            let is_cursor_line = cursor_visual_line == Some((li, pos));
+            if is_cursor_line {
+                // Compute char offset within this chunk.
+                let (_, char_offset) = cursor_visual_line.unwrap();
+                let in_chunk_offset = char_offset.saturating_sub(chunk_start).min(chunk.len());
+                let before: String = chunk.chars().take(in_chunk_offset).collect();
+                let after: String = chunk.chars().skip(in_chunk_offset).collect();
+                spans.push(Span::styled(before, Style::default().fg(Color::White)));
                 spans.push(Span::styled(cursor_ch.to_string(), Style::default().fg(prefix_color)));
+                spans.push(Span::styled(after, Style::default().fg(Color::White)));
+            } else {
+                spans.push(Span::styled(chunk, Style::default().fg(Color::White)));
             }
             lines.push(Line::from(spans));
         }

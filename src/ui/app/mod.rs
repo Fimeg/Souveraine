@@ -327,7 +327,7 @@ impl App {
     pub async fn run(&mut self) -> io::Result<()> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture, event::EnableBracketedPaste)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
@@ -431,6 +431,22 @@ impl App {
                             _ => SceneLayout::Single,
                         };
                     }
+                    Event::Paste(data) => {
+                        if self.current_screen == Screen::Chat {
+                            if let Some(chat) = self.chat.as_mut() {
+                                // Only count lines of what will actually fit
+                                // so the tag is accurate.
+                                chat.insert_at_cursor(&data);
+                                let inserted = data.len();
+                                let lines = data.lines().count();
+                                if lines > 3 {
+                                    chat.system_message(
+                                        format!("*[pasted {} lines — {} chars]*", lines, inserted),
+                                    );
+                                }
+                            }
+                        }
+                    }
                     Event::Mouse(m) => {
                         use crossterm::event::{MouseButton, MouseEventKind};
                         if self.current_screen == Screen::Chat {
@@ -491,7 +507,8 @@ impl App {
         execute!(
             terminal.backend_mut(),
             LeaveAlternateScreen,
-            DisableMouseCapture
+            DisableMouseCapture,
+            event::DisableBracketedPaste
         )?;
         terminal.show_cursor()?;
 
@@ -837,13 +854,15 @@ impl App {
             }
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 if chat.input.len() < 8_192 {
-                    chat.input.push('\n');
+                    chat.input.insert(chat.input_cursor, '\n');
+                    chat.input_cursor += '\n'.len_utf8();
                     chat.update_completion();
                 }
             }
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if chat.input.len() < 8_192 {
-                    chat.input.push('\n');
+                    chat.input.insert(chat.input_cursor, '\n');
+                    chat.input_cursor += '\n'.len_utf8();
                     chat.update_completion();
                 }
             }
@@ -853,8 +872,69 @@ impl App {
                 chat.submit();
             }
             KeyCode::Backspace => {
-                chat.input.pop();
-                chat.update_completion();
+                if chat.input_cursor > 0 {
+                    let prev = chat.input[..chat.input_cursor]
+                        .char_indices()
+                        .next_back()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    chat.input.remove(prev);
+                    chat.input_cursor = prev;
+                    chat.update_completion();
+                }
+            }
+            // Arrow-key navigation within the input field.
+            KeyCode::Left => {
+                if chat.input_cursor > 0 {
+                    chat.input_cursor = chat.input[..chat.input_cursor]
+                        .char_indices()
+                        .next_back()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                }
+            }
+            KeyCode::Right => {
+                if chat.input_cursor < chat.input.len() {
+                    if let Some(c) = chat.input[chat.input_cursor..].chars().next() {
+                        chat.input_cursor += c.len_utf8();
+                    }
+                }
+            }
+            KeyCode::Home => {
+                chat.input_cursor = 0;
+            }
+            KeyCode::End => {
+                chat.input_cursor = chat.input.len();
+            }
+            // Word-boundary navigation: Ctrl+Left / Ctrl+Right.
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Step back to start of current or previous word.
+                let before = &chat.input[..chat.input_cursor];
+                let prev_word = before
+                    .char_indices()
+                    .rev()
+                    .skip_while(|(_, c)| c.is_whitespace())
+                    .skip_while(|(_, c)| !c.is_whitespace())
+                    .next()
+                    .map(|(i, _)| i + before[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(0))
+                    .unwrap_or(0);
+                chat.input_cursor = prev_word;
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Step forward to start of next word.
+                let from = &chat.input[chat.input_cursor..];
+                let first_non_space = from.find(|c: char| !c.is_whitespace());
+                let next_word = match first_non_space {
+                    Some(i) => {
+                        let after_ws = &from[i..];
+                        match after_ws.find(char::is_whitespace) {
+                            Some(ws_end) => chat.input_cursor + i + ws_end,
+                            None => chat.input.len(),
+                        }
+                    }
+                    None => chat.input.len(),
+                };
+                chat.input_cursor = next_word;
             }
             // Arrow / page keys no longer scroll the message history — that
             // is mouse-wheel only now. The keys fall through as no-ops so
@@ -872,7 +952,8 @@ impl App {
             }
             KeyCode::Char(c) => {
                 if chat.input.len() < 8_192 {
-                    chat.input.push(c);
+                    chat.input.insert(chat.input_cursor, c);
+                    chat.input_cursor += c.len_utf8();
                     chat.update_completion();
                 }
             }

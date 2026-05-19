@@ -56,7 +56,7 @@ hound = "3.5"
 # tokenizers = "0.15"  # For local tokenization
 
 # Terminal/UI
-crossterm = "0.27"  # Terminal control
+crossterm = { version = "0.27", features = ["bracketed-paste"] }  # Terminal control (bracketed paste for paste detection)
 ratatui = { version = "0.30", features = ["crossterm"] }  # TUI framework with crossterm backend
 unicode-width = "0.1"
 arboard = { version = "3", features = ["wayland-data-control"] }  # Clipboard — click-to-copy a message bubble

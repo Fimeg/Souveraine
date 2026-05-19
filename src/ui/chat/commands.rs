@@ -41,6 +41,7 @@ Tab toggles the cockpit pane. `t` (on empty input) toggles tool expansion.";
 
         let trimmed = self.input.trim().to_string();
         self.input.clear();
+        self.input_cursor = 0;
 
         if let Some(rest) = trimmed.strip_prefix("/btw ") {
             let question = rest.trim().to_string();

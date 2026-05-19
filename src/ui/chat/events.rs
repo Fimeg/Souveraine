@@ -369,6 +369,7 @@ impl ChatState {
     pub fn enqueue_interjection(&mut self, text: String) {
         if !self.busy {
             self.input = text;
+            self.input_cursor = self.input.len();
             self.submit();
             return;
         }
@@ -509,6 +510,12 @@ impl ChatState {
         None
     }
 
+    pub fn insert_at_cursor(&mut self, text: &str) {
+        self.input.insert_str(self.input_cursor, text);
+        self.input_cursor += text.len();
+        self.update_completion();
+    }
+
     pub fn toggle_cockpit(&mut self) {
         self.cockpit = !self.cockpit;
     }
@@ -557,6 +564,7 @@ impl ChatState {
         if let Overlay::SlashComplete { selected, ref matches } = self.overlay {
             if let Some(cmd) = matches.get(selected) {
                 self.input = cmd.name.to_string();
+                self.input_cursor = self.input.len();
             }
         }
         self.overlay = Overlay::None;
