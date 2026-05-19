@@ -524,13 +524,14 @@ impl App {
                                     MouseEventKind::Down(MouseButton::Left) => {
                                         chat.copy_message_at(m.column, m.row);
                                     }
-                                    // Wheel rides the same scroll field the
-                                    // arrow keys move — a notch is three lines.
+                                    // Wheel scrolls whichever pane the cursor
+                                    // is over — thinking, subconscious, or the
+                                    // message history. A notch is three lines.
                                     MouseEventKind::ScrollUp => {
-                                        chat.scroll = chat.scroll.saturating_add(3);
+                                        chat.wheel_scroll(m.column, m.row, true);
                                     }
                                     MouseEventKind::ScrollDown => {
-                                        chat.scroll = chat.scroll.saturating_sub(3);
+                                        chat.wheel_scroll(m.column, m.row, false);
                                     }
                                     _ => {}
                                 }
@@ -1224,18 +1225,9 @@ impl App {
                 chat.input.pop();
                 chat.update_completion();
             }
-            KeyCode::Up => {
-                chat.scroll = chat.scroll.saturating_add(1);
-            }
-            KeyCode::Down => {
-                chat.scroll = chat.scroll.saturating_sub(1);
-            }
-            KeyCode::PageUp => {
-                chat.scroll = chat.scroll.saturating_add(10);
-            }
-            KeyCode::PageDown => {
-                chat.scroll = chat.scroll.saturating_sub(10);
-            }
+            // Arrow / page keys no longer scroll the message history — that
+            // is mouse-wheel only now. The keys fall through as no-ops so
+            // they're free for input-cursor movement later.
             KeyCode::Tab => {
                 chat.toggle_cockpit();
             }

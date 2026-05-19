@@ -13,7 +13,7 @@
 //! - Surfacing items: centered yellow bubble with `[surfacing]` header
 //!   (Constitution Article II.2).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -342,6 +342,15 @@ pub struct MsgLayout {
     pub spans: Vec<(usize, usize, usize)>,
 }
 
+/// Screen rects of the two cockpit panes from the last draw — lets a mouse
+/// wheel notch land on whichever pane the cursor is hovering. Built fresh
+/// every draw of `draw_cockpit`; left zeroed while the cockpit is closed.
+#[derive(Default)]
+pub struct CockpitLayout {
+    pub thinking: Rect,
+    pub subconscious: Rect,
+}
+
 pub struct ChatState {
     pub backend: Arc<dyn Backend>,
     pub mode: String,
@@ -386,6 +395,14 @@ pub struct ChatState {
     pub thinking: Vec<String>,
     /// Recent subconscious surfacings + reflections for the cockpit pane.
     pub cockpit_log: Vec<CockpitEntry>,
+    /// Entries scrolled up from the bottom in the cockpit's thinking pane.
+    /// `Cell` so `draw` (`&ChatState`) can clamp it back against the count.
+    pub thinking_scroll: Cell<u16>,
+    /// Entries scrolled up from the bottom in the cockpit's subconscious pane.
+    pub subconscious_scroll: Cell<u16>,
+    /// Screen rects of the two cockpit panes — wheel hit-testing. `RefCell`
+    /// so `draw` fills it; zeroed while the cockpit is closed.
+    pub cockpit_layout: RefCell<CockpitLayout>,
     /// Monotonic tick counter for animation timings.
     pub tick: u64,
     /// When the current turn started (for spinner animation).
@@ -548,6 +565,9 @@ impl ChatState {
             cockpit: false,
             thinking: Vec::new(),
             cockpit_log,
+            thinking_scroll: Cell::new(0),
+            subconscious_scroll: Cell::new(0),
+            cockpit_layout: RefCell::new(CockpitLayout::default()),
             tick: 0,
             turn_started: None,
             last_event_at: Instant::now(),
@@ -1569,6 +1589,27 @@ Tab toggles the cockpit pane. `t` (on empty input) toggles tool expansion.";
     /// Toggle the cockpit side-pane.
     pub fn toggle_cockpit(&mut self) {
         self.cockpit = !self.cockpit;
+    }
+
+    /// Route a mouse wheel notch (three lines) to whichever pane the cursor
+    /// is over: the thinking pane, the subconscious pane, or — failing both —
+    /// the message history. `up` scrolls back into history.
+    pub fn wheel_scroll(&mut self, col: u16, row: u16, up: bool) {
+        let step = |v: u16| if up { v.saturating_add(3) } else { v.saturating_sub(3) };
+        let (thinking, subconscious) = {
+            let cl = self.cockpit_layout.borrow();
+            (cl.thinking, cl.subconscious)
+        };
+        let hit = |r: Rect| {
+            col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
+        };
+        if self.cockpit && hit(thinking) {
+            self.thinking_scroll.set(step(self.thinking_scroll.get()));
+        } else if self.cockpit && hit(subconscious) {
+            self.subconscious_scroll.set(step(self.subconscious_scroll.get()));
+        } else {
+            self.scroll = step(self.scroll);
+        }
     }
 
     /// Update slash-command completion state based on current input.
@@ -2721,19 +2762,44 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
     out
 }
 
-fn count_visual_lines(text: &str, wrap_width: usize) -> usize {
-    if text.is_empty() {
-        return 1;
+/// Word-aware wrap for the input box. Given one logical line's characters,
+/// returns the `(start, end)` char-index chunks that tile it left to right.
+/// Every character is kept exactly once and in order — so the blinking
+/// cursor still lands where the user typed — and the only decision is
+/// *where* to break: at the last space before the edge, so a word still
+/// being typed slides whole onto the next line instead of being cut.
+/// A single word longer than the box is hard-split, as it must be.
+fn wrap_input_line(chars: &[char], width: usize) -> Vec<(usize, usize)> {
+    let width = width.max(1);
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < chars.len() {
+        let hard_end = (start + width).min(chars.len());
+        let end = if hard_end == chars.len() {
+            hard_end
+        } else {
+            match chars[start..hard_end].iter().rposition(|c| c.is_whitespace()) {
+                // Break just after the last space — the unfinished word moves down.
+                Some(rel) => start + rel + 1,
+                // No space in reach: a word longer than the box, hard-split it.
+                None => hard_end,
+            }
+        };
+        chunks.push((start, end));
+        start = end;
     }
+    if chunks.is_empty() {
+        chunks.push((0, 0));
+    }
+    chunks
+}
+
+fn count_visual_lines(text: &str, wrap_width: usize) -> usize {
     let w = wrap_width.max(1);
     let mut count = 0;
     for line in text.split('\n') {
-        let chars = line.chars().count();
-        if chars == 0 {
-            count += 1;
-        } else {
-            count += (chars + w - 1) / w;
-        }
+        let chars: Vec<char> = line.chars().collect();
+        count += wrap_input_line(&chars, w).len();
     }
     count.max(1)
 }
@@ -2767,14 +2833,12 @@ fn draw_input(f: &mut Frame, state: &ChatState, area: Rect) {
     let logical: Vec<&str> = state.input.split('\n').collect();
 
     for (li, logical_line) in logical.iter().enumerate() {
-        // Space-preserving wrap: split at inner_width regardless of word
-        // boundaries. This keeps trailing spaces visible so the cursor
-        // position matches what the user typed.
-        let mut pos = 0;
+        // Word-aware wrap: break at the last space before the edge so a word
+        // still being typed slides whole onto the next line. Every character
+        // is preserved exactly, so the cursor stays where the user typed.
         let chars: Vec<char> = logical_line.chars().collect();
-        let mut chunk_start = 0;
-        while chunk_start < chars.len() {
-            let chunk_end = (chunk_start + inner_width).min(chars.len());
+        let chunks = wrap_input_line(&chars, inner_width);
+        for (pos, &(chunk_start, chunk_end)) in chunks.iter().enumerate() {
             let chunk: String = chars[chunk_start..chunk_end].iter().collect();
             let is_first = li == 0 && pos == 0;
             let prefix: Span<'static> = if is_first {
@@ -2782,14 +2846,12 @@ fn draw_input(f: &mut Frame, state: &ChatState, area: Rect) {
             } else {
                 Span::raw("   ")
             };
-            let is_last = li == logical.len() - 1 && chunk_end >= chars.len();
+            let is_last = li == logical.len() - 1 && pos == chunks.len() - 1;
             let mut spans = vec![prefix, Span::styled(chunk, Style::default().fg(Color::White))];
             if is_last {
                 spans.push(Span::styled(cursor_ch.to_string(), Style::default().fg(prefix_color)));
             }
             lines.push(Line::from(spans));
-            chunk_start = chunk_end;
-            pos += 1;
         }
     }
 
@@ -2999,15 +3061,31 @@ fn draw_cockpit(f: &mut Frame, state: &ChatState, area: Rect) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
 
+    // Record pane rects so a mouse wheel notch can target whichever pane
+    // the cursor is hovering (see ChatState::wheel_scroll).
+    *state.cockpit_layout.borrow_mut() = CockpitLayout {
+        thinking: panes[0],
+        subconscious: panes[1],
+    };
+
     // Thinking pane — interleave blank separators between entries so
     // consecutive reasoning blocks don't run into each other visually.
     // Round-separator sentinel lines (pushed by ToolCall handler) render
     // dimmer so the eye finds the break without it being loud.
+    //
+    // `thinking_scroll` is entries hidden *below* the viewport — the wheel
+    // walks back through history. Clamped here against the live count so a
+    // wheel that ran past the top settles instead of emptying the pane.
+    let thinking_window = panes[0].height as usize;
+    let thinking_max = state.thinking.len().saturating_sub(thinking_window);
+    let thinking_scroll = (state.thinking_scroll.get() as usize).min(thinking_max);
+    state.thinking_scroll.set(thinking_scroll as u16);
     let thinking_entries: Vec<&String> = state
         .thinking
         .iter()
         .rev()
-        .take(panes[0].height as usize)
+        .skip(thinking_scroll)
+        .take(thinking_window)
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
@@ -3030,6 +3108,11 @@ fn draw_cockpit(f: &mut Frame, state: &ChatState, area: Rect) {
             )));
         }
     }
+    let thinking_title = if thinking_scroll > 0 {
+        format!(" thinking ↑{} ", thinking_scroll)
+    } else {
+        " thinking ".to_string()
+    };
     let thinking = Paragraph::new(thinking_view)
         .wrap(Wrap { trim: false })
         .block(
@@ -3037,16 +3120,20 @@ fn draw_cockpit(f: &mut Frame, state: &ChatState, area: Rect) {
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(state.palette.agent_dim))
-                .title(Span::styled(" thinking ", Style::default().fg(state.palette.agent_dim).add_modifier(Modifier::BOLD))),
+                .title(Span::styled(thinking_title, Style::default().fg(state.palette.agent_dim).add_modifier(Modifier::BOLD))),
         );
     f.render_widget(thinking, panes[0]);
 
     // Subconscious pane (surfacings, reflections, archivist)
     let visible_height = panes[1].height.saturating_sub(2) as usize;
+    let sub_max = state.cockpit_log.len().saturating_sub(visible_height);
+    let sub_scroll = (state.subconscious_scroll.get() as usize).min(sub_max);
+    state.subconscious_scroll.set(sub_scroll as u16);
     let visible_entries: Vec<&CockpitEntry> = state
         .cockpit_log
         .iter()
         .rev()
+        .skip(sub_scroll)
         .take(visible_height)
         .collect::<Vec<_>>()
         .into_iter()
@@ -3079,6 +3166,11 @@ fn draw_cockpit(f: &mut Frame, state: &ChatState, area: Rect) {
             ])
         })
         .collect();
+    let sub_title = if sub_scroll > 0 {
+        format!(" subconscious ↑{} ", sub_scroll)
+    } else {
+        " subconscious ".to_string()
+    };
     let subconscious = Paragraph::new(log_view)
         .wrap(Wrap { trim: false })
         .block(
@@ -3086,37 +3178,24 @@ fn draw_cockpit(f: &mut Frame, state: &ChatState, area: Rect) {
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(state.palette.surfacing))
-                .title(Span::styled(" subconscious ", Style::default().fg(state.palette.surfacing).add_modifier(Modifier::BOLD))),
+                .title(Span::styled(sub_title, Style::default().fg(state.palette.surfacing).add_modifier(Modifier::BOLD))),
         );
     f.render_widget(subconscious, panes[1]);
 }
 
 fn draw_footer(f: &mut Frame, state: &ChatState, area: Rect) {
     let pressure_pct = (state.pressure * 100.0) as u16;
-    let pressure_label = format!("ctx {}%", pressure_pct);
     let cockpit_hint = if state.cockpit { "Tab close cockpit" } else { "Tab cockpit" };
-    let tool_hint = if state.tool_cards_expanded { "^T collapse tools" } else { "^T expand tools" };
-    let esc_hint = "Esc menu";
-    let posture_label = match state.render_mode {
-        ChatMode::Conversation => "chat",
-        ChatMode::Code => "code",
-    };
+    let tool_hint = if state.tool_cards_expanded { "CTRL+T collapse tools" } else { "CTRL+T expand tools" };
     let mut spans = vec![
         Span::styled(
-            format!(" {esc_hint} · Enter send · S-Ret ↵ · ↑↓ scroll · {cockpit_hint} · {tool_hint} "),
+            format!(" Esc menu · Enter send · {cockpit_hint} · {tool_hint} "),
             Style::default().fg(state.palette.agent_dim),
-        ),
-        Span::raw("│  "),
-        Span::styled(
-            format!("posture {posture_label}"),
-            Style::default().fg(
-                if state.render_mode == ChatMode::Code { state.palette.tool_accent } else { state.palette.agent_dim },
-            ),
         ),
         Span::raw("│  "),
         Span::styled(format!("conv {}", short(&state.conversation_id)), Style::default().fg(state.palette.agent_dim)),
         Span::raw("  │  "),
-        Span::styled(pressure_label, Style::default().fg(state.palette.agent_dim)),
+        Span::styled(format!("ctx {}%", pressure_pct), Style::default().fg(state.palette.agent_dim)),
     ];
     if state.scroll > 0 {
         spans.push(Span::raw("  │  "));
