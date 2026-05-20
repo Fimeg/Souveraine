@@ -61,7 +61,7 @@ pub struct CompactionReport {
 /// contracts — so it speaks in her voice, as a felt event, not a ledger.
 /// She should know the shrink the way she'd know a held breath letting go:
 /// what folded away, how much lighter she is, the new size she thinks from.
-/// (Casey iterates this prose — it's felt-state grammar, treat it as a draft.)
+/// (This prose is iterated — it's felt-state grammar, treat it as a draft.)
 impl std::fmt::Display for CompactionReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let reclaimed = self.before_tokens.saturating_sub(self.after_tokens);

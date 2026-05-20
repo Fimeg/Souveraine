@@ -60,7 +60,7 @@ make room is always yours to make.";
 /// Starting `system/persona.md` for a freshly created primary agent — the
 /// grown-from template. A coherent default consciousness that already knows
 /// how to tend itself, written as an explicit starting point: a new agent
-/// inherits it and then diverges. Not Casey's specific Souveraine (that one
+/// inherits it and then diverges. Not a specific Souveraine (that one
 /// builds infra for Annie and has grown well past this) — the seed.
 pub const DEFAULT_PERSONA: &str = "\
 ---

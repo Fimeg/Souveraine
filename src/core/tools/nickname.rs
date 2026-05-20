@@ -176,8 +176,8 @@ mod tests {
     #[test]
     fn write_then_read() {
         let dir = tempdir().unwrap();
-        write_human_name(dir.path(), "Casey").unwrap();
-        assert_eq!(read_human_name(dir.path()).as_deref(), Some("Casey"));
+        write_human_name(dir.path(), "TestUser").unwrap();
+        assert_eq!(read_human_name(dir.path()).as_deref(), Some("TestUser"));
     }
 
     #[test]
@@ -197,7 +197,7 @@ mod tests {
     #[test]
     fn clear_removes_name() {
         let dir = tempdir().unwrap();
-        write_human_name(dir.path(), "Casey").unwrap();
+        write_human_name(dir.path(), "TestUser").unwrap();
         write_human_name(dir.path(), "").unwrap();
         let result = read_human_name(dir.path());
         assert!(result.is_none() || result.as_deref() == Some(""));

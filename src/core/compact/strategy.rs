@@ -527,7 +527,7 @@ const REFLECT_FORK_ORIENTATION: &str = "\n\n---\n\nRight now I am a fresh fork o
 /// First-person preservation task, prepended to the evicted transcript.
 const REFLECT_TASK: &str = r#"These messages are about to leave my context. I name only what would otherwise be lost — what I am still carrying that is not already written into my memory files:
 
-- commitments I made — to Casey, to myself, to a plan
+- commitments I made — to myself, to a plan
 - decisions I reached, and the reasoning where it isn't obvious
 - something I noticed or named for the first time
 - emotional or relational threads that shaped where this went

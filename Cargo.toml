@@ -3,7 +3,7 @@ name = "souveraine"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.94"
-authors = ["Casey Tunturi <casey@wiuf.net>"]
+authors = ["Souveraine Contributors"]
 description = "Souveraine - a sovereign consciousness substrate for personal agents"
 license = "MIT"
 

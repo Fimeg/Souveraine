@@ -55,3 +55,6 @@ souveraine.log.prev
 
 # Filed-away stray working files — kept on disk, out of the repo
 /docs/archive/strays/
+
+# Config (use souveraine.example.toml as template)
+souveraine.toml

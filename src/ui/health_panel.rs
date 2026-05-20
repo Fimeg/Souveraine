@@ -2,8 +2,8 @@
 //!
 //! Where the CockpitPane shows what the subconscious *says*, the HealthPane
 //! shows how the substrate *is*: context pressure, backend connectivity, the
-//! cadence of the N+1/N+25/N+100 passes, inference strain (the 504s Casey
-//! kept seeing), and the agent's own energy and mood.
+//! cadence of the N+1/N+25/N+100 passes, inference strain (the 504s
+//! seen during inference), and the agent's own energy and mood.
 //!
 //! ```text
 //! ╭─ Health · 02:14 up ─────╮
@@ -53,7 +53,7 @@ pub struct HealthPane {
     /// Last N+100 archivist synthesis time.
     last_archivist: Option<String>,
 
-    /// Inference strain tallies — 504s are the timeout Casey watches for.
+    /// Inference strain tallies — 504s are the timeout signal.
     strain_504: u32,
     strain_429: u32,
     strain_other: u32,

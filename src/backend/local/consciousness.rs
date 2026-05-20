@@ -168,7 +168,7 @@ impl crate::core::nervous::handler::TurnInjector for LocalBackend {
 /// lettabot-v017's `readSurfacingThoughts` + `clearSurfacingThoughts` pair
 /// (`~/Projects/lettabot-v017/src/core/prompts.ts:64-91`) — the substrate
 /// reads the channel subconscious wrote to and lets the conscious mind see it
-/// before she reads Casey.
+/// before she reads the user.
 ///
 /// Critical urgency gets `[ surfacing — CRITICAL: ... ]`. High becomes
 /// `[ surfacing — !: ... ]`. Low/none keep the bare form. The shape is a

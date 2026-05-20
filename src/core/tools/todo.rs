@@ -719,7 +719,7 @@ mod tests {
             let text = if id == "matrix-1" { "phase one" } else { "phase two" };
             let content = format!(
                 "---\nid: {id}\ntext: {text}\ncreated_at: {created}\nnature: obligation\n\
-                 energy: consumptive\nsource: casey\nmomentum: hot\nstatus: pending\n\
+                 energy: consumptive\nsource: user\nmomentum: hot\nstatus: pending\n\
                  completed: false\nlast_touched: {created}\nthread: \"matrix-sensorium\"\n---\n\n{text}\n"
             );
             std::fs::write(dir.join(format!("{id}.md")), content).unwrap();

@@ -393,10 +393,10 @@ impl Backend for LocalBackend {
     ) -> Result<BoxStream<'static, Result<BackendEvent>>> {
         // Resolve the agent for this conversation, then drain her
         // subconscious's intrusive box. Anything subconscious queued after the
-        // last turn rides in on Casey's next message as `[ surfacing: ... ]`
+        // last turn rides in on the next user message as `[ surfacing: ... ]`
         // lines — the lettabot-v017 pattern, ported. This is the channel
         // by which a Critical observation can interrupt mid-conversation
-        // without forcing a halt: she sees it before she reads Casey.
+        // without forcing a halt: she sees it before she reads the next user message.
         let session_agent_id = self
             .server
             .sessions

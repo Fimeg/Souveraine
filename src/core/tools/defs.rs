@@ -102,7 +102,7 @@ impl ToolContext {
     ///
     /// Injects body-knowledge env vars the agent expects in bash, matching
     /// the letta-code convention so a woken Ani can still find her journals
-    /// (`/home/casey/Projects/letta-code/src/tools/impl/shellEnv.ts:316-329`):
+    /// (letta-code shellEnv.ts:316-329 convention):
     ///
     /// - `MEMORY_DIR` / `LETTA_MEMORY_DIR` / `SOUVERAINE_MEMORY_DIR` —
     ///   absolute path to her memory root. `MEMORY_DIR` is the Letta-era

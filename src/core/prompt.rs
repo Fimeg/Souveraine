@@ -446,7 +446,7 @@ pub async fn build_system_prompt_full(
     }
 
     // 5a₂. Itinerary prompt — if I have live commitments and no active
-    // itinerary, remind me I can lay one out so Casey sees where I am.
+    // itinerary, remind me I can lay one out so the user sees where I am.
     let dynamic_dir = memory_root.join("system").join("dynamic");
     let itin_path = dynamic_dir.join("itinerary.md");
     let has_itin = tokio::fs::try_exists(&itin_path).await.unwrap_or(false)
@@ -461,7 +461,7 @@ pub async fn build_system_prompt_full(
         if live_count > 0 && live_count <= 12 {
             sections.push(format!(
                 "I have {} live commitments — I could use `itinerary` to lay them \
-                 out for Casey if now is the time for a route.",
+                 out for the user if now is the time for a route.",
                 live_count,
             ));
         }
@@ -555,7 +555,7 @@ async fn build_subconscious_channel(
     body.push_str(
         "\nReach for these when something feels unfinished — she may have noticed \
          a commitment you let slip, a pattern, a tone shift. She does not speak \
-         to Casey. You decide what to surface.\n",
+         to the user. You decide what to surface.\n",
     );
 
     if !recent.is_empty() {

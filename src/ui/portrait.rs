@@ -54,7 +54,7 @@ pub const RENDER_H: u16 = PORTRAIT_H / 2;
 
 // ── Base portrait grid — clean silhouette, no face ──────────────────────
 // This is the EMERGENCY default. The hand-crafted "Annie face" version
-// read as a creepy llama (Casey's words), so this is now a faceless
+// read as a creepy llama, so this is now a faceless
 // silhouette: hair, neck, collar. State animation lives in border color,
 // breath luminance pulse, and posture-driven color modulation — never in
 // per-pixel row swaps at this resolution. True facial animation belongs
