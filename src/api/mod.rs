@@ -44,8 +44,8 @@ pub fn create_routes(state: Arc<SouveraineServer>) -> Router {
 
     // Memory routes — require per-agent bearer token.
     //
-    // (memfs HTTP write path — replaces Letta's PATCH /v1/blocks/{id}
-    // for cron-into-memfs and external integration. See docs/MEMORY_BLOCKS_DECISION.md.)
+    // (memfs HTTP write path for cron-into-memfs and external integration.
+    // See docs/MEMORY_BLOCKS_DECISION.md.)
     let memory_routes = Router::new()
         .route(
             "/v1/agents/:id/memory",

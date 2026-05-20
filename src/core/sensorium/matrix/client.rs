@@ -1,13 +1,7 @@
 //! Matrix transport — `matrix-sdk` client construction, session
 //! persistence, and the sync loop.
 //!
-//! This is the Rust equivalent of letta-code's `matrix/client.ts`, but
-//! almost none of that file survives the port. His `client.ts` is a
-//! transport *shim*: an undici dispatcher and a fetch-backed request
-//! function that work around Bun's socket pooling and `matrix-bot-sdk`'s
-//! deprecated `request` library. `matrix-sdk` owns its own HTTP transport,
-//! so all of that pain is simply gone here. What remains — and what this
-//! file actually does — is the genuine work: build a client against a
+//! Builds a client against a
 //! homeserver, restore or establish a session, and drive `/sync`.
 //!
 //! Credentials live next to an encrypted SQLite store under

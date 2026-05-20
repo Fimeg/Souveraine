@@ -1,11 +1,9 @@
 //! Atmospheric visual presets — color themes that shift the UI's accent palette.
 //!
-//! Atmospheric visual presets — originally built for Letta's Matrix adapter
-//! (html-formatter.ts ATMOSPHERIC_PRESETS), ported here so Annie can express
-//! mood through the terminal chrome: border colors, title accents, background
-//! tints, and per-character text gradients in chat bubbles. The agent sets
-//! atmosphere via a structured event; when none is set, a posture-linked
-//! default applies.
+//! Atmospheric visual presets — ported here so Annie can express mood through
+//! the terminal chrome: border colors, title accents, background tints, and
+//! per-character text gradients in chat bubbles. The agent sets atmosphere via
+//! a structured event; when none is set, a posture-linked default applies.
 //!
 //! Each preset carries four tones: a primary accent (borders, titles), a secondary
 //! accent (subtle highlights), a dim muted shade, and a background tint.

@@ -59,7 +59,7 @@ impl App {
         cards
     }
 
-    /// Render the agent manager — Letta-style card deck. Each card has:
+    /// Render the agent manager — card deck. Each card has:
     ///   • a status badge (ACTIVE / PRIMARY) in the top-right
     ///   • a scale-to-fit portrait photo occupying the top ~55% of the card
     ///   • a dark metadata block below the photo, holding:
@@ -103,7 +103,7 @@ impl App {
         }
 
         // ── Grid math ─────────────────────────────────────────────────
-        // Letta shows 4 cards across; we pick the column count based on
+        // Shows 4 cards across; we pick the column count based on
         // available width so terminals down to ~50 cols still get usable
         // cards. Each card is taller than wide (portrait-style).
         let pad_x: u16 = 2;

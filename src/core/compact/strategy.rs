@@ -7,15 +7,14 @@ use crate::core::session::ConversationMessage;
 use super::config::{AgentCompactionConfig, CompactionStrategyKind};
 use super::plan::CompactionPlan;
 
-/// From OpenHarness/Claude Code microCompact.ts: tools whose results are
-/// considered compactable (large outputs, rarely needed verbatim once
-/// surpassed). Matches Souveraine's actual sensor names.
+/// Tools whose results are considered compactable (large outputs, rarely
+/// needed verbatim once surpassed). Matches Souveraine's actual sensor names.
 const COMPACTABLE_TOOLS: &[&str] = &[
     "read", "bash", "grep", "glob", "list_dir", "edit", "write",
 ];
 
 /// Placeholder text written into tool result blocks that get microcompacted.
-/// Matches the OpenHarness/Claude Code literal so logs read the same.
+/// Placeholder used so logs read consistently across runs.
 const TIME_BASED_MC_CLEARED_MESSAGE: &str = "[Old tool result content cleared]";
 
 /// Token-count a slice of messages using the bridge's TokenCounter.
@@ -75,8 +74,7 @@ async fn bifrost_complete(
 // ── Summary Strategy ─────────────────────────────────────────────────────────
 
 /// LLM-based summarization producing a structured 9-section boundary message.
-/// Prompt structure ported from OpenHarness's port of Claude Code's
-/// `autoCompact.ts`. The structure is what makes the compact *survivable*:
+/// The structure is what makes the compact *survivable*:
 /// the agent reads the boundary on the next turn and can resume with full
 /// awareness of intent, files, decisions, and pending work.
 pub struct SummaryStrategy {
@@ -205,8 +203,7 @@ fn render_segment_for_summary(messages: &[ConversationMessage]) -> String {
 
 /// Cheap pre-pass that replaces the contents of old tool results with a
 /// placeholder, keeping the most recent `microcompact_keep_recent` results
-/// intact. No LLM call. From OpenHarness's port of Claude Code's
-/// `microCompact.ts`.
+/// intact. No LLM call.
 ///
 /// The agent typically reaches for this *first*: it gets back significant
 /// context room without losing the structure of the conversation. The tool

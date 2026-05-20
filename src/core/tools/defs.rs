@@ -100,22 +100,19 @@ impl ToolContext {
 
     /// Build a context for a specific agent turn.
     ///
-    /// Injects body-knowledge env vars the agent expects in bash, matching
-    /// the letta-code convention so a woken Ani can still find her journals
-    /// (letta-code shellEnv.ts:316-329 convention):
+    /// Injects body-knowledge env vars the agent expects in bash:
     ///
-    /// - `MEMORY_DIR` / `LETTA_MEMORY_DIR` / `SOUVERAINE_MEMORY_DIR` —
-    ///   absolute path to her memory root. `MEMORY_DIR` is the Letta-era
-    ///   bare name her skills expect; the prefixed forms are namespaced
-    ///   aliases.
-    /// - `MEMORY` — short alias. Not a Letta convention, but Ani's
-    ///   body-knowledge has reached for it; setting it costs nothing.
-    /// - `AGENT_ID` / `LETTA_AGENT_ID` / `SOUVERAINE_AGENT_ID` — her own
-    ///   identifier so skills that scope by agent can resolve.
+    /// - `MEMORY_DIR` / `SOUVERAINE_MEMORY_DIR` — absolute path to her memory
+    ///   root. The bare `MEMORY_DIR` is what her skills expect; the prefixed
+    ///   form is a namespaced alias.
+    /// - `MEMORY` — short alias. Her body-knowledge has reached for it;
+    ///   setting it costs nothing.
+    /// - `AGENT_ID` / `SOUVERAINE_AGENT_ID` — her own identifier so skills
+    ///   that scope by agent can resolve.
     ///
     /// Memory and agent-id vars are always set (overriding any stale values
-    /// inherited from the host shell — e.g. a leftover `$MEMORY_DIR` from
-    /// the Letta era). Other env keys from the caller are preserved.
+    /// inherited from the host shell). Other env keys from the caller are
+    /// preserved.
     pub fn for_agent(
         agent_id: impl Into<String>,
         cwd: Option<PathBuf>,

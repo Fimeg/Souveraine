@@ -16,7 +16,7 @@
 //! 3. **Agent** — `<agent-memfs>/skills/` — skills attached to one agent.
 //!    Versioned in the agent's git memfs; survives migration.
 //! 4. **Project** — `.skills/` in the working directory — repo-local skills,
-//!    highest priority. Cameron's pattern from Letta Code.
+//!    highest priority.
 //!
 //! Higher tiers shadow lower tiers by skill name. The full resolution table
 //! is built at session start and can be inspected via `skill ls`.
@@ -137,7 +137,7 @@ impl SkillRegistry {
     }
 
     /// Render a system-prompt fragment listing all skills.
-    /// Format mirrors Letta Code's available-skills section.
+    /// Format mirrors the Souveraine available-skills section.
     pub fn render_system_addon(&self) -> String {
         if self.skills.is_empty() {
             return String::new();

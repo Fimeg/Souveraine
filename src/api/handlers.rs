@@ -264,7 +264,6 @@ async fn handle_conversation_stream(
 
 // ─── Memory (memfs HTTP write path) ───────────────────────────────────────
 //
-// Replaces Letta's PATCH /v1/blocks/{id} for the cron-into-memfs pattern.
 // Routes:
 //   GET    /v1/agents/:id/memory                — list (?prefix=subdir)
 //   GET    /v1/agents/:id/memory/*path          — read file

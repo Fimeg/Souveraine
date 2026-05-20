@@ -319,7 +319,7 @@ mod tests {
         repo.init().await.unwrap();
 
         // A legacy / corrupt box: frontmatter + prose body that is not a
-        // YAML item list — exactly what a Letta-era import or a hand-edit
+        // YAML item list — exactly what a legacy import or a hand-edit
         // leaves behind. Before the fix this killed every surfacing path.
         repo.write(
             PENDING,

@@ -123,15 +123,12 @@ impl Default for AgentCompactionConfig {
     }
 }
 
-/// Available compaction strategies. Synthesized from OpenHarness
-/// (port of Claude Code's microCompact.ts / autoCompact.ts), hermes-agent,
-/// claw-open, and jcode. See `docs/tasks/compaction-rebuild.md`.
+/// Available compaction strategies. See `docs/tasks/compaction-rebuild.md`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum CompactionStrategyKind {
     /// Cheap pre-pass: replace old tool result contents with a placeholder,
-    /// keeping recent tool results intact. No LLM. From OpenHarness/Claude
-    /// Code microCompact.ts. The first response to context pressure.
+    /// keeping recent tool results intact. No LLM. The first response to context pressure.
     Microcompact,
     /// Keep system + last N messages, drop the middle. No LLM. Fast.
     /// Tool-pair aware: never splits a tool call from its result.
@@ -145,7 +142,7 @@ pub enum CompactionStrategyKind {
     /// caught before they fall out of awareness.
     SlidingReflect,
     /// LLM-based structured summarization of oldest messages, producing a
-    /// 9-section boundary message (from OpenHarness/Claude Code autoCompact.ts).
+    /// 9-section structured boundary message.
     Summary,
     /// Drop low-value messages (greetings, acknowledgments). Role-aware:
     /// never drops System or Tool messages or tool-call carriers.

@@ -165,8 +165,7 @@ impl crate::core::nervous::handler::TurnInjector for LocalBackend {
 /// Drain subconscious's intrusive box for the given agent and return formatted
 /// `[ surfacing: ... ]` lines ready to prepend to the user's next message.
 /// Marks each drained item as delivered (moved to `sent.md`). Mirrors
-/// lettabot-v017's `readSurfacingThoughts` + `clearSurfacingThoughts` pair
-/// (`~/Projects/lettabot-v017/src/core/prompts.ts:64-91`) — the substrate
+/// the `readSurfacingThoughts` + `clearSurfacingThoughts` pair — the substrate
 /// reads the channel subconscious wrote to and lets the conscious mind see it
 /// before she reads the user.
 ///

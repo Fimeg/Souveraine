@@ -71,7 +71,7 @@ pub(crate) async fn write_energy_balance(server: &Arc<SouveraineServer>, agent_i
     }
 
     // Determine the top-of-mind description — shifts the tone of the one-liner
-    // the agent reads in context. Matches the lettabot-v017 heartbeat topology.
+    // the agent reads in context.
     let ratio = if generative + consumptive > 0 {
         generative as f32 / (generative + consumptive) as f32
     } else {

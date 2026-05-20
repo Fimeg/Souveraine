@@ -1,13 +1,13 @@
 //! Bootstrap — declarative startup pipeline.
 //!
-//! Composes three patterns from reference projects:
+//! Composes three startup patterns:
 //!
-//! 1. **Claw-open's `BootstrapPlan`** — ordered phases, each self-contained,
+//! 1. **`BootstrapPlan`** — ordered phases, each self-contained,
 //!    composable, independently testable.
-//! 2. **Letta-code's pure-function resolver** — zero-I/O decision tree that
+//! 2. **Pure-function resolver** — zero-I/O decision tree that
 //!    maps a `BootstrapProbe` → `Resolution`. No side effects, no async,
 //!    fully testable by feeding probe fixtures.
-//! 3. **J code's progressive hints** — non-blocking advisory nudges that
+//! 3. **Progressive hints** — non-blocking advisory nudges that
 //!    escalate with launch count. The wizard is the heavy option; hints are
 //!    the light touch.
 //!

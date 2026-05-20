@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 
-/// Render the chat screen - Claude-like conversation interface
+/// Render the chat screen - conversation interface
 pub fn render_chat_screen(frame: &mut Frame, state: &dyn TuiState, area: Rect) {
     // Split into main chat area and sidebar
     let chunks = Layout::default()

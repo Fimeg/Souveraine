@@ -272,7 +272,7 @@ impl Tool for Todo {
                     .get("energy")
                     .and_then(|v| v.as_str())
                     .unwrap_or_else(|| {
-                        // Default by nature — same logic as lettabot-v017.
+                        // Default by nature
                         match nature {
                             "desire" | "investigation" => "generative",
                             _ => "consumptive",

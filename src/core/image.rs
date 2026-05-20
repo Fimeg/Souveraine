@@ -2,7 +2,6 @@
 //!
 //! Decodes raw image bytes, resizes to fit dimension/pixel budget, then
 //! progressively reduces quality and dimension to stay under the byte ceiling.
-//! Modeled on letta-code's sharp-backed pipeline.
 
 use std::io::Write;
 

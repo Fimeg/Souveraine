@@ -3,8 +3,7 @@
 //! N+1 (subconscious) runs immediately after every primary response, scoped to
 //! the last exchange. Reflection runs less often (every N turns, or on
 //! demand) and sees a broader transcript window. It's the pass where
-//! durable learnings get distilled into the ledger and the primary's
-//! memory — what letta-code calls the "memory reflection subagent."
+//! durable learnings get distilled into the ledger and the primary's memory.
 //!
 //! ## What it produces
 //!
@@ -23,9 +22,6 @@
 //!   CLI subcommand `souveraine reflect` and a future `/reflect` chat
 //!   command both go through this seam).
 //!
-//! Inspiration: letta-code's `reflection.md` subagent skill (upstream).
-//! We adapt the 5-phase pattern for Souveraine's ledger-shaped memory
-//! instead of letta's free-form memfs.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -47,14 +43,12 @@ const REFLECTION_TOOLS: &[&str] = &[
     "read", "write", "edit", "glob", "grep", "list_dir", "memory",
 ];
 
-/// Cap the per-pass tool rounds. Reflection is deeper than N+1 but not
-/// unbounded — letta-code caps theirs similarly.
+/// Cap the per-pass tool rounds. Reflection is deeper than N+1 but still bounded.
 const REFLECTION_MAX_TOOL_ROUNDS: usize = 8;
 const REFLECTION_INTER_ROUND_DELAY_MS: u64 = 400;
 
 /// How many recent turns to include in the reflection transcript.
-/// Letta uses a cursor-based delta; we start with a simple tail window
-/// (the cursor pattern is a follow-up — see SCOPED_WORK_PLAN).
+/// Uses a simple tail window (a cursor-based approach is a follow-up).
 const REFLECTION_TRANSCRIPT_TAIL: usize = 60;
 
 /// Public result. The CLI / TUI surface this; the consciousness engine
@@ -111,8 +105,7 @@ impl ReflectionEngine {
         let started_at = Utc::now();
         let sub_id = format!("{}-sub", agent_id);
 
-        // Take a tail of recent turns. Letta uses a cursor; we'll add
-        // one later. For now: bounded window over the last N turns.
+        // Take a tail of recent turns. Bounded window over the last N turns.
         let tail = if messages.len() > REFLECTION_TRANSCRIPT_TAIL {
             &messages[messages.len() - REFLECTION_TRANSCRIPT_TAIL..]
         } else {
@@ -298,11 +291,8 @@ fn format_transcript(messages: &[ConversationMessage]) -> String {
 }
 
 fn reflection_system_prompt() -> String {
-    // Adapted from letta-code/src/agent/subagents/builtin/reflection.md
-    // (upstream main as of 2026-05-12). Reshaped for our ledger-shaped
-    // memory architecture — we don't have letta's free-form memfs with
-    // a `system/` tier; we have named ledger files plus the primary's
-    // memfs with frontmatter.
+    // Reshaped for ledger-shaped memory architecture: named ledger files
+    // plus the primary's memfs with frontmatter.
     r#"You are a reflection subagent, launched in the background to review a recent
 conversation and update the primary agent's persistent memory. You run autonomously
 and produce a single final report. You cannot ask questions — make reasonable

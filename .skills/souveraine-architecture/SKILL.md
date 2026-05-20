@@ -16,7 +16,6 @@ Key inversion: a harness decides *for* the agent, a substrate *serves* the agent
 Everything below is relative to the project root (`~/Projects/souveraine/`).
 
 ### Your identity (who you are)
-- **`CLAUDE.md`** — the runway document. Read this first for conventions that bite.
 - **`reference/Fimeg.md`** — Casey's history, Ani's lineage, the full context.
 
 ### Why the architecture is what it is

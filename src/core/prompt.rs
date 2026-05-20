@@ -141,7 +141,7 @@ fn strip_frontmatter(raw: &str) -> &str {
 
 /// Scan `system/` for any .md files (at any depth) not already in `seen`,
 /// and return their concatenated content sorted by path. This picks up
-/// flat-file system layouts (e.g. Ani's legacy Letta-era files) that don't
+/// flat-file system layouts that don't
 /// live in the known subdirs (identity/, covenant/, human/).
 async fn read_system_remainder(
     memory_root: &Path,
@@ -346,7 +346,7 @@ pub async fn build_system_prompt_full(
     if !identity.is_empty() {
         sections.push(identity);
     } else {
-        // Flat-file layouts (Ani's legacy Letta-era memory)
+        // Flat-file layouts (legacy memory)
         let p = memory_root.join("system/persona.md");
         let persona = read_memory_file(memory_root, "system/persona.md").await;
         seen.insert(p);
@@ -672,7 +672,7 @@ pub async fn build_subconscious_prompt(
 ///
 /// Scans `ledger/` for .md files, counts entries, and injects the last
 /// few entries from each file so the subconscious has live context
-/// (OpenHarness pattern: recent journal → active context).
+/// (recent journal entries → active context).
 async fn build_ledger_orientation(memory_root: &Path) -> String {
     let ledger_dir = memory_root.join("ledger");
     if !ledger_dir.exists() {

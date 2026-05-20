@@ -19,8 +19,7 @@
 //! - `breath_phase` — continuous, always on, drives subtle bob and color pulse.
 //!
 //! Plus name, last surfacing, and a [`VolitionGauge`] that mirrors the energy
-//! topology (generative vs consumptive, hot desires vs cold obligations)
-//! brought over from production Letta. The gauge is *displayed* here as embodied
+//! topology (generative vs consumptive, hot desires vs cold obligations). The gauge is *displayed* here as embodied
 //! state (posture, warmth); the numbers themselves live in the agent's memfs.
 //!
 //! ## Event subscriptions

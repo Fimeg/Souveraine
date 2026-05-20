@@ -50,9 +50,9 @@ use client::{account_dir, build_client, load_session_record, save_session_record
 ///
 /// Phase 3 stub: it knows which room a turn belongs to and accumulates the
 /// segments that turn emits. Phase 5 grows this into the full streaming
-/// turn model ported from letta-code's `ChatTurn` — throttled leading-edge
-/// message edits, tool blocks, thinking blocks. For now it is just enough
-/// state for the EventBus loop to have somewhere to put what it hears.
+/// turn model — throttled leading-edge message edits, tool blocks, thinking
+/// blocks. For now it is just enough state for the EventBus loop to have
+/// somewhere to put what it hears.
 #[allow(dead_code)]
 #[derive(Debug, Default)]
 pub struct MatrixTurn {
@@ -211,8 +211,7 @@ impl Sensorium for MatrixSensorium {
         // ── Inbound: register handlers before sync ───────────────────
         // Fire `sensorium:input` onto the EventBus for every room
         // message so the SensoriumInputHandler picks it up and routes
-        // it to the backend. This is the seam — same as letta-code's
-        // `adapter.onMessage = (msg) => registry.handleInboundMessage(msg)`.
+        // it to the backend.
         let bus = events.clone();
         let account = self.account.clone();
         let agent_id = self.agent_id.clone();

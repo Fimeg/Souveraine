@@ -7,8 +7,7 @@
 //! - TTS: `POST /audio/speech` — JSON `{ input, voice, model }`, returns mp3
 //!   bytes.
 //!
-//! Text is cleaned before synthesis via [`clean_text_for_tts`] — ported
-//! verbatim from `letta-code/src/channels/matrix/tts.ts` lines 52–103.
+//! Text is cleaned before synthesis via [`clean_text_for_tts`].
 
 use anyhow::{Context, Result};
 

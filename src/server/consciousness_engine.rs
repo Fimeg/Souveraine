@@ -147,10 +147,9 @@ impl ConsciousnessEngine {
 
     /// Get or create the subconscious's persistent session. The subconscious
     /// is a full agent with her own conversation that accumulates across N+1
-    /// passes — just like Aster had CONSCIENCE_CONVERSATION_ID in Letta.
-    ///
-    /// The conversation survives process restarts: every `add_message` writes
-    /// to disk, and this restores it from the conversation store on first use.
+    /// passes. The conversation survives process restarts: every `add_message`
+    /// writes to disk, and this restores it from the conversation store on
+    /// first use.
     async fn subconscious_session_id(&self, sub_id: &str) -> String {
         // Already live in memory?
         let existing = self.sessions.list_for_agent(sub_id);

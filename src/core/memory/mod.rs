@@ -15,7 +15,7 @@
 //! memory compact --strategy sliding-window
 //! ```
 //!
-//! Design follows the Letta Code memory tool pattern:
+//! Design:
 //! - All files require YAML frontmatter with `description`
 //! - `read_only: true` in frontmatter blocks writes
 //! - Every write is a git commit (auto-commit)
@@ -50,8 +50,8 @@ pub struct MemoryFrontmatter {
     #[serde(default)]
     pub tags: Option<Vec<String>>,
     /// Optional max body size in characters. Writes/appends that would exceed
-    /// this length are rejected. Closes the LET-8133 gap that exists upstream
-    /// (Letta's memfs write path bypasses block `limit`).
+    /// this length are rejected. Closes a gap where upstream memfs write path
+    /// bypasses block `limit`.
     ///
     /// Units are characters, not tokens — cheap to enforce without a tokenizer.
     /// Best-practice default for system/ files: 4_000 characters
