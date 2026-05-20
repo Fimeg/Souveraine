@@ -90,8 +90,11 @@ fn draw_field_panel(frame: &mut Frame, area: Rect, view: &SettingsView) {
     lines.push(Line::from(""));
 
     let p = &view.palette;
+    let has_applies_live = fields.iter().any(|(loc, _)| loc.applies_live());
+
     for (i, (loc, value)) in fields.iter().enumerate() {
-        let is_selected = i == view.field_idx && view.focus == PanelFocus::Fields;
+        let is_readonly = loc.is_readonly();
+        let is_selected = i == view.field_idx && view.focus == PanelFocus::Fields && !is_readonly;
         let key_style = if is_selected {
             Style::default().fg(p.agent_primary).add_modifier(Modifier::BOLD)
         } else {
@@ -103,24 +106,26 @@ fn draw_field_panel(frame: &mut Frame, area: Rect, view: &SettingsView) {
         ];
 
         // If this field is being edited, show the buffer with cursor.
-        if let SettingsMode::Editing { loc: edit_loc, buffer, cursor } = &view.mode {
-            if *edit_loc == *loc {
-                let before = &buffer[..*cursor];
-                let after = &buffer[*cursor..];
-                spans.push(Span::styled(
-                    before.to_string(),
-                    Style::default().fg(p.agent_primary).add_modifier(Modifier::BOLD),
-                ));
-                spans.push(Span::styled(
-                    '▏'.to_string(),
-                    Style::default().fg(Color::White).add_modifier(Modifier::SLOW_BLINK),
-                ));
-                spans.push(Span::styled(
-                    after.to_string(),
-                    Style::default().fg(p.agent_primary).add_modifier(Modifier::BOLD),
-                ));
-                lines.push(Line::from(spans));
-                continue;
+        if !is_readonly {
+            if let SettingsMode::Editing { loc: edit_loc, buffer, cursor } = &view.mode {
+                if *edit_loc == *loc {
+                    let before = &buffer[..*cursor];
+                    let after = &buffer[*cursor..];
+                    spans.push(Span::styled(
+                        before.to_string(),
+                        Style::default().fg(p.agent_primary).add_modifier(Modifier::BOLD),
+                    ));
+                    spans.push(Span::styled(
+                        '▏'.to_string(),
+                        Style::default().fg(Color::White).add_modifier(Modifier::SLOW_BLINK),
+                    ));
+                    spans.push(Span::styled(
+                        after.to_string(),
+                        Style::default().fg(p.agent_primary).add_modifier(Modifier::BOLD),
+                    ));
+                    lines.push(Line::from(spans));
+                    continue;
+                }
             }
         }
 
@@ -131,11 +136,13 @@ fn draw_field_panel(frame: &mut Frame, area: Rect, view: &SettingsView) {
         lines.push(Line::from(spans));
     }
 
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "  ◆ applies live · other changes take effect on restart",
-        Style::default().fg(p.agent_dim).add_modifier(Modifier::ITALIC),
-    )));
+    if has_applies_live {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  ◆ applies live · other changes take effect on restart",
+            Style::default().fg(p.agent_dim).add_modifier(Modifier::ITALIC),
+        )));
+    }
 
     let focused = view.focus == PanelFocus::Fields;
     let border_color = if view.dirty {

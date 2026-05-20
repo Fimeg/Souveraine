@@ -173,6 +173,12 @@ pub enum FieldLoc {
     // TUI
     TuShowInterstitial,
     TuCennoThreshold,
+    // Agent (read-only diagnostics)
+    AgAgentId,
+    AgSubconsciousId,
+    AgMemoryPath,
+    AgSubconsciousPath,
+    AgSubconsciousStatus,
 }
 
 impl FieldLoc {
@@ -198,6 +204,8 @@ impl FieldLoc {
             FieldLoc::PrPulseEnabled | FieldLoc::PrPulseIntervalSecs | FieldLoc::PrOutfit | FieldLoc::PrAtmosphere => Category::Presence,
             FieldLoc::VcEnabled | FieldLoc::VcSttUrl | FieldLoc::VcTtsUrl | FieldLoc::VcVoiceId | FieldLoc::VcPushToTalkKey => Category::Voice,
             FieldLoc::TuShowInterstitial | FieldLoc::TuCennoThreshold => Category::Tui,
+            FieldLoc::AgAgentId | FieldLoc::AgSubconsciousId | FieldLoc::AgMemoryPath
+                | FieldLoc::AgSubconsciousPath | FieldLoc::AgSubconsciousStatus => Category::Agent,
         }
     }
 
@@ -272,12 +280,29 @@ impl FieldLoc {
             FieldLoc::FdAutoWake => "auto_wake",
             FieldLoc::TuShowInterstitial => "show_interstitial",
             FieldLoc::TuCennoThreshold => "cenno_word_threshold",
+            FieldLoc::AgAgentId => "agent_id",
+            FieldLoc::AgSubconsciousId => "subconscious_id",
+            FieldLoc::AgMemoryPath => "memory_path",
+            FieldLoc::AgSubconsciousPath => "subconscious_path",
+            FieldLoc::AgSubconsciousStatus => "subconscious_ok",
         }
     }
 
     /// Returns true if this field's value should be masked in browse mode.
     pub fn is_secret(&self) -> bool {
         matches!(self, FieldLoc::BfApiKey | FieldLoc::BfVirtualKey)
+    }
+
+    /// Returns true for informational fields that cannot be edited.
+    pub fn is_readonly(&self) -> bool {
+        matches!(
+            self,
+            FieldLoc::AgAgentId
+                | FieldLoc::AgSubconsciousId
+                | FieldLoc::AgMemoryPath
+                | FieldLoc::AgSubconsciousPath
+                | FieldLoc::AgSubconsciousStatus
+        )
     }
 
     pub fn label(&self) -> &'static str {
@@ -287,7 +312,7 @@ impl FieldLoc {
             FieldLoc::BfBaseUrl => "endpoint",
             FieldLoc::BfApiKey => "API key",
             FieldLoc::BfVirtualKey => "virtual key",
-            FieldLoc::BfPrimaryModel => "primary model",
+            FieldLoc::BfPrimaryModel => "new-agent default",
             FieldLoc::ScN1Enabled => "N+1 enabled",
             FieldLoc::ScN1Trigger => "N+1 trigger",
             FieldLoc::ScN1Every => "  └ every N responses",
@@ -351,6 +376,11 @@ impl FieldLoc {
             FieldLoc::FdAutoWake => "auto-wake on summon",
             FieldLoc::TuShowInterstitial => "interstitial narration",
             FieldLoc::TuCennoThreshold => "cenno threshold (words)",
+            FieldLoc::AgAgentId => "agent id",
+            FieldLoc::AgSubconsciousId => "subconscious",
+            FieldLoc::AgMemoryPath => "memory path",
+            FieldLoc::AgSubconsciousPath => "subconscious path",
+            FieldLoc::AgSubconsciousStatus => "subconscious on disk",
         }
     }
 

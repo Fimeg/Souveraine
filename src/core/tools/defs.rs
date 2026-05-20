@@ -113,8 +113,9 @@ impl ToolContext {
     /// - `AGENT_ID` / `LETTA_AGENT_ID` / `SOUVERAINE_AGENT_ID` — her own
     ///   identifier so skills that scope by agent can resolve.
     ///
-    /// Any value already present in `env` is left alone — the caller's
-    /// override wins.
+    /// Memory and agent-id vars are always set (overriding any stale values
+    /// inherited from the host shell — e.g. a leftover `$MEMORY_DIR` from
+    /// the Letta era). Other env keys from the caller are preserved.
     pub fn for_agent(
         agent_id: impl Into<String>,
         cwd: Option<PathBuf>,
@@ -124,18 +125,22 @@ impl ToolContext {
     ) -> Self {
         let agent_id_str = agent_id.into();
 
+        // Strip stale values so the computed override always wins.
+        env.retain(|(k, _)| {
+            !matches!(k.as_str(),
+                "MEMORY_DIR" | "LETTA_MEMORY_DIR" | "SOUVERAINE_MEMORY_DIR" | "MEMORY"
+                | "AGENT_ID" | "LETTA_AGENT_ID" | "SOUVERAINE_AGENT_ID"
+            )
+        });
+
         if let Some(root) = memory_root.as_ref() {
             let root_str = root.display().to_string();
             for key in ["MEMORY_DIR", "LETTA_MEMORY_DIR", "SOUVERAINE_MEMORY_DIR", "MEMORY"] {
-                if !env.iter().any(|(k, _)| k == key) {
-                    env.push((key.to_string(), root_str.clone()));
-                }
+                env.push((key.to_string(), root_str.clone()));
             }
         }
         for key in ["AGENT_ID", "LETTA_AGENT_ID", "SOUVERAINE_AGENT_ID"] {
-            if !env.iter().any(|(k, _)| k == key) {
-                env.push((key.to_string(), agent_id_str.clone()));
-            }
+            env.push((key.to_string(), agent_id_str.clone()));
         }
 
         Self {

@@ -152,10 +152,19 @@ fn draw_header(f: &mut Frame, state: &ChatState, area: Rect) {
         "remote" => state.palette.agent_primary,
         _ => state.palette.agent_dim,
     };
+    let posture_label = match state.render_mode {
+        super::ChatMode::Code => "tools shown",
+        super::ChatMode::Conversation => "tools folded",
+    };
+    let posture_color = match state.render_mode {
+        super::ChatMode::Code => state.palette.tool_accent,
+        super::ChatMode::Conversation => state.palette.agent_dim,
+    };
     let title = Line::from(vec![
         Span::styled("✦ Souveraine ", Style::default().fg(state.palette.agent_primary).add_modifier(Modifier::BOLD)),
         Span::styled(format!("· {} ", state.agent_name), Style::default().fg(Color::White)),
-        Span::styled(format!("[{} mode]", state.mode), Style::default().fg(mode_color)),
+        Span::styled(format!("[{}] ", state.mode), Style::default().fg(mode_color)),
+        Span::styled(format!("[{}]", posture_label), Style::default().fg(posture_color)),
     ]);
     f.render_widget(Paragraph::new(title).alignment(Alignment::Center), area);
 }

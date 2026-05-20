@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tokio::sync::oneshot;
 
@@ -24,6 +24,16 @@ pub struct ActiveAgentSettings {
     pub model: String,
     /// The model as loaded — for save-time diffing.
     pub model_original: String,
+    /// Display-only: the paired subconscious agent id (always `{id}-sub`).
+    pub subconscious_id: String,
+    /// Display-only: the primary's memory directory path.
+    pub memory_root: PathBuf,
+    /// Display-only: the subconscious agent's memory directory path.
+    pub subconscious_root: PathBuf,
+    /// Display-only: whether the subconscious directory + memory.git exist.
+    pub has_subconscious: bool,
+    /// Display-only: whether the agent's own agent.json is readable.
+    pub agent_json_exists: bool,
 }
 
 pub struct SettingsView {
@@ -154,6 +164,12 @@ impl SettingsView {
                         let idx = variants.iter().position(|m| m == &agent.model).unwrap_or(0);
                         out.push((AgModel, EditableValue::EnumVariant { index: idx, variants }));
                     }
+                    // Read-only diagnostics
+                    out.push((AgAgentId, EditableValue::Text(agent.id.clone())));
+                    out.push((AgSubconsciousId, EditableValue::Text(agent.subconscious_id.clone())));
+                    out.push((AgMemoryPath, EditableValue::Text(agent.memory_root.to_string_lossy().to_string())));
+                    out.push((AgSubconsciousPath, EditableValue::Text(agent.subconscious_root.to_string_lossy().to_string())));
+                    out.push((AgSubconsciousStatus, EditableValue::Bool(agent.has_subconscious)));
                 }
             }
             Category::Bifrost => {
@@ -614,6 +630,9 @@ impl SettingsView {
 
             TuShowInterstitial => { if let EditableValue::Bool(v) = value { self.config.tui.show_interstitial = v; } }
             TuCennoThreshold => { if let EditableValue::Uint(v) = value { self.config.tui.cenno_word_threshold = v as usize; } }
+
+            // Read-only diagnostic fields — no-op on apply.
+            AgAgentId | AgSubconsciousId | AgMemoryPath | AgSubconsciousPath | AgSubconsciousStatus => {}
         }
         self.dirty = true;
     }

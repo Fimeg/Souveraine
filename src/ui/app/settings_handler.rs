@@ -233,11 +233,21 @@ impl App {
         self.chat.as_ref()?; // a backend is required to persist the change
         let id = self.agent_id_by_name(&self.agent_pref)?;
         let model = Self::agent_model_from_disk(&id)?;
+        let base = dirs::home_dir()?;
+        let memory_root = base.join(".souveraine/agents").join(&id).join("memory");
+        let subconscious_root = base.join(".souveraine/subconscious-agents").join(format!("{id}-sub")).join("memory.git");
+        let has_subconscious = subconscious_root.join("HEAD").exists();
+        let agent_json_exists = base.join(".souveraine/server/agents").join(&id).join("agent.json").exists();
         Some(crate::ui::settings::ActiveAgentSettings {
-            id,
+            id: id.clone(),
             name: self.agent_pref.clone(),
             model: model.clone(),
             model_original: model,
+            subconscious_id: format!("{id}-sub"),
+            memory_root,
+            subconscious_root,
+            has_subconscious,
+            agent_json_exists,
         })
     }
 
