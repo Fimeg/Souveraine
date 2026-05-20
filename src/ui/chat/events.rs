@@ -767,6 +767,29 @@ impl ChatState {
         }
     }
 
+    /// Copy text to clipboard — tries arboard system clipboard first,
+    /// falls back to OSC 52 escape sequence (works in tmux, SSH, kitty, etc.).
+    fn copy_to_clipboard(text: &str) -> bool {
+        // arboard is the most reliable when desktop clipboard is available
+        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text.to_string())) {
+            Ok(()) => return true,
+            Err(e) => tracing::warn!("arboard clipboard failed, trying OSC 52: {}", e),
+        }
+
+        // OSC 52 escape: \x1b]52;c;{base64}\x07
+        use std::io::Write;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+        let osc = if std::env::var("TMUX").is_ok() {
+            // Tmux passthrough: \x1bPtmux;\x1b]52;c;{b64}\x07\x1b\\
+            format!("\x1bPtmux;\x1b]52;c;{b64}\x07\x1b\\")
+        } else {
+            format!("\x1b]52;c;{b64}\x07")
+        };
+        let _ = std::io::stdout().write_all(osc.as_bytes()).and_then(|_| std::io::stdout().flush());
+        // Assume success — OSC 52 either works or silently ignores
+        true
+    }
+
     pub fn copy_message_at(&mut self, col: u16, row: u16) -> bool {
         let idx = {
             let layout = self.msg_layout.borrow();
@@ -786,15 +809,16 @@ impl ChatState {
         };
         let Some(idx) = idx else { return false };
         let Some(text) = self.message_copy_text(idx) else { return false };
-        match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
-            Ok(()) => {
-                self.copy_flash = Some(Instant::now());
-                true
-            }
-            Err(e) => {
-                tracing::warn!("clipboard copy failed: {}", e);
-                false
-            }
+
+        if Self::copy_to_clipboard(&text) {
+            self.copy_flash = Some(Instant::now());
+            true
+        } else {
+            self.system_message(
+                "*[clipboard copy failed — install xclip/wl-clipboard or use a terminal that supports OSC 52]*".to_string(),
+            );
+            false
         }
     }
+
 }

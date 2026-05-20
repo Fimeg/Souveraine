@@ -2,7 +2,7 @@
 //!
 //! Three flows:
 //! - `FreshInstall`: no config, no agents — full walkthrough
-//! - `ImportAgent`: config exists, but no agents — skip Bifrost, create/import
+//! - `ImportAgent`: config exists, but no agents — skip API config, create/import
 //! - `FederationSync`: wants to sync from a federation peer (env override)
 
 use tokio::sync::oneshot;
@@ -230,7 +230,7 @@ pub enum SetupFlow {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SetupStep {
     Welcome,
-    BifrostConfig,
+    ApiConfig,
     CreateAgent,
     ImportOrFederation,
     FederationConfig,
@@ -249,7 +249,7 @@ pub struct SetupState {
     pub step: SetupStep,
     pub complete: bool,
 
-    // ── Bifrost fields ──
+    // ── API connection fields ──
     pub bifrost_url: String,
     pub bifrost_key: String,
 
@@ -291,7 +291,7 @@ impl SetupState {
             flow,
             step,
             complete: false,
-            bifrost_url: "http://10.10.20.120:3360".to_string(),
+            bifrost_url: "http://127.0.0.1:3360".to_string(),
             bifrost_key: String::new(),
             agent_name: "Souveraine".to_string(),
             model_handle: default_model.to_string(),
@@ -375,9 +375,9 @@ impl SetupState {
                 show_submit: true,
                 hint: None,
             },
-            SetupStep::BifrostConfig => FormState {
+            SetupStep::ApiConfig => FormState {
                 slots: vec![
-                    FormSlot::text("Bifrost URL", "http://10.10.20.120:3360", false),
+                    FormSlot::text("API Endpoint URL", "http://127.0.0.1:3360", false),
                     FormSlot::text("API Key", "", true),
                 ],
                 focus: 0,
@@ -426,8 +426,8 @@ impl SetupState {
     pub fn advance(&mut self) {
         use SetupStep::*;
         self.step = match self.step {
-            Welcome => BifrostConfig,
-            BifrostConfig => {
+            Welcome => ApiConfig,
+            ApiConfig => {
                 self.bifrost_url = self.form.slots[0].value();
                 self.bifrost_key = self.form.slots[1].value();
                 CreateAgent
@@ -453,7 +453,7 @@ impl SetupState {
         use SetupStep::*;
         self.step = match self.step {
             Welcome => return,
-            BifrostConfig => {
+            ApiConfig => {
                 self.bifrost_url = self.form.slots[0].value();
                 self.bifrost_key = self.form.slots[1].value();
                 Welcome
@@ -462,7 +462,7 @@ impl SetupState {
                 self.agent_name = self.form.slots[0].value();
                 self.model_handle = self.form.slots[1].value();
                 match self.flow {
-                    SetupFlow::FreshInstall => BifrostConfig,
+                    SetupFlow::FreshInstall => ApiConfig,
                     SetupFlow::ImportAgent => ImportOrFederation,
                     SetupFlow::FederationSync => FederationConfig,
                 }
@@ -518,7 +518,7 @@ impl SetupState {
         // Submit button focused: Enter advances
         if matches!(key.code, KeyCode::Enter) && self.form.is_submit_focused() {
             match self.step {
-                SetupStep::BifrostConfig => {
+                SetupStep::ApiConfig => {
                     self.bifrost_url = self.form.slots[0].value();
                     self.bifrost_key = self.form.slots[1].value();
                 }
@@ -592,7 +592,7 @@ impl SetupState {
 
         match self.step {
             SetupStep::Welcome => self.draw_welcome(frame, area),
-            SetupStep::BifrostConfig => self.draw_form(frame, area, "Bifrost Connection"),
+            SetupStep::ApiConfig => self.draw_form(frame, area, "API Connection"),
             SetupStep::CreateAgent => self.draw_create_agent(frame, area),
             SetupStep::ImportOrFederation => self.draw_import_screen(frame, area),
             SetupStep::FederationConfig => self.draw_form(frame, area, "Federation Sync"),
@@ -617,7 +617,7 @@ impl SetupState {
             )),
             Line::from(""),
             Line::from(Span::styled("You'll set up:", Style::default().fg(Color::Gray))),
-            Line::from(Span::styled("  \u{2022} A Bifrost connection (or go local-only)", Style::default().fg(Color::Gray))),
+            Line::from(Span::styled("  \u{2022} An API endpoint (or go local-only — models on your machine)", Style::default().fg(Color::Gray))),
             Line::from(Span::styled("  \u{2022} Your first agent", Style::default().fg(Color::Gray))),
             Line::from(Span::styled("  \u{2022} Optional import from Letta or federation", Style::default().fg(Color::Gray))),
             Line::from(""),
@@ -632,7 +632,7 @@ impl SetupState {
         frame.render_widget(para, centered_rect(area, 60, 60));
     }
 
-    /// Generic form renderer for simple input forms (Bifrost, Federation).
+    /// Generic form renderer for simple input forms (API, Federation).
     fn draw_form(&self, frame: &mut Frame, area: Rect, title: &str) {
         let form_area = centered_rect(area, 50, 50);
         let mut lines: Vec<Line> = Vec::new();
@@ -724,7 +724,7 @@ impl SetupState {
                 lines.push(Line::from(Span::styled(format!(" {}{}", mv, extra), Style::default().fg(m_fg))));
                 if !self.models_fetching {
                     lines.push(Line::from(Span::styled(
-                        "   [r] fetch models from Bifrost",
+                        "   [r] fetch models from endpoint",
                         Style::default().fg(Color::Rgb(80, 120, 140)),
                     )));
                 }
@@ -833,7 +833,7 @@ impl SetupState {
         let has_key = !self.bifrost_key.is_empty();
         lines.push(Line::from(Span::styled(format!("  Agent:       {}", self.agent_name), Style::default().fg(Color::White))));
         lines.push(Line::from(Span::styled(
-            format!("  Bifrost:     {} ({})", self.bifrost_url, if has_key { "key set" } else { "no key \u{2014} local fallback" }),
+            format!("  API:    {} ({})", self.bifrost_url, if has_key { "key set" } else { "no key \u{2014} local fallback" }),
             Style::default().fg(Color::Rgb(150, 150, 150)),
         )));
         lines.push(Line::from(Span::styled(format!("  Model:       {}", self.model_handle), Style::default().fg(Color::Rgb(150, 200, 255)))));
@@ -869,7 +869,7 @@ impl SetupState {
             SetupFlow::FederationSync => 2,
         };
         let current = match (self.flow, self.step) {
-            (SetupFlow::FreshInstall, SetupStep::BifrostConfig) => 1,
+            (SetupFlow::FreshInstall, SetupStep::ApiConfig) => 1,
             (SetupFlow::FreshInstall, SetupStep::CreateAgent) => 2,
             (SetupFlow::FreshInstall, SetupStep::ImportOrFederation) => 3,
             (SetupFlow::FreshInstall, SetupStep::Complete) => 4,
@@ -945,7 +945,7 @@ mod tests {
         assert!(state.form.show_submit);
         assert!(state.form.is_submit_focused());
         state.advance();
-        assert_eq!(state.step, SetupStep::BifrostConfig);
+        assert_eq!(state.step, SetupStep::ApiConfig);
         state.advance();
         assert_eq!(state.step, SetupStep::CreateAgent);
         state.advance();
@@ -971,7 +971,7 @@ mod tests {
     #[test]
     fn test_text_input() {
         let mut state = SetupState::new(SetupFlow::FreshInstall, "kimi-k2.6");
-        state.advance(); // → BifrostConfig
+        state.advance(); // → ApiConfig
         state.form.focus = 0;
         state.form.slots[0].kind = SlotKind::Text {
             value: String::new(),
@@ -992,13 +992,13 @@ mod tests {
         state.advance();
         state.advance();
         state.go_back();
-        assert_eq!(state.step, SetupStep::BifrostConfig);
+        assert_eq!(state.step, SetupStep::ApiConfig);
     }
 
     #[test]
     fn test_model_picker_cycle() {
         let mut state = SetupState::new(SetupFlow::FreshInstall, "kimi-k2.6");
-        state.advance(); // BifrostConfig
+        state.advance(); // ApiConfig
         state.advance(); // CreateAgent
 
         // Focus is on slot 0 (name). Advance to slot 1 (model picker).

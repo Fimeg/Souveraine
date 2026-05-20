@@ -162,7 +162,7 @@ impl Default for AuthConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BifrostConfig {
-    /// Bifrost API base URL (e.g. "http://10.10.20.120:3360")
+    /// Bifrost API base URL (e.g. "http://127.0.0.1:3360")
     #[serde(default = "default_bifrost_url")]
     pub base_url: String,
 
@@ -803,7 +803,7 @@ impl Default for FederationConfig {
 /// trust root for verifying every event the peer sends.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerConfig {
-    /// Peer's federation endpoint, e.g. `ws://10.10.20.50:8484`.
+    /// Peer's federation endpoint, e.g. `ws://192.168.1.50:8484`.
     pub url: String,
     /// Peer's Ed25519 public key, hex-encoded.
     pub pubkey: String,
@@ -851,8 +851,8 @@ impl Default for VoiceConfig {
     }
 }
 
-fn default_stt_url() -> String { "http://10.10.20.19:7862".to_string() }
-fn default_tts_url() -> String { "http://10.10.20.19:7861".to_string() }
+fn default_stt_url() -> String { "http://127.0.0.1:7862".to_string() }
+fn default_tts_url() -> String { "http://127.0.0.1:7861".to_string() }
 fn default_voice_id() -> String { "en-Soother_woman".to_string() }
 fn default_ptt_key() -> String { "Space".to_string() }
 
@@ -862,8 +862,8 @@ impl ConsciousnessConfig {
         let candidates = [
             "souveraine.toml",
             "souveraine.yaml",
-            "~/.config/souveraine/config.toml",
-            "~/.config/souveraine/config.yaml",
+            "~/.souveraine/config.toml",
+            "~/.souveraine/config.yaml",
         ];
         for path_str in &candidates {
             let expanded = shellexpand::tilde(path_str);
@@ -915,7 +915,7 @@ fn default_warning_1_threshold() -> f32 { 0.8 }
 fn default_warning_2_threshold() -> f32 { 0.95 }
 fn default_sub_inter_round_delay() -> u64 { 300 }
 fn default_auto_model() -> String { "auto".to_string() }
-fn default_bifrost_url() -> String { "http://10.10.20.120:3360".to_string() }
+fn default_bifrost_url() -> String { "http://127.0.0.1:3360".to_string() }
 fn default_server_bind() -> String { "127.0.0.1".to_string() }
 fn default_server_port() -> u16 { 8484 }
 fn default_server_url() -> String { "http://127.0.0.1:8484".to_string() }

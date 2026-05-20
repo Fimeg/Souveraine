@@ -5,12 +5,10 @@ use tracing::{debug, info, warn};
 
 /// Bifrost Inference Client
 ///
-/// Bifrost is an OpenAI-compatible API gateway: http://10.10.20.120:3360/v1
-/// Uses Bearer token auth + optional x-bf-vk header for provider virtual keys.
-/// OpenAI format for chat completions + tool calls.
+/// Bifrost is an OpenAI-compatible API gateway: http://127.0.0.1:3360/v1
 #[derive(Debug, Clone)]
 pub struct BifrostClient {
-    /// Base URL including /v1 (e.g. "http://10.10.20.120:3360/v1")
+    /// Base URL including /v1 (e.g. "http://127.0.0.1:3360/v1")
     base_url: String,
     /// Bearer token for auth
     api_key: String,
@@ -673,7 +671,7 @@ mod tests {
     #[test]
     fn test_client_creation() {
         let client = BifrostClient::new(
-            "http://10.10.20.120:3360",
+            "http://127.0.0.1:3360",
             "sk-bf-test",
             "",
             "openai/deepseek-v4-pro",

@@ -1,6 +1,6 @@
 //! Voice service HTTP clients — STT (Faster-Whisper) and TTS (VibeVoice).
 //!
-//! Pure HTTP, no audio I/O. Both services run on 10.10.20.19.
+//! Pure HTTP, no audio I/O. Both services run on 127.0.0.1 by default.
 //!
 //! - STT: `POST /transcribe` — multipart form, `audio` field (WAV), returns
 //!   `{ "text": string, "language"?: string }`.
@@ -138,9 +138,9 @@ pub fn clean_text_for_tts(text: &str) -> String {
 /// No retry logic — if a request fails, the caller treats the error as a
 /// sensorium event (the voice is hoarse; the body has bad days).
 pub struct VoiceClient {
-    /// Faster-Whisper base URL, e.g. `http://10.10.20.19:7862`
+    /// Faster-Whisper base URL, e.g. `http://127.0.0.1:7862`
     stt_url: String,
-    /// VibeVoice base URL, e.g. `http://10.10.20.19:7861`
+    /// VibeVoice base URL, e.g. `http://127.0.0.1:7861`
     tts_url: String,
     /// Voice ID for synthesis, e.g. `en-Soother_woman`
     voice: String,

@@ -176,7 +176,12 @@ impl App {
                     }
                 }
                 {
-                    let path = self.config_path.clone().unwrap_or_else(|| PathBuf::from("souveraine.toml"));
+                    let path = self.config_path.clone().unwrap_or_else(|| {
+                        let home = dirs::home_dir().unwrap_or_default();
+                        let dir = home.join(".souveraine");
+                        let _ = std::fs::create_dir_all(&dir);
+                        dir.join("config.toml")
+                    });
                     let cfg = self.config.read().await;
                     if let Err(e) = cfg.save(&path) {
                         warn!("setup wizard could not save config to {}: {}", path.display(), e);
