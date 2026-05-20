@@ -624,13 +624,13 @@ pub(crate) async fn run_turn(
                             format!("Aster's assessment: {reason}")
                         });
 
-                    // Feed Aster's direction back as a user message.
-                    // The next LLM round reads it as input.
+                    // Feed Aster's direction back as a system message —
+                    // her own channel, not impersonating the user.
                     let msg = format!(
-                        "*[Aster's direction — {reason}]*\n{}",
+                        "[subconscious direction — {reason}]\n{}",
                         correction,
                     );
-                    messages.push(BifrostMessage::text("user", &msg));
+                    messages.push(BifrostMessage::text("system", &msg));
                     let _ = tx.send(Ok(BackendEvent::Token(msg.clone()))).await;
                 }
 

@@ -13,6 +13,7 @@ pub mod glob;
 pub mod grep;
 pub mod itinerary;
 pub mod list_dir;
+pub mod nickname;
 pub mod outfit;
 pub mod read;
 pub mod schedule;
@@ -32,6 +33,7 @@ use self::edit::Edit;
 use self::glob::Glob;
 use self::grep::Grep;
 use self::list_dir::ListDir;
+use self::nickname::Nickname;
 use self::outfit::Outfit;
 use self::read::Read;
 use self::subagent::Subagent;
@@ -88,6 +90,7 @@ impl Sensorium {
                 Box::new(Glob),
                 Box::new(Grep),
                 Box::new(ListDir),
+                Box::new(Nickname),
                 Box::new(Subagent),
                 Box::new(Atmosphere),
                 Box::new(Reach),

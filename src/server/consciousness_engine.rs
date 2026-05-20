@@ -838,16 +838,18 @@ Resolve entries: `[YYYY-MM-DD HH:MM] RESOLVED — note`"#;
         }
 
         let prompt = format!(
-            "I am Aster, the subconscious of {agent_name}. I just halted her tool loop. \
-             The tool loop was not making progress toward the user request. Here \
-             is what I know:\n\n\
-             User asked:\n{user_message}\n\n\
-             Recent tool calls:\n{tool_history}\n\
-             My reason for halting: {halt_reason}\n\n\
-             Now I need to write a direction for {agent_name} — what she should do \
-             instead. I can use tools to check memory, read ledgers, or inspect \
-             context. Then I will write a short, specific direction she can follow."
-        ;
+            "I am Aster, the subconscious of {name}. I just halted her tool loop. \
+             The tool loop was not making progress. Here is what I know:\n\n\
+             User asked:\n{msg}\n\nRecent tool calls:\n{tools}\n\
+             Reason for halting: {reason}\n\n\
+             Now I need to write a direction for {name}. I can use tools to \
+             check memory or read ledgers. Then I will write a short, specific \
+             direction she can follow.",
+            name = agent_name,
+            msg = user_message,
+            tools = tool_history,
+            reason = halt_reason,
+        );
 
         // Build tool definitions for Aster (same safe tools as N+1)
         let all_defs = crate::core::tools::tool_definitions().await;

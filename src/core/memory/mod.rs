@@ -196,6 +196,9 @@ impl MemoryRepo {
             .await
             .context("writing state.md")?;
 
+        // human.md is not written here — the setup wizard or first-run
+        // onboarding creates it with the human's name when it has one.
+
         // Initial commit
         let mut index = repo.index().context("opening git index")?;
         index.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)

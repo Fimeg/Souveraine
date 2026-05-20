@@ -354,6 +354,10 @@ pub struct ChatState {
     /// Current itinerary route-line for the header strip.
     /// Empty string means no active itinerary.
     pub itinerary_line: String,
+
+    /// The human's preferred name, read from system/human.md frontmatter.
+    /// Falls back to "you" if unset.
+    pub human_name: String,
 }
 
 #[derive(Debug, Clone)]
@@ -441,11 +445,24 @@ impl ChatState {
             }
         }
 
+        // Try to load the human's nickname from the agent's memfs.
+        let human_name = {
+            let home = std::env::var("HOME").unwrap_or_default();
+            let p = std::path::PathBuf::from(home)
+                .join(".souveraine")
+                .join("agents")
+                .join(&agent.id)
+                .join("memory");
+            crate::core::tools::nickname::read_human_name(&p)
+                .unwrap_or_else(|| "you".to_string())
+        };
+
         Ok(Self {
             backend,
             mode: mode.to_string(),
             agent_name: agent.name,
             agent_id: agent.id,
+            human_name,
             conversation_id,
             messages,
             input: String::new(),

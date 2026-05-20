@@ -324,7 +324,7 @@ fn draw_messages(f: &mut Frame, state: &ChatState, area: Rect) {
         match msg {
             ChatMessage::User { text, .. } => {
                 lines.extend(bubble(
-                    "⧉ you",
+                    &format!("⧉ {}", state.human_name),
                     text,
                     max_bubble,
                     Style::default().fg(state.palette.user_accent),
