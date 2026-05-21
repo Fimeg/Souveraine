@@ -152,20 +152,34 @@ fn draw_header(f: &mut Frame, state: &ChatState, area: Rect) {
         "remote" => state.palette.agent_primary,
         _ => state.palette.agent_dim,
     };
-    let posture_label = match state.render_mode {
-        super::ChatMode::Code => "tools shown",
-        super::ChatMode::Conversation => "tools folded",
+    let posture_label = if state.tool_cards_expanded {
+        "tools shown"
+    } else {
+        "tools folded"
     };
-    let posture_color = match state.render_mode {
-        super::ChatMode::Code => state.palette.tool_accent,
-        super::ChatMode::Conversation => state.palette.agent_dim,
+    let posture_color = if state.tool_cards_expanded {
+        state.palette.tool_accent
+    } else {
+        state.palette.agent_dim
     };
-    let title = Line::from(vec![
+    let mut spans = vec![
         Span::styled("✦ Souveraine ", Style::default().fg(state.palette.agent_primary).add_modifier(Modifier::BOLD)),
         Span::styled(format!("· {} ", state.agent_name), Style::default().fg(Color::White)),
-        Span::styled(format!("[{}] ", state.mode), Style::default().fg(mode_color)),
-        Span::styled(format!("[{}]", posture_label), Style::default().fg(posture_color)),
-    ]);
+    ];
+    // Code mode pill — distinct visual indicator when in code rendering mode
+    if state.render_mode == super::ChatMode::Code {
+        spans.push(Span::styled(
+            " CODE MODE ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(state.palette.tool_accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(" "));
+    }
+    spans.push(Span::styled(format!("[{}] ", state.mode), Style::default().fg(mode_color)));
+    spans.push(Span::styled(format!("[{}]", posture_label), Style::default().fg(posture_color)));
+    let title = Line::from(spans);
     f.render_widget(Paragraph::new(title).alignment(Alignment::Center), area);
 }
 
@@ -289,30 +303,56 @@ fn draw_messages(f: &mut Frame, state: &ChatState, area: Rect) {
     let max_bubble = ((area.width as usize).saturating_sub(8) * 70 / 100).max(20);
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    let show_cards = state.tool_cards_expanded || state.render_mode == ChatMode::Code;
+    // Fold pass only runs in Chat mode when tools are hidden.
+    // Code mode always shows tools (compact when closed, full when open).
+    let do_fold = !state.tool_cards_expanded && state.render_mode == ChatMode::Conversation;
     let mut fold_footer: std::collections::HashMap<usize, String> =
         std::collections::HashMap::new();
     let mut consumed: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    if !show_cards {
+    if do_fold {
         let msgs = &state.messages;
         let mut leading: Vec<usize> = Vec::new();
         for (idx, m) in msgs.iter().enumerate() {
             match m {
                 ChatMessage::Tool { .. } => leading.push(idx),
                 ChatMessage::Assistant { .. } => {
+                    // Scan forward through the tool block, skipping Interstitial/Interjection
+                    // entries that sit between the bubble and the tool block (narration
+                    // from turn.rs). Only tools get consumed into the fold footer; the
+                    // narration renders independently in the second pass.
                     let mut j = idx + 1;
-                    while j < msgs.len() && matches!(msgs[j], ChatMessage::Tool { .. }) {
-                        j += 1;
-                    }
-                    let mut owned = std::mem::take(&mut leading);
-                    owned.extend((idx + 1)..j);
-                    if !owned.is_empty() {
-                        for &t in &owned {
-                            consumed.insert(t);
+                    while j < msgs.len() {
+                        match &msgs[j] {
+                            ChatMessage::Tool { .. } => j += 1,
+                            ChatMessage::Interstitial { .. } | ChatMessage::Interjection { .. } => {
+                                j += 1;
+                            }
+                            _ => break,
                         }
-                        fold_footer.insert(idx, tool_footer_label(&owned, msgs));
+                    }
+                    // Gather leading tools that arrived before any Assistant (e.g. first
+                    // turn's tool calls fired before narration). Filter out any that were
+                    // already consumed by a prior Assistant's gap scan.
+                    let owned: Vec<usize> = std::mem::take(&mut leading)
+                        .into_iter()
+                        .filter(|i| !consumed.contains(i))
+                        .collect();
+                    // Only tools in the gap get consumed — interstitials/interjections
+                    // render independently in the second pass below.
+                    let gap_tools: Vec<usize> = ((idx + 1)..j)
+                        .filter(|&i| matches!(msgs[i], ChatMessage::Tool { .. }))
+                        .collect();
+                    let all_indices: Vec<usize> = owned.into_iter().chain(gap_tools).collect();
+                    if !all_indices.is_empty() {
+                        for &i in &all_indices {
+                            consumed.insert(i);
+                        }
+                        fold_footer.insert(idx, tool_footer_label(&all_indices, msgs));
                     }
                 }
+                // Interstitials/interjections sit between the bubble and tool block;
+                // don't clear leading — they don't break the tool-to-assistant flow.
+                ChatMessage::Interstitial { .. } | ChatMessage::Interjection { .. } => {}
                 _ => leading.clear(),
             }
         }
@@ -433,9 +473,8 @@ fn draw_messages(f: &mut Frame, state: &ChatState, area: Rect) {
                 )));
                 lines.push(Line::from(""));
             }
-            ChatMessage::Tool { name, arguments, round, result, expanded, ts, .. } => {
-                let code_posture = state.render_mode == ChatMode::Code;
-                let expand = *expanded || state.tool_cards_expanded || code_posture;
+            ChatMessage::Tool { name, arguments, round, result, ts, .. } => {
+                let expand = state.tool_cards_expanded;
                 let name_pulse = if result.is_none() {
                     Some(tool_name_pulse(ts.elapsed()))
                 } else {
@@ -713,7 +752,6 @@ fn render_tool_card(
     palette: &ChatPalette,
     name_pulse: Option<Color>,
 ) -> Vec<Line<'static>> {
-    let mdpal = crate::ui::markdown::MarkdownPalette::from_chat_palette(palette);
     let is_err = result.map(|r| r.is_error).unwrap_or(false);
     let border_color = if is_err {
         palette.compaction
@@ -732,30 +770,32 @@ fn render_tool_card(
     };
     let title = format!("{} {}  ·  round {}", glyph, name, round);
 
-    let mut body_lines: Vec<Line<'static>> = Vec::new();
+    // Delegate body rendering to per-tool renderers (Tier 3)
     let inner_width = max_width.saturating_sub(4).max(8);
-
-    let args_summary = summarize_tool_args(arguments);
-    let args_line = Line::from(vec![Span::styled(
-        args_summary,
-        Style::default().fg(dim_color),
-    )]);
-    body_lines.extend(markdown::wrap_line(args_line, inner_width));
-
-    if let Some(r) = result {
-        body_lines.push(Line::from(""));
-        let preview = preview_output(&r.output, 12);
-        let inner_width = max_width.saturating_sub(4).max(8);
-        let rendered = markdown::render_with_width(
-            &preview,
-            if r.is_error { palette.compaction } else { palette.agent_primary },
-            Some(inner_width),
-            &mdpal,
+    let (args_lines, rendered_body) =
+        super::tool_renderers::render_card_body(
+            name, arguments,
+            result.map(|r| r.output.as_str()),
+            result.map(|r| r.is_error).unwrap_or(false),
+            inner_width, palette,
         );
-        body_lines.extend(rendered);
-        if r.output.lines().count() > 12 {
+
+    let mut body_lines: Vec<Line<'static>> = Vec::new();
+    body_lines.extend(args_lines);
+    let has_body = !rendered_body.is_empty();
+
+    if has_body {
+        body_lines.push(Line::from(""));
+        body_lines.extend(rendered_body);
+    }
+
+    // Truncation notice — only for fallback cards that didn't get per-tool
+    // rendering (per-tool renderers add their own footers).
+    if let Some(r) = result {
+        let total = r.output.lines().count();
+        if total > 30 && !has_body {
             body_lines.push(Line::from(Span::styled(
-                format!("  … ({} more lines)", r.output.lines().count() - 12),
+                format!("  … ({} total lines)", total),
                 Style::default().fg(dim_color).add_modifier(Modifier::ITALIC),
             )));
         }
@@ -796,7 +836,7 @@ fn render_tool_card_compact(
         .saturating_sub(reserved + 6)
         .max(20)
         .min(120);
-    let args_summary = clip(&summarize_tool_args(arguments), arg_budget);
+    let args_summary = clip(&super::tool_renderers::summarize_tool_args(name, arguments), arg_budget);
 
     let mut spans: Vec<Span<'static>> = vec![
         Span::raw("  "),
@@ -820,47 +860,23 @@ fn render_tool_card_compact(
 
     let mut out = vec![Line::from(spans)];
 
+    // Per-tool result detail line (Tier 2)
     if let Some(r) = result {
-        if r.is_error {
-            if let Some(first_line) = r.output.lines().next() {
-                let trimmed = first_line.trim();
-                if !trimmed.is_empty() {
-                    let inner = (container_width as usize).saturating_sub(8).max(20);
-                    let preview = clip(trimmed, inner);
-                    out.push(Line::from(vec![
-                        Span::raw("    "),
-                        Span::styled(
-                            preview,
-                            Style::default().fg(palette.compaction).add_modifier(Modifier::ITALIC),
-                        ),
-                    ]));
-                }
-            }
+        if let Some(detail) = super::tool_renderers::compact_result_details(name, &r.output, r.is_error) {
+            let inner = (container_width as usize).saturating_sub(8).max(20);
+            let preview = clip(&detail, inner);
+            let detail_color = if r.is_error { palette.compaction } else { palette.tool_dim };
+            out.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(
+                    preview,
+                    Style::default().fg(detail_color).add_modifier(Modifier::ITALIC),
+                ),
+            ]));
         }
     }
 
     out
-}
-
-fn summarize_tool_args(arguments: &str) -> String {
-    let parsed: Result<serde_json::Value, _> = serde_json::from_str(arguments);
-    match parsed {
-        Ok(serde_json::Value::Object(map)) => {
-            let parts: Vec<String> = map
-                .iter()
-                .map(|(k, v)| {
-                    let s = match v {
-                        serde_json::Value::String(s) => clip(s, 60),
-                        other => clip(&other.to_string(), 60),
-                    };
-                    format!("{}: {}", k, s)
-                })
-                .collect();
-            parts.join("  ·  ")
-        }
-        Ok(other) => clip(&other.to_string(), 120),
-        Err(_) => clip(arguments, 120),
-    }
 }
 
 fn clip(s: &str, max: usize) -> String {
@@ -870,11 +886,6 @@ fn clip(s: &str, max: usize) -> String {
     let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
     out.push('…');
     out
-}
-
-fn preview_output(s: &str, n: usize) -> String {
-    let lines: Vec<&str> = s.lines().take(n).collect();
-    lines.join("\n")
 }
 
 fn draw_input(f: &mut Frame, state: &ChatState, area: Rect) {
