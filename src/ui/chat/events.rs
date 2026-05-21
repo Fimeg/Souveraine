@@ -288,7 +288,6 @@ impl ChatState {
                         round,
                         result: None,
                         ts: Instant::now(),
-                        expanded: false,
                     });
                 }
                 BackendEvent::ToolResult { id, name: _, output, is_error } => {

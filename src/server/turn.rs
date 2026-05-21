@@ -589,8 +589,8 @@ pub(crate) async fn run_turn(
                 .await
             {
                 // ── HALT: circuit breaker ───────────────────────────
-                // Break the tool loop, run Aster with full autonomy,
-                // feed her correction back as a user message, then
+                // Break the tool loop, run subconscious correction pass,
+                // feed the correction back as a user message, then
                 // continue the loop so the primary course-corrects.
                 Ok(crate::server::consciousness_engine::CheckpointVerdict::Halt(reason)) => {
                     let _ = tx
@@ -613,7 +613,7 @@ pub(crate) async fn run_turn(
                         ConversationMessage::assistant_text(&primary_text),
                     )?;
 
-                    // Run Aster's correction pass — full tool access,
+                    // Run subconscious correction pass — full tool access,
                     // no token cap, her own voice.
                     let correction = server
                         .consciousness
@@ -621,10 +621,10 @@ pub(crate) async fn run_turn(
                         .await
                         .unwrap_or_else(|e| {
                             tracing::warn!("checkpoint correction failed: {e}");
-                            format!("Aster's assessment: {reason}")
+                            format!("Subconscious assessment: {reason}")
                         });
 
-                    // Feed Aster's direction back as a system message —
+                    // Feed subconscious direction back as a system message —
                     // her own channel, not impersonating the user.
                     let msg = format!(
                         "[subconscious direction — {reason}]\n{}",
@@ -719,7 +719,7 @@ pub(crate) async fn run_turn(
     // The primary's turn is done — her words are committed. Release the user
     // here, before the N+1 pass: the stream stays open so the subconscious's
     // surfacings still arrive, but the user is free to speak again. The
-    // substrate signals; it does not hold her hostage to Aster's pass.
+    // substrate signals; it does not hold her hostage to the subconscious pass.
     let _ = tx.send(Ok(BackendEvent::PrimaryComplete)).await;
 
     // N+1 gate — the subconscious pass is sovereign-configurable, and the

@@ -252,8 +252,9 @@ Tab toggles the cockpit pane. `t` (on empty input) toggles tool expansion.";
 
         if trimmed == "/code" {
             self.render_mode = ChatMode::Code;
+            self.tool_cards_expanded = true;
             self.system_message(
-                "Code posture. Tool gestures expand; the prompt becomes ≡. Same conversation."
+                "Code posture. Tools unfolded; the prompt becomes ≡. Same conversation."
                     .to_string(),
             );
             return true;
@@ -261,8 +262,9 @@ Tab toggles the cockpit pane. `t` (on empty input) toggles tool expansion.";
 
         if trimmed == "/chat" {
             self.render_mode = ChatMode::Conversation;
+            self.tool_cards_expanded = false;
             self.system_message(
-                "Conversation posture. Tool gestures collapse; the prompt returns to ›.".to_string(),
+                "Conversation posture. Tools folded; the prompt returns to ›.".to_string(),
             );
             return true;
         }

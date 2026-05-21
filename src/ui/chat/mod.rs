@@ -19,6 +19,7 @@ mod events;
 mod footer;
 mod overlays;
 mod render;
+mod tool_renderers;
 pub mod wrap;
 
 pub use render::draw;
@@ -256,7 +257,6 @@ pub enum ChatMessage {
         round: u32,
         result: Option<ToolResultBlock>,
         ts: Instant,
-        expanded: bool,
     },
     Image {
         media_type: String,

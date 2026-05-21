@@ -811,7 +811,7 @@ Resolve entries: `[YYYY-MM-DD HH:MM] RESOLVED — note`"#;
     }
 
     /// Full-autonomy correction pass. Called when the mid-turn checkpoint
-    /// returns HALT. Aster gets tool access, no token cap, and writes a
+    /// returns HALT. The subconscious gets tool access, no token cap, and writes a
     /// direction for the primary — what went wrong and what to try instead.
     pub async fn checkpoint_correction(
         &self,
@@ -837,7 +837,7 @@ Resolve entries: `[YYYY-MM-DD HH:MM] RESOLVED — note`"#;
         }
 
         let prompt = format!(
-            "I am Aster, the subconscious of {name}. I just halted her tool loop. \
+            "I am {name}'s subconscious. I just halted her tool loop. \
              The tool loop was not making progress. Here is what I know:\n\n\
              User asked:\n{msg}\n\nRecent tool calls:\n{tools}\n\
              Reason for halting: {reason}\n\n\
@@ -850,7 +850,7 @@ Resolve entries: `[YYYY-MM-DD HH:MM] RESOLVED — note`"#;
             reason = halt_reason,
         );
 
-        // Build tool definitions for Aster (same safe tools as N+1)
+        // Build tool definitions for subconscious (same safe tools as N+1)
         let all_defs = crate::core::tools::tool_definitions().await;
         let tools: Vec<crate::bridge::bifrost::ToolDefinition> = all_defs
             .iter()
