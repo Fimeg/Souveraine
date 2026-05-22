@@ -351,6 +351,12 @@ pub struct ChatState {
     pub palette: ChatPalette,
     pub stream_buffer: String,
 
+    /// Live subconscious reasoning stream — ephemeral lines from the N+1 pass.
+    /// Pushed to by SubconsciousToken/ToolCall/ToolResult events in events.rs.
+    /// Cleared on each new pass start. Rendered as a fading block below the
+    /// phase bar during TurnPhase::Subconscious.
+    pub subconscious_stream: Vec<String>,
+
     /// Current itinerary route-line for the header strip.
     /// Empty string means no active itinerary.
     pub itinerary_line: String,
@@ -503,6 +509,7 @@ impl ChatState {
             render_mode: ChatMode::Conversation,
             palette: ChatPalette::default(),
             stream_buffer: String::new(),
+            subconscious_stream: Vec::new(),
             itinerary_line: String::new(),
         })
     }

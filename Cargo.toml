@@ -1,6 +1,6 @@
 [package]
 name = "souveraine"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.94"
 authors = ["Souveraine Contributors"]
@@ -18,7 +18,7 @@ async-trait = "0.1"
 # Web/WebSocket (for external clients)
 axum = { version = "0.7", features = ["ws"] }
 tower = "0.4"
-tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
 tokio-tungstenite = "0.24"  # Outbound WS client — federation bridge connects to peer endpoints
 
 # Serialization
@@ -37,7 +37,7 @@ sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite", "migrate
 dashmap = "5"
 
 # File system
-notify = "6"  # File watching
+notify = "7"  # File watching
 
 # Environment (.env file loading)
 dotenvy = "0.15"
@@ -56,7 +56,7 @@ hound = "3.5"
 # tokenizers = "0.15"  # For local tokenization
 
 # Terminal/UI
-crossterm = { version = "0.27", features = ["bracketed-paste"] }  # Terminal control (bracketed paste for paste detection)
+crossterm = { version = "0.28", features = ["bracketed-paste"] }  # Terminal control (bracketed paste for paste detection)
 ratatui = { version = "0.30", features = ["crossterm"] }  # TUI framework with crossterm backend
 unicode-width = "0.1"
 arboard = { version = "3", features = ["wayland-data-control"] }  # Clipboard — click-to-copy a message bubble

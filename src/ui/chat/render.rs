@@ -28,10 +28,14 @@ pub fn draw(f: &mut Frame, state: &ChatState) {
     let max_input_lines = ((area.height as usize) * 40 / 100).max(1);
     let input_height = (input_visual_lines.min(max_input_lines) as u16) + 2;
 
+    let subconscious_stream_lines = if state.phase == TurnPhase::Subconscious {
+        let n = state.subconscious_stream.len();
+        if n > 0 { (n as u16).min(5) } else { 0 }
+    } else { 0 };
     let phase_height: u16 = if state.busy
         || state.phase == TurnPhase::Interrupted
         || state.phase == TurnPhase::Subconscious
-    { 1 } else { 0 };
+    { 1 + subconscious_stream_lines } else { 0 };
 
     let itinerary_height: u16 = if state.itinerary_line.is_empty() { 0 } else { 1 };
 
@@ -72,7 +76,19 @@ pub fn draw(f: &mut Frame, state: &ChatState) {
     }
 
     if phase_height > 0 {
-        draw_phase(f, state, vchunks[2]);
+        if state.phase == TurnPhase::Subconscious && subconscious_stream_lines > 0 {
+            let phase_rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1),
+                    Constraint::Length(phase_height - 1),
+                ])
+                .split(vchunks[2]);
+            draw_phase(f, state, phase_rows[0]);
+            draw_subconscious_stream(f, state, phase_rows[1]);
+        } else {
+            draw_phase(f, state, vchunks[2]);
+        }
     }
     draw_input(f, state, vchunks[3]);
     draw_footer(f, state, vchunks[4]);
@@ -144,6 +160,56 @@ fn draw_phase(f: &mut Frame, state: &ChatState, area: Rect) {
     }
     let line = Line::from(spans);
     f.render_widget(Paragraph::new(line).alignment(Alignment::Left), area);
+}
+
+/// Render the live subconscious reasoning stream — ephemeral lines from the
+/// N+1 pass showing what the subconscious is thinking, which tools she's
+/// calling, and what results she's getting. Newest at bottom, vivid; older
+/// lines above fade upward toward `agent_dim`. Capped at 5 visible lines;
+/// scrolls as new events arrive.
+fn draw_subconscious_stream(f: &mut Frame, state: &ChatState, area: Rect) {
+    let stream = &state.subconscious_stream;
+    if stream.is_empty() || area.height == 0 {
+        return;
+    }
+    let cap = (area.height as usize).min(5);
+    let visible = stream.len().min(cap);
+    let start = stream.len() - visible;
+    let inner_width = (area.width as usize).saturating_sub(2).max(1);
+    let mut lines: Vec<Line> = Vec::with_capacity(visible);
+    for (idx, i) in (start..stream.len()).enumerate() {
+        let is_newest = i == stream.len() - 1;
+        let t = if visible <= 1 {
+            1.0
+        } else {
+            idx as f32 / (visible - 1) as f32
+        };
+        let color = lerp_color(state.palette.agent_dim, state.palette.surfacing, t);
+        let mut style = Style::default().fg(color).add_modifier(Modifier::ITALIC);
+        if !is_newest && t < 0.34 {
+            style = style.add_modifier(Modifier::DIM);
+        }
+        let prefix = if is_newest { "⟡ " } else { "  " };
+        let body = clip_to_width(&stream[i], inner_width);
+        lines.push(Line::from(vec![Span::styled(format!("{}{}", prefix, body), style)]));
+    }
+    f.render_widget(Paragraph::new(lines).alignment(Alignment::Left), area);
+}
+
+fn clip_to_width(s: &str, width: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let mut acc = String::new();
+    let mut w = 0usize;
+    for ch in s.chars() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if w + cw > width.saturating_sub(1) {
+            acc.push('…');
+            break;
+        }
+        acc.push(ch);
+        w += cw;
+    }
+    acc
 }
 
 fn draw_header(f: &mut Frame, state: &ChatState, area: Rect) {
