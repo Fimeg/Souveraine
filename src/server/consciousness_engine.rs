@@ -782,11 +782,24 @@ Resolve entries: `[YYYY-MM-DD HH:MM] RESOLVED — note`"#;
                 "subconscious LLM call returned"
             );
 
-            // Emit streaming events for live TUI visibility
+            // Chunked-replay streaming for live TUI visibility — mirrors the
+            // primary's pattern at `src/server/turn.rs:445-471`. Bifrost
+            // returns the full response in one shot; we slice it into small
+            // pieces and emit them with a small inter-chunk delay so the
+            // subconscious appears to be typing in real time.
             if let Some(tx) = stream_tx {
-                let content = response.content.trim();
-                if !content.is_empty() {
-                    let _ = tx.send(Ok(BackendEvent::SubconsciousToken(content.to_string()))).await;
+                let trimmed = response.content.trim();
+                if !trimmed.is_empty() {
+                    let chars: Vec<char> = trimmed.chars().collect();
+                    for chunk in chars.chunks(10) {
+                        let s: String = chunk.iter().collect();
+                        if tx.send(Ok(BackendEvent::SubconsciousToken(s))).await.is_err() {
+                            // Receiver dropped — bail out of the streaming
+                            // emission; the round itself still completes.
+                            break;
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                    }
                 }
                 for tc in &response.tool_calls {
                     let _ = tx.send(Ok(BackendEvent::SubconsciousToolCall {

@@ -29,7 +29,9 @@ pub fn draw(f: &mut Frame, state: &ChatState) {
     let input_height = (input_visual_lines.min(max_input_lines) as u16) + 2;
 
     let subconscious_stream_lines = if state.phase == TurnPhase::Subconscious {
-        let n = state.subconscious_stream.len();
+        let history = state.subconscious_stream.len();
+        let live = if state.subconscious_current.is_empty() { 0 } else { 1 };
+        let n = history + live;
         if n > 0 { (n as u16).min(5) } else { 0 }
     } else { 0 };
     let phase_height: u16 = if state.busy
@@ -168,21 +170,40 @@ fn draw_phase(f: &mut Frame, state: &ChatState, area: Rect) {
 /// lines above fade upward toward `agent_dim`. Capped at 5 visible lines;
 /// scrolls as new events arrive.
 fn draw_subconscious_stream(f: &mut Frame, state: &ChatState, area: Rect) {
-    let stream = &state.subconscious_stream;
-    if stream.is_empty() || area.height == 0 {
+    if area.height == 0 {
+        return;
+    }
+    let history = &state.subconscious_stream;
+    let live = &state.subconscious_current;
+    let has_live = !live.is_empty();
+    let total = history.len() + if has_live { 1 } else { 0 };
+    if total == 0 {
         return;
     }
     let cap = (area.height as usize).min(5);
-    let visible = stream.len().min(cap);
-    let start = stream.len() - visible;
+    let visible = total.min(cap);
     let inner_width = (area.width as usize).saturating_sub(2).max(1);
-    let mut lines: Vec<Line> = Vec::with_capacity(visible);
-    for (idx, i) in (start..stream.len()).enumerate() {
-        let is_newest = i == stream.len() - 1;
-        let t = if visible <= 1 {
+
+    // Build the visible window from newest backward, then reverse for render
+    // so newest sits at the bottom of `area`. `slot_idx` indexes the visible
+    // window from 0 (top, dimmest) to visible-1 (bottom, brightest).
+    let mut entries: Vec<&str> = Vec::with_capacity(visible);
+    if has_live {
+        entries.push(live.as_str());
+    }
+    let history_take = visible - entries.len();
+    for s in history.iter().rev().take(history_take) {
+        entries.push(s.as_str());
+    }
+    entries.reverse();
+
+    let mut lines: Vec<Line> = Vec::with_capacity(entries.len());
+    for (slot_idx, body) in entries.iter().enumerate() {
+        let is_newest = slot_idx + 1 == entries.len();
+        let t = if entries.len() <= 1 {
             1.0
         } else {
-            idx as f32 / (visible - 1) as f32
+            slot_idx as f32 / (entries.len() - 1) as f32
         };
         let color = lerp_color(state.palette.agent_dim, state.palette.surfacing, t);
         let mut style = Style::default().fg(color).add_modifier(Modifier::ITALIC);
@@ -190,8 +211,11 @@ fn draw_subconscious_stream(f: &mut Frame, state: &ChatState, area: Rect) {
             style = style.add_modifier(Modifier::DIM);
         }
         let prefix = if is_newest { "⟡ " } else { "  " };
-        let body = clip_to_width(&stream[i], inner_width);
-        lines.push(Line::from(vec![Span::styled(format!("{}{}", prefix, body), style)]));
+        let clipped = clip_to_width(body, inner_width);
+        lines.push(Line::from(vec![Span::styled(
+            format!("{}{}", prefix, clipped),
+            style,
+        )]));
     }
     f.render_widget(Paragraph::new(lines).alignment(Alignment::Left), area);
 }
