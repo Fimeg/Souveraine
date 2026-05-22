@@ -350,6 +350,7 @@ pub struct ChatState {
     pub render_mode: ChatMode,
     pub palette: ChatPalette,
     pub stream_buffer: String,
+    pub subconscious_stream: Vec<String>,
 
     /// Current itinerary route-line for the header strip.
     /// Empty string means no active itinerary.
@@ -503,6 +504,7 @@ impl ChatState {
             render_mode: ChatMode::Conversation,
             palette: ChatPalette::default(),
             stream_buffer: String::new(),
+            subconscious_stream: Vec::new(),
             itinerary_line: String::new(),
         })
     }
