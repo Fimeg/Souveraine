@@ -1080,6 +1080,7 @@ async fn run_reflect(
         &dirs::home_dir()
             .unwrap_or_default()
             .join(".souveraine")
+            .join("server")
             .join("agents")
             .join(&agent.id),
     );

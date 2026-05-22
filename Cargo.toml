@@ -146,9 +146,9 @@ matrix-sdk = { version = "0.17", optional = true, default-features = false }
 tokio-test = "0.4"
 colored = "2"
 
-[[example]]
-name = "demo"
-path = "examples/demo.rs"
+# [[example]]
+# name = "demo"
+# path = "examples/demo.rs"
 
 [[bin]]
 name = "souveraine"

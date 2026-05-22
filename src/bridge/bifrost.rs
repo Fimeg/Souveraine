@@ -513,8 +513,9 @@ impl BifrostClient {
                     return Err(primary_err);
                 }
                 warn!(
-                    "Primary model {} exhausted, trying {} fallback(s)",
+                    "Primary model {} exhausted (error: {}), trying {} fallback(s)",
                     request.model,
+                    primary_err,
                     fallbacks.len()
                 );
             }
