@@ -7,6 +7,8 @@ import Sidebar from '@/components/Layout/Sidebar';
 import StatusBar from '@/components/Layout/StatusBar';
 import ChatContainer from '@/components/Chat/ChatContainer';
 import WelcomeScreen from '@/components/WelcomeScreen';
+import MemoryBrowser from '@/components/Memory/MemoryBrowser';
+import ConsciousnessHub from '@/components/Consciousness/ConsciousnessHub';
 
 /**
  * Ani Studio — Main Application Page
@@ -16,6 +18,7 @@ import WelcomeScreen from '@/components/WelcomeScreen';
  */
 export default function Home() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [activeTab, setActiveTab] = useState('chat');
 
   const {
     agents,
@@ -47,6 +50,40 @@ export default function Home() {
     clearChat();
   };
 
+  const renderActiveContent = () => {
+    if (!isConnected || !selectedAgent) {
+      return (
+        <WelcomeScreen
+          connectionStatus={connectionStatus}
+          onRetry={connect}
+        />
+      );
+    }
+
+    switch (activeTab) {
+      case 'memory':
+        return <MemoryBrowser agent={selectedAgent} />;
+      case 'consciousness':
+        return (
+          <ConsciousnessHub
+            firehoseEvents={firehoseEvents}
+            agent={selectedAgent}
+          />
+        );
+      case 'chat':
+      default:
+        return (
+          <ChatContainer
+            messages={messages}
+            isStreaming={isStreaming}
+            onSend={send}
+            error={error}
+            subconsciousEvents={subconsciousEvents}
+          />
+        );
+    }
+  };
+
   return (
     <div className="app-shell">
       <Header
@@ -63,22 +100,11 @@ export default function Home() {
           onNewChat={handleNewChat}
           isCollapsed={sidebarCollapsed}
           onToggleCollapse={() => setSidebarCollapsed(s => !s)}
+          activeTab={activeTab}
+          onSelectTab={setActiveTab}
         />
 
-        {isConnected && selectedAgent ? (
-          <ChatContainer
-            messages={messages}
-            isStreaming={isStreaming}
-            onSend={send}
-            error={error}
-            subconsciousEvents={subconsciousEvents}
-          />
-        ) : (
-          <WelcomeScreen
-            connectionStatus={connectionStatus}
-            onRetry={connect}
-          />
-        )}
+        {renderActiveContent()}
       </div>
 
       <StatusBar
@@ -89,3 +115,4 @@ export default function Home() {
     </div>
   );
 }
+

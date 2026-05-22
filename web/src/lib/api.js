@@ -87,6 +87,24 @@ export async function fetchMemoryFile(agentId, path) {
   return res.json();
 }
 
+export async function writeMemoryFile(agentId, path, body) {
+  const res = await fetch(`${SOUVERAINE_URL}/v1/agents/${agentId}/memory/${path}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'text/plain' },
+    body: body,
+  });
+  if (!res.ok) throw new Error(`Failed to write memory: ${res.statusText}`);
+  return true;
+}
+
+export async function deleteMemoryFile(agentId, path) {
+  const res = await fetch(`${SOUVERAINE_URL}/v1/agents/${agentId}/memory/${path}`, {
+    method: 'DELETE',
+  });
+  if (!res.ok) throw new Error(`Failed to delete memory: ${res.statusText}`);
+  return true;
+}
+
 export async function checkHealth() {
   try {
     const res = await fetch(`${SOUVERAINE_URL}/health`);
