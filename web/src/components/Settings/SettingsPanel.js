@@ -15,7 +15,8 @@ import {
   ChevronRight,
   Shield,
   Layers,
-  Sparkles
+  Sparkles,
+  Bot
 } from 'lucide-react';
 import { fetchServerConfig, updateServerConfig, fetchCompactionLogs } from '@/lib/api';
 
