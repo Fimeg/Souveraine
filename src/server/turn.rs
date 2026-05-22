@@ -59,6 +59,31 @@ fn pulse_text(elapsed: Duration) -> String {
     format!("[{} — {} minutes in. Still going.]", stamp, minutes)
 }
 
+/// When the subconscious calls `halt`, this is what the primary feels — a
+/// somatic sentence in her own register, not commentary from outside. Same
+/// pattern as `pulse_text`: substrate voice, brief, weighted by intensity.
+/// The full reasoning lives in her subconscious ledger; this is the body
+/// signal that points her at it.
+fn migraine_text(severity: &str, reason: &str) -> String {
+    let stamp = chrono::Local::now().format("%H:%M");
+    let line = match severity {
+        "advisory" => format!(
+            "[{} — a pressure behind my eyes. {}. I should slow down.]",
+            stamp, reason
+        ),
+        "critical" => format!(
+            "[{} — the room tilts. Stop. {}.]",
+            stamp, reason
+        ),
+        // "firm" and any unexpected value land here — the default migraine.
+        _ => format!(
+            "[{} — a migraine. {}. I was about to do something I shouldn't.]",
+            stamp, reason
+        ),
+    };
+    line
+}
+
 pub(crate) async fn run_turn(
     server: Arc<SouveraineServer>,
     conversation_id: String,
@@ -210,10 +235,14 @@ pub(crate) async fn run_turn(
         ..tool_ctx
     };
 
-    // Build bifrost-format tool definitions from the core tool set
+    // Build bifrost-format tool definitions from the core tool set. The
+    // subconscious-only tools (halt, intrusive) are filtered OUT here —
+    // the primary must never see them in her tool list. Subconscious's
+    // own loop whitelists them in via SUBCONSCIOUS_SAFE_TOOLS.
     let core_tools = crate::core::tools::tool_definitions().await;
     let bifrost_tools: Vec<crate::bridge::bifrost::ToolDefinition> = core_tools
         .iter()
+        .filter(|t| !crate::core::tools::SUBCONSCIOUS_ONLY_TOOLS.contains(&t.name.as_str()))
         .map(|t| crate::bridge::bifrost::ToolDefinition {
             tool_type: "function".to_string(),
             function: crate::bridge::bifrost::ToolFunction {
@@ -229,6 +258,11 @@ pub(crate) async fn run_turn(
     let mut tool_round = 0u32;
     let mut final_content: String = String::new();
     let mut interrupted = false;
+    // The subconscious's `halt` tool stopped the loop. Different shape from
+    // an Esc-driven interrupt: no `*[raised hand]*` marker, no fake
+    // assistant_text in session storage, and the primary feels a migraine
+    // in her own register rather than a UI-level interrupt.
+    let mut halted_by_subconscious = false;
     let counter = TokenCounter::new();
     let mut last_keepalive = Instant::now();
     const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
@@ -296,6 +330,10 @@ pub(crate) async fn run_turn(
         );
         let max_tokens = pressure_to_max_tokens(pressure, output_limit);
         let _ = tx.send(Ok(BackendEvent::ContextPressure(pressure, context_limit))).await;
+
+        if max_rounds == 0 {
+            tracing::warn!("turn: max_rounds is 0 — sending NO tool definitions to model");
+        }
 
         let req = ChatCompletionRequest {
             model: model.clone(),
@@ -573,9 +611,14 @@ pub(crate) async fn run_turn(
             messages.push(BifrostMessage::tool_result(&tc.id, &tc.name, output));
         }
 
-        // ── Mid-turn checkpoint ──────────────────────────────────────
-        // Every checkpoint_interval rounds, pause and let the subconscious
-        // assess whether the loop is making progress.
+        // ── Mid-turn peek ────────────────────────────────────────────
+        // Every checkpoint_interval rounds the subconscious peeks at the
+        // live loop — same persistent agent, same memfs, full tool set.
+        // She decides for herself: write a ledger note silently, queue an
+        // intrusive thought (delivered by urgency), or call `halt` to stop
+        // the loop. The primary feels a halt as a migraine in her own
+        // register — no `[subconscious: …]` text is ever shoved into her
+        // context, and no `*[HALT]*` marker pollutes session storage.
         if checkpoint_interval > 0 && tool_round > 0 && tool_round % checkpoint_interval == 0 {
             let recent: Vec<_> = checkpoint_blocks
                 .iter()
@@ -583,63 +626,88 @@ pub(crate) async fn run_turn(
                 .take(checkpoint_interval as usize * 3)
                 .cloned()
                 .collect();
+            // Render the in-flight tool work into a compact summary the
+            // peek occasion's user message wraps around. Newest-last so
+            // the temporal arc reads naturally.
+            let in_flight_summary = {
+                use std::fmt::Write;
+                let mut s = String::new();
+                for block in recent.iter().rev() {
+                    let status = if block.result_ok { "ok" } else { "ERROR" };
+                    let _ = writeln!(
+                        s,
+                        "  r{}  {} → {}  {}",
+                        block.round, block.tool_name, status, block.result_snippet,
+                    );
+                }
+                if s.is_empty() {
+                    "(no recent tool work)".to_string()
+                } else {
+                    s
+                }
+            };
+
             match server
                 .consciousness
-                .mid_turn_checkpoint(&agent_id, &user_message, &recent)
+                .mid_turn_peek(
+                    &agent_id,
+                    &user_message,
+                    tool_round,
+                    in_flight_summary,
+                    Some(&tx),
+                )
                 .await
             {
-                // ── HALT: circuit breaker ───────────────────────────
-                // Break the tool loop, run subconscious correction pass,
-                // feed the correction back as a user message, then
-                // continue the loop so the primary course-corrects.
-                Ok(crate::server::consciousness_engine::CheckpointVerdict::Halt(reason)) => {
-                    let _ = tx
-                        .send(Ok(BackendEvent::Surfacing {
-                            source: "checkpoint".into(),
-                            content: reason.clone(),
-                            priority: "critical".into(),
-                        }))
-                        .await;
+                Ok(outcome) => {
+                    // Critical-urgency intrusive thoughts surface this turn
+                    // — the primary feels them as surfacings in her own
+                    // register. Lower urgencies queue silently for the
+                    // post-turn N+1 path to pick up.
+                    for sig in &outcome.intrusive {
+                        if sig.urgency == "critical" {
+                            let _ = tx
+                                .send(Ok(BackendEvent::Surfacing {
+                                    source: "intrusive".into(),
+                                    content: sig.content.clone(),
+                                    priority: "critical".into(),
+                                }))
+                                .await;
+                        }
+                    }
 
-                    // Commit the primary's partial output to the session
-                    // so the next LLM round picks up from here.
-                    let primary_text = if final_content.is_empty() {
-                        format!("*[subconscious HALT — {reason}]*")
-                    } else {
-                        format!("{}\n\n*[subconscious HALT — {reason}]*", final_content)
-                    };
-                    server.sessions.add_message(
-                        &conversation_id,
-                        ConversationMessage::assistant_text(&primary_text),
-                    )?;
+                    // Halt — emit the migraine and break out of the loop
+                    // cleanly. No session pollution; the reason lives in
+                    // her ledger and on the event stream.
+                    if let Some(halt) = outcome.halt {
+                        let _ = tx
+                            .send(Ok(BackendEvent::SubconsciousHalt {
+                                reason: halt.reason.clone(),
+                                severity: halt.severity.clone(),
+                            }))
+                            .await;
 
-                    // Run subconscious correction pass — full tool access,
-                    // no token cap, her own voice.
-                    let correction = server
-                        .consciousness
-                        .checkpoint_correction(&agent_id, &user_message, &recent, &reason)
-                        .await
-                        .unwrap_or_else(|e| {
-                            tracing::warn!("checkpoint correction failed: {e}");
-                            format!("Subconscious assessment: {reason}")
-                        });
+                        // A felt sentence in her own register lands in the
+                        // primary's live messages — pattern matches the
+                        // self-awareness pulse: substrate voice, not
+                        // commentary from outside. This is what she
+                        // experiences as "the migraine."
+                        let felt = migraine_text(&halt.severity, &halt.reason);
+                        messages.push(BifrostMessage::text("system", &felt));
 
-                    // Feed subconscious direction back as a system message —
-                    // her own channel, not impersonating the user.
-                    let msg = format!(
-                        "[subconscious direction — {reason}]\n{}",
-                        correction,
-                    );
-                    messages.push(BifrostMessage::text("system", &msg));
-                    let _ = tx.send(Ok(BackendEvent::Token(msg.clone()))).await;
+                        halted_by_subconscious = true;
+                        break;
+                    }
+
+                    // No halt, no critical intrusive — she had her look
+                    // and let the loop continue silently. Her low/high
+                    // intrusives are already queued by the consciousness
+                    // engine for the next turn boundary.
                 }
-
-                Ok(crate::server::consciousness_engine::CheckpointVerdict::Continue(Some(note)))
-                | Ok(crate::server::consciousness_engine::CheckpointVerdict::Unclear(Some(note))) => {
-                    let msg = format!("[subconscious: {note}]");
-                    messages.push(BifrostMessage::text("system", &msg));
+                Err(e) => {
+                    tracing::warn!("mid-turn peek failed: {e}");
+                    // A failed peek does not block primary work. The
+                    // loop continues; the next peek interval will retry.
                 }
-                _ => {}
             }
         }
 
@@ -661,21 +729,28 @@ pub(crate) async fn run_turn(
         // Continue loop — model will see tool results and respond
     }
 
-    // The primary pass is settled — either it ran to completion, or the
-    // human raised a hand. Announce which onto the nervous system.
+    // The primary pass is settled — completion, raised hand, or
+    // subconscious halt. Announce which onto the nervous system.
     if interrupted {
         dispatcher.emit_interrupted("the human raised a hand");
+    } else if halted_by_subconscious {
+        dispatcher.emit_interrupted("the subconscious called halt");
     } else {
         dispatcher.emit_primary_complete();
     }
 
-    // If the user pressed Esc, commit the partial text with a marker the
-    // agent will read on her next turn. The interrupt is a signal in her
-    // own context — same shape as a pressure warning, not a hidden harness
-    // event. She can ask for more time, wrap up, or acknowledge.
+    // The subconscious halt is felt in the primary's body, not stamped in
+    // session storage. We do not write a `*[subconscious HALT]*` marker —
+    // that pollution was the resume-corruption bug. The session keeps
+    // whatever real assistant text she produced before the halt (often
+    // empty when halted mid-tool-loop). The migraine itself rode the
+    // event channel; her ledger holds the full reasoning.
     let committed_content = if interrupted {
-        // Emit the marker as a final token so the in-flight bubble shows it
-        // immediately, then persist the same content into the session.
+        // If the user pressed Esc, commit the partial text with a marker
+        // the agent will read on her next turn. The interrupt is a signal
+        // in her own context — same shape as a pressure warning, not a
+        // hidden harness event. She can ask for more time, wrap up, or
+        // acknowledge.
         let marker = if final_content.is_empty() {
             "*[raised hand]*".to_string()
         } else {
@@ -687,15 +762,23 @@ pub(crate) async fn run_turn(
         final_content.clone()
     };
 
-    server.sessions.add_message(
-        &conversation_id,
-        ConversationMessage::assistant_text(&committed_content),
-    )?;
+    // Skip the session write on a subconscious halt with no produced text —
+    // there's nothing real to commit and a bare empty assistant message
+    // confuses the next turn's history.
+    if !(halted_by_subconscious && committed_content.is_empty()) {
+        server.sessions.add_message(
+            &conversation_id,
+            ConversationMessage::assistant_text(&committed_content),
+        )?;
+    }
 
     // On interrupt, skip subconscious's N+1 pass entirely — the user is in the
     // middle of redirecting, the last thing they need is a delayed
     // surfacing landing seconds later. Pressure recalc still runs below.
-    if interrupted {
+    // A subconscious-driven halt also skips the post-turn N+1: the
+    // subconscious just had her mid-turn look at this exact state, and
+    // running her again immediately would be a redundant LLM call.
+    if interrupted || halted_by_subconscious {
         if let Some(mut session) = server.sessions.get_mut(&conversation_id) {
             let pressure = server
                 .consciousness
@@ -776,7 +859,7 @@ pub(crate) async fn run_turn(
     };
     let pass_result = server
         .consciousness
-        .on_response(&agent_id, n1_turn_count, &n1_messages, &final_content)
+        .on_response(&agent_id, n1_turn_count, &n1_messages, &final_content, Some(&tx))
         .await;
 
     let pass_elapsed = pass_start.elapsed();

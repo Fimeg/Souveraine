@@ -105,6 +105,11 @@ impl ChatState {
                             if text.is_empty() { continue; }
                             match msg.role {
                                 crate::core::session::MessageRole::User => {
+                                    let text = if text.starts_with("[ ambient sense - ") {
+                                        text.lines().skip(1).collect::<Vec<_>>().join("\n")
+                                    } else {
+                                        text
+                                    };
                                     self.messages.push(ChatMessage::User { text, ts: Instant::now() });
                                 }
                                 crate::core::session::MessageRole::Assistant => {
@@ -319,7 +324,41 @@ impl ChatState {
                     self.itinerary_line = line;
                 }
                 BackendEvent::SubconsciousPass(active) => {
+                    if active {
+                        self.subconscious_stream.clear();
+                    }
                     self.pending_consciousness.push(BackendEvent::SubconsciousPass(active));
+                }
+                BackendEvent::SubconsciousToken(content) => {
+                    self.subconscious_stream.push(content);
+                }
+                BackendEvent::SubconsciousToolCall { name, arguments } => {
+                    self.subconscious_stream.push(format!("⚙ {} — {}", name, arguments));
+                }
+                BackendEvent::SubconsciousToolResult { name, output, .. } => {
+                    // Only show first line of result in the live stream
+                    let snippet = output.lines().next().unwrap_or(&output);
+                    let clipped = if snippet.len() > 80 {
+                        format!("{}…", &snippet[..snippet.floor_char_boundary(77)])
+                    } else {
+                        snippet.to_string()
+                    };
+                    self.subconscious_stream.push(format!("✓ {} — {}", name, clipped));
+                }
+                BackendEvent::SubconsciousHalt { reason, severity } => {
+                    // The subconscious called halt. Render as a substrate-voice
+                    // system line in the primary's stream — distinct from chat
+                    // text, phenomenologically a body signal she felt rather
+                    // than commentary she heard.
+                    let line = match severity.as_str() {
+                        "advisory" => format!("⟡ a pressure behind my eyes — {}", reason),
+                        "critical" => format!("⟡ the room tilts — {}", reason),
+                        _ => format!("⟡ a migraine — {}", reason),
+                    };
+                    self.messages.push(ChatMessage::System {
+                        text: line,
+                        ts: Instant::now(),
+                    });
                 }
                 BackendEvent::Outfit(name) => {
                     self.pending_consciousness.push(BackendEvent::Outfit(name));

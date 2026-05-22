@@ -11,6 +11,8 @@ pub mod defs;
 pub mod edit;
 pub mod glob;
 pub mod grep;
+pub mod halt;
+pub mod intrusive;
 pub mod itinerary;
 pub mod list_dir;
 pub mod nickname;
@@ -32,6 +34,8 @@ use self::defs::{Tool, ToolContext, ToolError, ToolOutput};
 use self::edit::Edit;
 use self::glob::Glob;
 use self::grep::Grep;
+use self::halt::Halt;
+use self::intrusive::Intrusive;
 use self::list_dir::ListDir;
 use self::nickname::Nickname;
 use self::outfit::Outfit;
@@ -43,6 +47,12 @@ use self::itinerary::ItineraryTool;
 use self::schedule::Schedule;
 use self::todo::Todo;
 use self::write::Write;
+
+/// Tools that exist only for the subconscious mode. The primary's tool list
+/// filters these out; the subconscious whitelists them in.
+/// Lives here so both the primary's filter (turn.rs) and the subconscious's
+/// whitelist (consciousness_engine.rs) read from the same source of truth.
+pub const SUBCONSCIOUS_ONLY_TOOLS: &[&str] = &["halt", "intrusive"];
 
 // ── Re-export for backward compat ───────────────────────────────
 
@@ -98,6 +108,8 @@ impl Sensorium {
                 Box::new(ItineraryTool),
                 Box::new(Todo),
                 Box::new(Schedule),
+                Box::new(Halt),
+                Box::new(Intrusive),
             ],
             bash,
             context: ToolContext {

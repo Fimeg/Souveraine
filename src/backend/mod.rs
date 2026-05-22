@@ -106,6 +106,20 @@ pub enum BackendEvent {
         output: String,
         is_error: bool,
     },
+    /// Streaming token from the subconscious N+1 pass (emitted between tool
+    /// rounds — the LLM call itself is non-streaming, so this fires in blocks
+    /// rather than character-by-character).
+    SubconsciousToken(String),
+    /// Subconscious called a tool during N+1.
+    SubconsciousToolCall { name: String, arguments: String },
+    /// Subconscious tool result during N+1.
+    SubconsciousToolResult { name: String, output: String, is_error: bool },
+    /// Subconscious called `halt` during a mid-turn peek — the primary's tool
+    /// loop is being stopped and she feels a migraine in her own register.
+    /// The reason is the short sentence she will sense; the severity shapes
+    /// how loud the body signal lands. The long-form reasoning lives in her
+    /// subconscious's ledger; the primary can read it when she breathes through.
+    SubconsciousHalt { reason: String, severity: String },
     /// Agent set an atmospheric preset for the UI chrome.
     Atmosphere(String),
 
