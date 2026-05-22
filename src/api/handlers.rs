@@ -445,3 +445,143 @@ async fn federation_events_stream(server: Arc<SouveraineServer>, mut socket: Web
 
     tracing::info!("federation: peer bridge disconnected from inbound endpoint");
 }
+
+// ─── Phase 3 REST Handlers ────────────────────────────────────────────────
+
+pub async fn get_config(
+    State(server): State<Arc<SouveraineServer>>,
+) -> Result<Json<crate::core::config::ConsciousnessConfig>, ApiError> {
+    let config = server.app_config.read().await.clone();
+    Ok(Json(config))
+}
+
+pub async fn update_config(
+    State(server): State<Arc<SouveraineServer>>,
+    Json(new_config): Json<crate::core::config::ConsciousnessConfig>,
+) -> Result<Json<crate::core::config::ConsciousnessConfig>, ApiError> {
+    // 1. Update active configuration in memory
+    {
+        let mut config = server.app_config.write().await;
+        *config = new_config.clone();
+    }
+
+    // 2. Persist updated TOML configuration file to disk
+    let config_path = crate::core::config::ConsciousnessConfig::discover_path()
+        .unwrap_or_else(|| std::path::PathBuf::from("souveraine.toml"));
+
+    if let Err(e) = new_config.save(&config_path) {
+        tracing::warn!("Failed to persist config to disk at {:?}: {}", config_path, e);
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
+            error: "config_save_failed".to_string(),
+            message: e.to_string(),
+        })));
+    } else {
+        tracing::info!("Saved live settings to {:?}", config_path);
+    }
+
+    Ok(Json(new_config))
+}
+
+pub async fn get_compaction_logs(
+    State(server): State<Arc<SouveraineServer>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let base = dirs::home_dir().unwrap_or_default().join(".souveraine");
+    let events_dir = base.join("events");
+
+    let mut logs = Vec::new();
+
+    // Scan date partitioned logs for the past 7 days
+    let today = chrono::Utc::now().date_naive();
+    for i in 0..7 {
+        let date = today - chrono::Duration::days(i);
+        let path = events_dir.join(format!("events-{}.jsonl", date.format("%Y-%m-%d")));
+        if !path.exists() {
+            continue;
+        }
+
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            for line in content.lines() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                    let sensor = val.get("sensor_name").and_then(|s| s.as_str()).unwrap_or("");
+                    let ev_type = val.get("event_type").and_then(|t| t.as_str()).unwrap_or("");
+                    let content = val.get("payload").and_then(|p| p.get("content").and_then(|c| c.as_str())).unwrap_or("");
+
+                    if sensor == "archivist" || 
+                       ev_type.contains("compaction") || 
+                       ev_type.contains("archive") ||
+                       content.contains("compaction") {
+                        logs.push(val);
+                    }
+                }
+            }
+        }
+    }
+
+    // Return newest events first
+    logs.reverse();
+
+    Ok(Json(serde_json::json!({ "logs": logs })))
+}
+
+pub async fn get_conversation_tokens(
+    State(server): State<Arc<SouveraineServer>>,
+    Path(conversation_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let session = server.sessions.get(&conversation_id)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(ErrorResponse {
+            error: "conversation_not_found".to_string(),
+            message: format!("Conversation {} not found", conversation_id),
+        })))?;
+
+    let counter = crate::bridge::model_router::TokenCounter::new();
+
+    let mut system_tokens = 0;
+    let mut user_tokens = 0;
+    let mut assistant_tokens = 0;
+
+    for msg in &session.messages {
+        let mut msg_tokens = 0;
+        for block in &msg.blocks {
+            let block_text = match block {
+                crate::core::session::ContentBlock::Text { text } => text.clone(),
+                crate::core::session::ContentBlock::ToolUse { id, name, input } => format!("{id} {name} {input}"),
+                crate::core::session::ContentBlock::ToolResult { tool_use_id, tool_name, output, .. } => {
+                    format!("{tool_use_id} {tool_name} {output}")
+                }
+                crate::core::session::ContentBlock::Reasoning { reasoning } => reasoning.clone(),
+                crate::core::session::ContentBlock::Image { media_type, data } => format!("{media_type} {data}"),
+            };
+            msg_tokens += counter.count(&block_text);
+        }
+
+        match msg.role {
+            crate::core::session::MessageRole::System => system_tokens += msg_tokens,
+            crate::core::session::MessageRole::User => user_tokens += msg_tokens,
+            crate::core::session::MessageRole::Assistant => assistant_tokens += msg_tokens,
+            crate::core::session::MessageRole::Tool => user_tokens += msg_tokens, // Tool inputs/outputs consume context space
+        }
+    }
+
+    let total_tokens = system_tokens + user_tokens + assistant_tokens;
+
+    // Load agent to query their configured model's context limit
+    let limit = if let Ok(agent) = server.agents.get(&session.agent_id).await {
+        agent.llm_config.context_window as usize
+    } else {
+        128000
+    };
+
+    Ok(Json(serde_json::json!({
+        "system_tokens": system_tokens,
+        "user_tokens": user_tokens,
+        "assistant_tokens": assistant_tokens,
+        "total_tokens": total_tokens,
+        "context_limit": limit,
+        "percentage": if limit > 0 { (total_tokens as f32 / limit as f32).min(1.0) } else { 0.0 }
+    })))
+}
+

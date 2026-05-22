@@ -3,12 +3,14 @@ import { useState } from 'react';
 import MessageList from './MessageList';
 import InputBar from './InputBar';
 import SubconsciousPanel from './SubconsciousPanel';
+import TokenVisualizer from './TokenVisualizer';
 
-export default function ChatContainer({ messages, isStreaming, onSend, error, subconsciousEvents }) {
+export default function ChatContainer({ messages, isStreaming, onSend, error, subconsciousEvents, conversationId }) {
   const [showSubconscious, setShowSubconscious] = useState(false);
 
   return (
     <main className="chat-container" id="chat-container">
+      <TokenVisualizer conversationId={conversationId} messagesCount={messages.length} />
       {error && (
         <div className="chat-error" role="alert" id="chat-error">
           <span className="chat-error-icon">⚠</span>

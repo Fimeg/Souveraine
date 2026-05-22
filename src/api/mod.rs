@@ -18,6 +18,9 @@ pub fn create_routes(state: Arc<SouveraineServer>) -> Router {
         .route("/v1/conversations", get(handlers::list_conversations).post(handlers::create_conversation))
         .route("/v1/firehose", get(handlers::firehose))
         .route("/v1/federation/events", get(handlers::federation_events))
+        .route("/v1/config", get(handlers::get_config).post(handlers::update_config))
+        .route("/v1/compaction-logs", get(handlers::get_compaction_logs))
+        .route("/v1/conversations/:id/tokens", get(handlers::get_conversation_tokens))
         .route("/health", get(health_check));
 
     // Protected agent routes — require per-agent bearer token.

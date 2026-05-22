@@ -9,6 +9,7 @@ import ChatContainer from '@/components/Chat/ChatContainer';
 import WelcomeScreen from '@/components/WelcomeScreen';
 import MemoryBrowser from '@/components/Memory/MemoryBrowser';
 import ConsciousnessHub from '@/components/Consciousness/ConsciousnessHub';
+import SettingsPanel from '@/components/Settings/SettingsPanel';
 
 /**
  * Ani Studio — Main Application Page
@@ -37,6 +38,7 @@ export default function Home() {
     subconsciousEvents,
     send,
     clearChat,
+    conversationId,
   } = useChat(selectedAgent?.id);
 
   const isConnected = connectionStatus === 'connected';
@@ -70,6 +72,8 @@ export default function Home() {
             agent={selectedAgent}
           />
         );
+      case 'settings':
+        return <SettingsPanel agent={selectedAgent} />;
       case 'chat':
       default:
         return (
@@ -79,6 +83,7 @@ export default function Home() {
             onSend={send}
             error={error}
             subconsciousEvents={subconsciousEvents}
+            conversationId={conversationId}
           />
         );
     }

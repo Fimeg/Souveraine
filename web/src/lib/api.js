@@ -136,3 +136,34 @@ export function createFirehoseConnection(onEvent, onError) {
 
   return ws;
 }
+
+// ─── Phase 3 REST queries ────────────────────────────────────────────────
+
+export async function fetchServerConfig() {
+  const res = await fetch(`${SOUVERAINE_URL}/v1/config`);
+  if (!res.ok) throw new Error(`Failed to load server configurations: ${res.statusText}`);
+  return res.json();
+}
+
+export async function updateServerConfig(config) {
+  const res = await fetch(`${SOUVERAINE_URL}/v1/config`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(config),
+  });
+  if (!res.ok) throw new Error(`Failed to update server configurations: ${res.statusText}`);
+  return res.json();
+}
+
+export async function fetchCompactionLogs() {
+  const res = await fetch(`${SOUVERAINE_URL}/v1/compaction-logs`);
+  if (!res.ok) throw new Error(`Failed to fetch compaction logs: ${res.statusText}`);
+  return res.json();
+}
+
+export async function fetchConversationTokens(conversationId) {
+  const res = await fetch(`${SOUVERAINE_URL}/v1/conversations/${conversationId}/tokens`);
+  if (!res.ok) throw new Error(`Failed to load conversation token metrics: ${res.statusText}`);
+  return res.json();
+}
+
