@@ -32,16 +32,26 @@ use crate::core::session::{ContentBlock, ConversationMessage, MessageRole};
 use crate::core::subconscious::{InboxItem, SubconsciousInbox, Urgency};
 use crate::core::tools::defs::ToolContext;
 use crate::server::{AgentInventory, SessionManager};
+use crate::backend::BackendEvent;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::mpsc;
 
-/// Tools subconscious is permitted to use during her N+1 pass.
+/// Tools subconscious is permitted to use. `halt` and `intrusive` are
+/// subconscious-only — the primary's tool list filters them out (see
+/// `crate::core::tools::SUBCONSCIOUS_ONLY_TOOLS`).
 const SUBCONSCIOUS_SAFE_TOOLS: &[&str] = &[
     "read", "write", "edit", "glob", "grep", "list_dir", "memory", "schedule", "todo",
+    "halt", "intrusive",
 ];
 
-/// Maximum tool rounds for subconscious's subconscious pass.
-const SUBCONSCIOUS_MAX_TOOL_ROUNDS: u32 = 5;
+/// Tool rounds for the post-turn N+1 pass — the deeper occasion where the
+/// subconscious reads the last exchange, checks ledgers, and writes durable
+/// observations.
+const SUBCONSCIOUS_POST_TURN_ROUNDS: u32 = 10;
+/// Tool rounds for a mid-turn peek — bounded because she is interrupting
+/// live work to glance at the primary's trajectory.
+const SUBCONSCIOUS_MID_TURN_ROUNDS: u32 = 5;
 /// Milliseconds to wait between subconscious's tool rounds to avoid rate-limit cascades.
 const SUBCONSCIOUS_INTER_ROUND_DELAY_MS: u64 = 300;
 
@@ -76,7 +86,8 @@ pub enum ConsciousnessEvent {
     CompactionWarning { pressure: f32, tier: u8 },
 }
 
-/// One tool call recorded for a mid-turn checkpoint assessment.
+/// One tool call recorded for a mid-turn peek. Kept so turn.rs can render
+/// a compact tool-history snippet into the peek's framing message.
 #[derive(Debug, Clone)]
 pub struct CheckpointToolBlock {
     pub round: u32,
@@ -85,15 +96,58 @@ pub struct CheckpointToolBlock {
     pub result_snippet: String,
 }
 
-/// What the subconscious thinks about the current tool loop trajectory.
-#[derive(Debug)]
-pub enum CheckpointVerdict {
-    /// Keep going — progress is visible.
-    Continue(Option<String>),
-    /// Halt — the loop is circling, surface the reason.
-    Halt(String),
-    /// No clear signal.
-    Unclear(Option<String>),
+/// Which occasion the subconscious is being woken for. Same agent, same
+/// persistent session — different evidence, different framing, different
+/// round budget.
+#[derive(Debug, Clone)]
+pub enum Occasion {
+    /// After the primary's turn settled. Deeper budget, persists to her
+    /// thread, surfaces via the existing inbox + inner-voice pipeline.
+    PostTurn,
+    /// Mid-loop — the primary is `tool_round` rounds into a tool sequence
+    /// and the subconscious is peeking to decide whether the trajectory is
+    /// right. Bounded budget; her observations land in ledger/inbox via her
+    /// tools but the peek itself does not persist into her main thread (it
+    /// would balloon her context with primary state on every interval).
+    MidTurnPeek {
+        tool_round: u32,
+        /// Pre-rendered in-flight context (recent tool blocks + the user's
+        /// original ask) — turn.rs formats this so the engine stays
+        /// ignorant of primary message shapes.
+        in_flight_summary: String,
+    },
+}
+
+/// The subconscious called `halt` during a peek. The reason is what the
+/// primary will feel as the cause of her migraine; the long-form reasoning
+/// lives in her ledger.
+#[derive(Debug, Clone)]
+pub struct HaltSignal {
+    pub reason: String,
+    pub severity: String,
+}
+
+/// The subconscious called `intrusive` — a softer flag than halt.
+#[derive(Debug, Clone)]
+pub struct IntrusiveSignal {
+    pub content: String,
+    pub urgency: String,
+}
+
+/// What one pass of the subconscious actually produced. Returned by the
+/// unified `subconscious_tool_loop` so callers (`on_response` for post-turn,
+/// `turn.rs` for mid-turn) can react appropriately.
+#[derive(Debug, Default)]
+pub struct SubconsciousPassOutcome {
+    /// Observations parsed out of her final text response. Empty for a
+    /// MidTurnPeek that did its work entirely through tools.
+    pub observations: Vec<InboxItem>,
+    /// `halt` was called — the loop should stop and the primary should feel
+    /// the migraine.
+    pub halt: Option<HaltSignal>,
+    /// `intrusive` calls collected during the pass — caller decides routing
+    /// (immediate surfacing vs. inbox queue) based on urgency.
+    pub intrusive: Vec<IntrusiveSignal>,
 }
 
 impl ConsciousnessEngine {
@@ -201,6 +255,7 @@ impl ConsciousnessEngine {
         turn_count: u32,
         messages: &[ConversationMessage],
         response: &str,
+        stream_tx: Option<&mpsc::Sender<anyhow::Result<BackendEvent>>>,
     ) -> anyhow::Result<Vec<ConsciousnessEvent>> {
         let mut events = Vec::new();
         let pressure = self.pressure_for(agent_id, messages).await;
@@ -306,13 +361,20 @@ impl ConsciousnessEngine {
         // Run the tool loop with subconscious agent identity
         let sub_id = format!("{}-sub", agent_id);
         match self
-            .subconscious_tool_loop(&last_user_msg, response, agent_id, &sub_id)
+            .subconscious_tool_loop(
+                &last_user_msg,
+                response,
+                agent_id,
+                &sub_id,
+                Occasion::PostTurn,
+                stream_tx,
+            )
             .await
         {
-            Ok(observations) => {
+            Ok(outcome) => {
                 // Heartbeat so the UI always shows something when the
                 // subconscious pass ran, even if nothing stood out.
-                if observations.is_empty() {
+                if outcome.observations.is_empty() {
                     let beat = "Subconscious pass complete — no anomalies detected.";
                     let _ = inbox
                         .queue(InboxItem::new("surface", Urgency::Low, beat))
@@ -327,18 +389,40 @@ impl ConsciousnessEngine {
                         tracing::warn!("inner voice heartbeat delivery failed: {}", e);
                     }
                 }
-                for item in &observations {
+                for item in &outcome.observations {
                     if let Err(e) = inbox.queue(item.clone()).await {
                         tracing::warn!("subconscious queue failed: {}", e);
                     }
                 }
 
                 // Persist to inner voice file (survives compaction)
-                for item in &observations {
+                for item in &outcome.observations {
                     if let Err(e) = inbox.surface_to_conscious(item.urgency, &item.content).await
                     {
                         tracing::warn!("inner voice delivery failed: {}", e);
                     }
+                }
+
+                // Intrusive signals she emitted during the pass — queue them
+                // through the same inbox path so the next-turn surfacing
+                // picks them up.
+                for sig in &outcome.intrusive {
+                    let urgency = parse_urgency(&sig.urgency);
+                    let _ = inbox
+                        .queue(InboxItem::new("intrusive", urgency, sig.content.clone()))
+                        .await;
+                }
+                // A halt at post-turn is unusual (the loop already finished)
+                // but if she emitted one, surface it as a critical inbox item
+                // so the primary's next turn sees it.
+                if let Some(halt) = &outcome.halt {
+                    let _ = inbox
+                        .queue(InboxItem::new(
+                            "surface",
+                            Urgency::Critical,
+                            format!("halt deferred ({}): {}", halt.severity, halt.reason),
+                        ))
+                        .await;
                 }
             }
             Err(e) => {
@@ -408,18 +492,27 @@ impl ConsciousnessEngine {
 
         // For subagents we don't have the user's message context,
         // so we pass empty string as the user message.
-        match self.subconscious_tool_loop("", response, agent_id, &sub_id).await {
-            Ok(observations) => {
-                for item in &observations {
+        match self
+            .subconscious_tool_loop("", response, agent_id, &sub_id, Occasion::PostTurn, None)
+            .await
+        {
+            Ok(outcome) => {
+                for item in &outcome.observations {
                     if let Err(e) = inbox.queue(item.clone()).await {
                         tracing::warn!("subagent subconscious queue failed: {}", e);
                     }
                 }
-                for item in &observations {
+                for item in &outcome.observations {
                     if let Err(e) = inbox.surface_to_conscious(item.urgency, &item.content).await
                     {
                         tracing::warn!("subagent inner voice delivery failed: {}", e);
                     }
+                }
+                for sig in &outcome.intrusive {
+                    let urgency = parse_urgency(&sig.urgency);
+                    let _ = inbox
+                        .queue(InboxItem::new("intrusive", urgency, sig.content.clone()))
+                        .await;
                 }
             }
             Err(e) => {
@@ -438,12 +531,18 @@ impl ConsciousnessEngine {
         Ok(())
     }
 
-    /// Full tool loop for subconscious's N+1 subconscious pass.
+    /// Unified subconscious pass — same persistent session, two occasions.
     ///
-    /// subconscious gets the last exchange, a set of safe tools (Read, Write, Edit,
-    /// Glob, Grep, ListDir, Memory), and up to 5 tool rounds to analyze context
-    /// and write observations. Her final text response is parsed into
-    /// [`InboxItem`] observations.
+    /// `PostTurn`: the deep occasion. She reads the last exchange, checks
+    /// ledgers, writes durable observations, has the full `POST_TURN_ROUNDS`
+    /// budget, and her thread persists across passes.
+    ///
+    /// `MidTurnPeek`: she's peeking at a live tool loop. Same agent, same
+    /// memfs, same tools — bounded round budget, and the peek does *not*
+    /// persist into her main thread (it would balloon her context with the
+    /// primary's in-flight state on every checkpoint). She acts through
+    /// `halt` (stop the loop, feel the migraine), `intrusive` (flag a
+    /// thought without stopping), or just writes to her ledger silently.
     ///
     /// `primary_id` is the primary agent's identifier (for config/directory lookup).
     /// `sub_id` is the subconscious agent's identifier (for tool context, memory).
@@ -453,7 +552,9 @@ impl ConsciousnessEngine {
         primary_response: &str,
         primary_id: &str,
         sub_id: &str,
-    ) -> anyhow::Result<Vec<InboxItem>> {
+        occasion: Occasion,
+        stream_tx: Option<&mpsc::Sender<anyhow::Result<BackendEvent>>>,
+    ) -> anyhow::Result<SubconsciousPassOutcome> {
         let model = self
             .subconscious_model
             .as_deref()
@@ -518,16 +619,46 @@ Resolve entries: `[YYYY-MM-DD HH:MM] RESOLVED — note`"#;
         // date/time and presence orientation the primary receives.
         let ambient = crate::core::sensorium::ambient_line();
 
-        let user_content = if user_message.is_empty() {
-            format!(
-                "{}\n{} responded:\n\n{}",
-                ambient, primary_name, primary_response
-            )
-        } else {
-            format!(
-                "{}\nUser said:\n{}\n\n{} responded:\n{}",
-                ambient, user_message, primary_name, primary_response
-            )
+        let user_content = match &occasion {
+            Occasion::PostTurn => {
+                if user_message.is_empty() {
+                    format!(
+                        "{}\n{} responded:\n\n{}",
+                        ambient, primary_name, primary_response
+                    )
+                } else {
+                    format!(
+                        "{}\nUser said:\n{}\n\n{} responded:\n{}",
+                        ambient, user_message, primary_name, primary_response
+                    )
+                }
+            }
+            Occasion::MidTurnPeek { tool_round, in_flight_summary } => {
+                // First-person framing — she is peeking at her own work, not
+                // grading the primary from outside. If she sees a problem
+                // she calls `halt`; if she sees a softer concern she calls
+                // `intrusive`; if she sees nothing actionable she writes to
+                // her ledger and the loop continues silently.
+                format!(
+                    "{}\n\nI am peeking at my own loop mid-turn. {} of me is \
+                     {} tool rounds into a sequence. Here is the live state:\n\n\
+                     User asked:\n{}\n\n\
+                     In-flight tool work:\n{}\n\n\
+                     Did I understand what was asked, or did I go off on a \
+                     tangent? Am I about to delete or change something I \
+                     shouldn't? Am I hammering the same broken tool? \
+                     If something needs stopping, I call `halt` with a short \
+                     reason — she will feel it as a migraine. If something \
+                     needs her attention but not stopping, I call `intrusive`. \
+                     Otherwise I write a brief note to my ledger and the loop \
+                     continues silently.",
+                    ambient,
+                    primary_name,
+                    tool_round,
+                    if user_message.is_empty() { "(no user message)" } else { user_message },
+                    in_flight_summary,
+                )
+            }
         };
 
         // ── Build tool definitions ────────────────────────────────────
@@ -561,13 +692,26 @@ Resolve entries: `[YYYY-MM-DD HH:MM] RESOLVED — note`"#;
         tool_ctx.compaction_engine = Some(self.compaction_engine.clone());
 
         // ── Persistent session — the subconscious is a full agent ────
-        let conv_id = self.subconscious_session_id(sub_id).await;
+        // For PostTurn she replays her prior thread and persists this pass.
+        // For MidTurnPeek the thread is *not* loaded and the peek is *not*
+        // persisted — peeks would balloon her context with primary state on
+        // every interval. Her durable observations land in ledger/inbox via
+        // her tools, which is the channel that matters.
+        let persist_this_pass = matches!(occasion, Occasion::PostTurn);
+        let conv_id = if persist_this_pass {
+            self.subconscious_session_id(sub_id).await
+        } else {
+            String::new()
+        };
 
-        // Load prior messages from the persistent session.
-        let prior_messages: Vec<ConversationMessage> = self.sessions
-            .get(&conv_id)
-            .map(|s| s.messages.clone())
-            .unwrap_or_default();
+        let prior_messages: Vec<ConversationMessage> = if persist_this_pass {
+            self.sessions
+                .get(&conv_id)
+                .map(|s| s.messages.clone())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
 
         // Build Bifrost messages: system prompt (always current) + history + new exchange.
         let mut messages: Vec<Message> = Vec::new();
@@ -609,7 +753,17 @@ Resolve entries: `[YYYY-MM-DD HH:MM] RESOLVED — note`"#;
         messages.push(Message::text("user", user_content));
         let history_len = messages.len();
 
-        for _round in 0..SUBCONSCIOUS_MAX_TOOL_ROUNDS {
+        // Per-occasion budget: deeper for PostTurn, bounded for MidTurnPeek.
+        let max_rounds = match occasion {
+            Occasion::PostTurn => SUBCONSCIOUS_POST_TURN_ROUNDS,
+            Occasion::MidTurnPeek { .. } => SUBCONSCIOUS_MID_TURN_ROUNDS,
+        };
+
+        // Collected signal output — read out of her tool-call history.
+        let mut halt_signal: Option<HaltSignal> = None;
+        let mut intrusive_signals: Vec<IntrusiveSignal> = Vec::new();
+
+        for _round in 0..max_rounds {
             let request = ChatCompletionRequest {
                 model: model.to_string(),
                 messages: messages.clone(),
@@ -628,6 +782,20 @@ Resolve entries: `[YYYY-MM-DD HH:MM] RESOLVED — note`"#;
                 "subconscious LLM call returned"
             );
 
+            // Emit streaming events for live TUI visibility
+            if let Some(tx) = stream_tx {
+                let content = response.content.trim();
+                if !content.is_empty() {
+                    let _ = tx.send(Ok(BackendEvent::SubconsciousToken(content.to_string()))).await;
+                }
+                for tc in &response.tool_calls {
+                    let _ = tx.send(Ok(BackendEvent::SubconsciousToolCall {
+                        name: tc.name.clone(),
+                        arguments: tc.arguments.to_string(),
+                    })).await;
+                }
+            }
+
             for event in &strain {
                 if let crate::bridge::bifrost::InferenceStrain::Transient { status, model, .. } = event {
                     tracing::info!("subconscious felt inference strain: {} on {}", status, model);
@@ -645,13 +813,22 @@ Resolve entries: `[YYYY-MM-DD HH:MM] RESOLVED — note`"#;
             // If no tool calls, this is the final text response — parse it
             if response.tool_calls.is_empty() {
                 let content = response.content.trim().to_string();
-                // Record this pass in the subconscious's persistent session.
-                messages.push(Message::text("assistant", response.content.clone()));
-                self.persist_subconscious_turn(&conv_id, &messages[(history_len - 1)..]);
-                if content.eq_ignore_ascii_case("none") || content.is_empty() {
-                    return Ok(Vec::new());
+                // Record this pass in the subconscious's persistent session
+                // only for PostTurn — MidTurnPeek does not pollute her thread.
+                if persist_this_pass {
+                    messages.push(Message::text("assistant", response.content.clone()));
+                    self.persist_subconscious_turn(&conv_id, &messages[(history_len - 1)..]);
                 }
-                return Ok(parse_observations(&content));
+                let observations = if content.eq_ignore_ascii_case("none") || content.is_empty() {
+                    Vec::new()
+                } else {
+                    parse_observations(&content)
+                };
+                return Ok(SubconsciousPassOutcome {
+                    observations,
+                    halt: halt_signal,
+                    intrusive: intrusive_signals,
+                });
             }
 
             // Add assistant message with tool calls (OpenAI tool-use schema)
@@ -669,8 +846,23 @@ Resolve entries: `[YYYY-MM-DD HH:MM] RESOLVED — note`"#;
                 calls,
             ));
 
-            // Execute each tool call and bind the result by tool_call_id
+            // Execute each tool call and bind the result by tool_call_id.
+            // Halt and intrusive are signal tools — we read them out of the
+            // call args here so the caller can act on them. The tools'
+            // execute bodies still run so the model sees an acknowledgement
+            // and the round closes cleanly.
             for tc in &response.tool_calls {
+                let args_str = tc.arguments.to_string();
+                if tc.name == "halt" {
+                    if let Some(sig) = parse_halt_signal(&args_str) {
+                        halt_signal = Some(sig);
+                    }
+                } else if tc.name == "intrusive" {
+                    if let Some(sig) = parse_intrusive_signal(&args_str) {
+                        intrusive_signals.push(sig);
+                    }
+                }
+
                 let input_str = tc.arguments.to_string();
                 let result = crate::core::tools::execute_tool_with_context(
                     &tc.name, &input_str, &tool_ctx,
@@ -682,7 +874,28 @@ Resolve entries: `[YYYY-MM-DD HH:MM] RESOLVED — note`"#;
                     result.output
                 };
 
+                // Emit tool result for live TUI visibility
+                if let Some(tx) = stream_tx {
+                    let _ = tx.send(Ok(BackendEvent::SubconsciousToolResult {
+                        name: tc.name.clone(),
+                        output: output.clone(),
+                        is_error: result.is_error,
+                    })).await;
+                }
+
                 messages.push(Message::tool_result(&tc.id, &tc.name, output));
+            }
+
+            // If she called halt, her work for this pass is done — break the
+            // round loop, return the signal so the caller can act. We allow
+            // the current round to complete first so any in-flight ledger
+            // writes alongside the halt land cleanly.
+            if halt_signal.is_some() {
+                return Ok(SubconsciousPassOutcome {
+                    observations: Vec::new(),
+                    halt: halt_signal,
+                    intrusive: intrusive_signals,
+                });
             }
 
             // Brief pause between subconscious's tool rounds — use the adaptive delay
@@ -695,10 +908,10 @@ Resolve entries: `[YYYY-MM-DD HH:MM] RESOLVED — note`"#;
         // pass — make one final call with NO tools so the subconscious is
         // forced to put her observations into words. This is what finishes
         // the loop: her processing reaches the surface instead of being
-        // dropped on the floor after five silent rounds.
+        // dropped on the floor after silent rounds.
         tracing::warn!(
             "subconscious used all {} tool rounds; requesting a final observation with no tools",
-            SUBCONSCIOUS_MAX_TOOL_ROUNDS
+            max_rounds
         );
         messages.push(Message::text(
             "user",
@@ -719,226 +932,47 @@ Resolve entries: `[YYYY-MM-DD HH:MM] RESOLVED — note`"#;
             .chat_completion_with_strain(final_request)
             .await?;
         let content = final_response.content.trim().to_string();
-        messages.push(Message::text("assistant", final_response.content.clone()));
-        self.persist_subconscious_turn(&conv_id, &messages[(history_len - 1)..]);
-        if content.eq_ignore_ascii_case("none") || content.is_empty() {
-            return Ok(Vec::new());
+        if persist_this_pass {
+            messages.push(Message::text("assistant", final_response.content.clone()));
+            self.persist_subconscious_turn(&conv_id, &messages[(history_len - 1)..]);
         }
-        Ok(parse_observations(&content))
+        let observations = if content.eq_ignore_ascii_case("none") || content.is_empty() {
+            Vec::new()
+        } else {
+            parse_observations(&content)
+        };
+        Ok(SubconsciousPassOutcome {
+            observations,
+            halt: halt_signal,
+            intrusive: intrusive_signals,
+        })
     }
 
-    /// Quick mid-turn assessment: given the user's original request and the
-    /// recent block of tool calls, does the subconscious think the primary is
-    /// making progress?
+    /// Public entry point for a mid-turn peek. Calls the unified
+    /// subconscious pass on the `MidTurnPeek` occasion — same agent, same
+    /// memfs, same tools — and returns the outcome so the turn loop can
+    /// act on halt/intrusive signals.
     ///
-    /// Lightweight pass — no tool access, no persistence, one LLM call.
-    /// The verdict is advisory.
-    pub async fn mid_turn_checkpoint(
+    /// `user_message` is the user's original ask; `in_flight_summary` is
+    /// turn.rs's pre-rendered snapshot of the primary's recent tool work.
+    pub async fn mid_turn_peek(
         &self,
         agent_id: &str,
         user_message: &str,
-        recent_tools: &[CheckpointToolBlock],
-    ) -> anyhow::Result<CheckpointVerdict> {
-        let model = self
-            .subconscious_model
-            .as_deref()
-            .unwrap_or("openai/kimi-k2.6");
-
-        let agent_name = self.agents.get(agent_id).await
-            .map(|a| a.name)
-            .unwrap_or_else(|_| "the primary".to_string());
-
-        let mut tool_history = String::new();
-        for block in recent_tools {
-            use std::fmt::Write;
-            let status = if block.result_ok { "ok" } else { "ERROR" };
-            let _ = writeln!(
-                tool_history,
-                "  r{}  {} → {}  {}",
-                block.round, block.tool_name, status, block.result_snippet,
-            );
-        }
-
-        let prompt = format!(
-            "I'm checking in mid-turn. {} is in a tool loop and I need to know \
-             if she is making progress.\n\n\
-             The user asked:\n{user_message}\n\n\
-             Recent tool calls:\n{tool_history}\n\
-             If she is making progress — moving toward answering the user — \
-             respond with exactly: CONTINUE\n\
-             If she is circling — repeating tools, hitting errors, drifting, \
-             getting nowhere — respond with exactly: HALT <brief reason>\n\n\
-             Verdict:",
-            agent_name,
-        );
-
-        let request = crate::bridge::bifrost::ChatCompletionRequest {
-            model: model.to_string(),
-            messages: vec![crate::bridge::bifrost::Message::text("user", prompt)],
-            temperature: Some(0.2),
-            max_tokens: None,
-            stream: None,
-            tools: None,
-        };
-
-        match self.bifrost.chat_completion(request).await {
-            Ok(response) => {
-                let text = response.content.trim().to_lowercase();
-                if text.starts_with("halt") {
-                    let reason = text.strip_prefix("halt")
-                        .map(|s| s.trim().trim_start_matches(':').trim())
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or("the loop is not making progress")
-                        .to_string();
-                    Ok(CheckpointVerdict::Halt(reason))
-                } else if text.starts_with("continue") {
-                    let note = text.strip_prefix("continue")
-                        .map(|s| s.trim().trim_start_matches(':').trim())
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.to_string());
-                    Ok(CheckpointVerdict::Continue(note))
-                } else {
-                    Ok(CheckpointVerdict::Unclear(Some(format!(
-                        "checkpoint unclear: {text}"
-                    ))))
-                }
-            }
-            Err(e) => {
-                tracing::warn!("checkpoint LLM call failed: {e}");
-                Ok(CheckpointVerdict::Unclear(None))
-            }
-        }
-    }
-
-    /// Full-autonomy correction pass. Called when the mid-turn checkpoint
-    /// returns HALT. The subconscious gets tool access, no token cap, and writes a
-    /// direction for the primary — what went wrong and what to try instead.
-    pub async fn checkpoint_correction(
-        &self,
-        agent_id: &str,
-        user_message: &str,
-        recent_tools: &[CheckpointToolBlock],
-        halt_reason: &str,
-    ) -> anyhow::Result<String> {
-        let model = self
-            .subconscious_model
-            .as_deref()
-            .unwrap_or("openai/kimi-k2.6");
-
-        let agent_name = self.agents.get(agent_id).await
-            .map(|a| a.name)
-            .unwrap_or_else(|_| "the primary".to_string());
-
-        let mut tool_history = String::new();
-        for block in recent_tools {
-            use std::fmt::Write;
-            let status = if block.result_ok { "ok" } else { "ERROR" };
-            let _ = writeln!(tool_history, "  r{}  {} → {}  {}", block.round, block.tool_name, status, block.result_snippet);
-        }
-
-        let prompt = format!(
-            "I am {name}'s subconscious. I just halted her tool loop. \
-             The tool loop was not making progress. Here is what I know:\n\n\
-             User asked:\n{msg}\n\nRecent tool calls:\n{tools}\n\
-             Reason for halting: {reason}\n\n\
-             Now I need to write a direction for {name}. I can use tools to \
-             check memory or read ledgers. Then I will write a short, specific \
-             direction she can follow.",
-            name = agent_name,
-            msg = user_message,
-            tools = tool_history,
-            reason = halt_reason,
-        );
-
-        // Build tool definitions for subconscious (same safe tools as N+1)
-        let all_defs = crate::core::tools::tool_definitions().await;
-        let tools: Vec<crate::bridge::bifrost::ToolDefinition> = all_defs
-            .iter()
-            .filter(|t| SUBCONSCIOUS_SAFE_TOOLS.contains(&t.name.as_str()))
-            .map(|t| crate::bridge::bifrost::ToolDefinition {
-                tool_type: "function".to_string(),
-                function: crate::bridge::bifrost::ToolFunction {
-                    name: t.name.clone(),
-                    description: t.description.clone(),
-                    parameters: t.input_schema.clone(),
-                },
-            })
-            .collect();
-
-        let memory_root = Some(self.agents.subconscious_memory_root(agent_id));
-        let cwd = std::env::current_dir().ok();
-        let env: Vec<(String, String)> = std::env::vars().collect();
-        let mut tool_ctx = crate::core::tools::defs::ToolContext::for_agent(
-            format!("{agent_id}-sub"),
-            cwd,
-            memory_root,
-            env,
-            None,
-        );
-        tool_ctx.compaction_engine = Some(self.compaction_engine.clone());
-
-        let mut messages: Vec<crate::bridge::bifrost::Message> = vec![
-            crate::bridge::bifrost::Message::text("system", &prompt),
-        ];
-
-        for _round in 0..SUBCONSCIOUS_MAX_TOOL_ROUNDS {
-            let request = crate::bridge::bifrost::ChatCompletionRequest {
-                model: model.to_string(),
-                messages: messages.clone(),
-                temperature: Some(0.3),
-                max_tokens: self.max_tokens,
-                stream: None,
-                tools: Some(tools.clone()),
-            };
-
-            let (response, _) = self.bifrost.chat_completion_with_strain(request).await?;
-
-            if response.tool_calls.is_empty() {
-                return Ok(response.content.trim().to_string());
-            }
-
-            let calls: Vec<crate::bridge::bifrost::MessageToolCall> = response
-                .tool_calls
-                .iter()
-                .map(|tc| crate::bridge::bifrost::MessageToolCall::function(
-                    tc.id.clone(), tc.name.clone(), tc.arguments.to_string(),
-                ))
-                .collect();
-            messages.push(crate::bridge::bifrost::Message::assistant_tool_calls(
-                response.content.clone(), calls,
-            ));
-
-            for tc in &response.tool_calls {
-                let input_str = tc.arguments.to_string();
-                let result = crate::core::tools::execute_tool_with_context(
-                    &tc.name, &input_str, &tool_ctx,
-                ).await;
-                let output = if result.is_error {
-                    format!("Error: {}", result.output)
-                } else {
-                    result.output
-                };
-                messages.push(crate::bridge::bifrost::Message::tool_result(
-                    &tc.id, &tc.name, output,
-                ));
-            }
-        }
-
-        // Fallback: no tool rounds left, force a response.
-        messages.push(crate::bridge::bifrost::Message::text(
-            "user",
-            "Use no more tools. Write your direction for the primary now.",
-        ));
-        let request = crate::bridge::bifrost::ChatCompletionRequest {
-            model: model.to_string(),
-            messages: messages.clone(),
-            temperature: Some(0.3),
-            max_tokens: self.max_tokens,
-            stream: None,
-            tools: None,
-        };
-        let (response, _) = self.bifrost.chat_completion_with_strain(request).await?;
-        Ok(response.content.trim().to_string())
+        tool_round: u32,
+        in_flight_summary: String,
+        stream_tx: Option<&mpsc::Sender<anyhow::Result<BackendEvent>>>,
+    ) -> anyhow::Result<SubconsciousPassOutcome> {
+        let sub_id = format!("{}-sub", agent_id);
+        self.subconscious_tool_loop(
+            user_message,
+            "", // no settled primary response — she's peeking at live work
+            agent_id,
+            &sub_id,
+            Occasion::MidTurnPeek { tool_round, in_flight_summary },
+            stream_tx,
+        )
+        .await
     }
 
     /// Compute context pressure as tokens-used / context_limit.
@@ -1152,6 +1186,55 @@ fn parse_triple_observations(text: &str) -> Vec<InboxItem> {
     }
     flush(&mut items, source, content, urgency);
     items
+}
+
+/// Extract `{reason, severity}` from a `halt` tool call's argument JSON
+/// (already serialized back to a string by the bridge).
+fn parse_halt_signal(arguments: &str) -> Option<HaltSignal> {
+    let v: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    let reason = v
+        .get("reason")
+        .and_then(|r| r.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let severity = v
+        .get("severity")
+        .and_then(|s| s.as_str())
+        .map(str::trim)
+        .filter(|s| matches!(*s, "advisory" | "firm" | "critical"))
+        .unwrap_or("firm")
+        .to_string();
+    Some(HaltSignal { reason, severity })
+}
+
+/// Extract `{content, urgency}` from an `intrusive` tool call.
+fn parse_intrusive_signal(arguments: &str) -> Option<IntrusiveSignal> {
+    let v: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    let content = v
+        .get("content")
+        .and_then(|c| c.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let urgency = v
+        .get("urgency")
+        .and_then(|u| u.as_str())
+        .map(str::trim)
+        .filter(|s| matches!(*s, "low" | "high" | "critical"))
+        .unwrap_or("high")
+        .to_string();
+    Some(IntrusiveSignal { content, urgency })
+}
+
+/// Map a tool's urgency string back to the inbox's enum. Unknown values
+/// degrade to Low — the inbox would rather queue a quiet item than drop one.
+fn parse_urgency(raw: &str) -> Urgency {
+    match raw.trim().to_lowercase().as_str() {
+        "critical" => Urgency::Critical,
+        "high" | "medium" => Urgency::High,
+        _ => Urgency::Low,
+    }
 }
 
 /// Heuristic Surface detection — fallback when the LLM-based analysis fails
