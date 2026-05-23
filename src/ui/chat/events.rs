@@ -326,17 +326,28 @@ impl ChatState {
                 BackendEvent::SubconsciousPass(active) => {
                     if active {
                         self.subconscious_stream.clear();
+                        self.subconscious_current.clear();
                     }
                     self.pending_consciousness.push(BackendEvent::SubconsciousPass(active));
                 }
                 BackendEvent::SubconsciousToken(content) => {
-                    self.subconscious_stream.push(content);
+                    // Chunked-replay: each event is a slice of the LLM's text
+                    // response. Append to the live-building line; the render
+                    // path shows this as the brightest bottom line.
+                    self.subconscious_current.push_str(&content);
                 }
                 BackendEvent::SubconsciousToolCall { name, arguments } => {
+                    if !self.subconscious_current.is_empty() {
+                        let line = std::mem::take(&mut self.subconscious_current);
+                        self.subconscious_stream.push(line);
+                    }
                     self.subconscious_stream.push(format!("⚙ {} — {}", name, arguments));
                 }
                 BackendEvent::SubconsciousToolResult { name, output, .. } => {
-                    // Only show first line of result in the live stream
+                    if !self.subconscious_current.is_empty() {
+                        let line = std::mem::take(&mut self.subconscious_current);
+                        self.subconscious_stream.push(line);
+                    }
                     let snippet = output.lines().next().unwrap_or(&output);
                     let clipped = if snippet.len() > 80 {
                         format!("{}…", &snippet[..snippet.floor_char_boundary(77)])
