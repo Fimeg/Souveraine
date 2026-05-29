@@ -31,8 +31,9 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use crate::bridge::bifrost::{
-    BifrostClient, ChatCompletionRequest, Message, ToolDefinition, ToolFunction,
+    ChatCompletionRequest, Message, ToolDefinition, ToolFunction,
 };
+use crate::bridge::LlmProvider;
 use crate::core::session::{ContentBlock, ConversationMessage, MessageRole};
 use crate::core::tools::defs::ToolContext;
 use crate::server::AgentInventory;
@@ -69,7 +70,7 @@ pub struct ReflectionReport {
 
 pub struct ReflectionEngine {
     agents: Arc<AgentInventory>,
-    bifrost: Arc<BifrostClient>,
+    bifrost: Arc<dyn LlmProvider>,
     rate_delay: Arc<AtomicU64>,
     /// Model handle for reflection passes. None falls back to the
     /// subconscious model, then to a sensible default.
@@ -80,7 +81,7 @@ pub struct ReflectionEngine {
 impl ReflectionEngine {
     pub fn new(
         agents: Arc<AgentInventory>,
-        bifrost: Arc<BifrostClient>,
+        bifrost: Arc<dyn LlmProvider>,
         rate_delay: Arc<AtomicU64>,
         model: Option<String>,
         max_tokens: Option<u32>,

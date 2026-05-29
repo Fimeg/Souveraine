@@ -35,7 +35,8 @@ use anyhow::Result;
 use chrono::{NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::bridge::bifrost::{BifrostClient, ChatCompletionRequest, Message};
+use crate::bridge::bifrost::{ChatCompletionRequest, Message};
+use crate::bridge::LlmProvider;
 use crate::core::config::{ArchivistConfig, SynthesisElement};
 use crate::core::memory::MemoryRepo;
 use crate::server::AgentInventory;
@@ -94,7 +95,7 @@ impl SynthesisReport {
 
 pub struct ArchivistEngine {
     agents: Arc<AgentInventory>,
-    bifrost: Arc<BifrostClient>,
+    bifrost: Arc<dyn LlmProvider>,
     rate_delay: Arc<AtomicU64>,
     config: ArchivistConfig,
     /// Subconscious model handle — used to resolve `compression_model: "auto"`.
@@ -104,7 +105,7 @@ pub struct ArchivistEngine {
 impl ArchivistEngine {
     pub fn new(
         agents: Arc<AgentInventory>,
-        bifrost: Arc<BifrostClient>,
+        bifrost: Arc<dyn LlmProvider>,
         rate_delay: Arc<AtomicU64>,
         config: ArchivistConfig,
         subconscious_model: Option<String>,

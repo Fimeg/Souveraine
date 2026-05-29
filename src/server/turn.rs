@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 use crate::bridge::bifrost::{ChatCompletionRequest, ContentPart, ImageUrlSource, Message as BifrostMessage};
 use crate::bridge::model_router::TokenCounter;
 use crate::core::compact::CompactionEngine;
-use crate::core::nervous::EventBus;
+use crate::core::nervous::{EventBus, SensorEvent};
 use crate::core::session::{ContentBlock, ConversationMessage, MessageRole};
 use crate::core::tools::defs::ToolContext;
 use crate::server::consciousness_engine::{ConsciousnessEvent, ConsciousnessEngine};
@@ -375,6 +375,23 @@ pub(crate) async fn run_turn(
                     model: model.clone(),
                 })).await;
                 bump_on_strain(&server.rate_delay, *status);
+                // Surface provider strain onto the nervous-system bus too, so a
+                // second machine watching the firehose sees the voice go hoarse,
+                // not just the local TUI.
+                server.event_bus.send(SensorEvent {
+                    sensor_name: "inference".to_string(),
+                    timestamp: chrono::Utc::now(),
+                    event_type: "inference_strain".to_string(),
+                    target: None,
+                    urgency: 0.3,
+                    payload: Some(serde_json::json!({
+                        "attempt": *attempt,
+                        "status": *status,
+                        "model": model,
+                    })),
+                    seed_id: None,
+                    reply_to: None,
+                });
             }
         }
 

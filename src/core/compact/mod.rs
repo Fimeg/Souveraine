@@ -32,8 +32,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
 
-use crate::bridge::bifrost::BifrostClient;
 use crate::bridge::model_router::TokenCounter;
+use crate::bridge::LlmProvider;
 use crate::core::config::ConsciousnessConfig;
 use crate::core::memory::MemoryRepo;
 use crate::core::session::ConversationMessage;
@@ -85,7 +85,7 @@ pub trait CompactionEngine: Send + Sync {
 pub struct DefaultCompactionEngine {
     pub config: Arc<RwLock<ConsciousnessConfig>>,
     pub counter: TokenCounter,
-    pub bifrost: Option<BifrostClient>,
+    pub bifrost: Option<Arc<dyn LlmProvider>>,
     pub model: Option<String>,
     pub clock: Arc<dyn Clock>,
     pub get_messages: Arc<dyn Fn(&str) -> Option<Vec<ConversationMessage>> + Send + Sync>,

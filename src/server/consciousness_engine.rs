@@ -25,7 +25,8 @@
 //! separate agent — it is the same consciousness in a different mode that runs
 //! immediately after the primary's turn.
 
-use crate::bridge::bifrost::{BifrostClient, ChatCompletionRequest, Message, ToolDefinition, ToolFunction};
+use crate::bridge::bifrost::{ChatCompletionRequest, Message, ToolDefinition, ToolFunction};
+use crate::bridge::LlmProvider;
 use crate::bridge::model_router::TokenCounter;
 use crate::core::compact::CompactionEngine;
 use crate::core::session::{ContentBlock, ConversationMessage, MessageRole};
@@ -58,7 +59,7 @@ const SUBCONSCIOUS_INTER_ROUND_DELAY_MS: u64 = 300;
 pub struct ConsciousnessEngine {
     agents: Arc<AgentInventory>,
     sessions: Arc<SessionManager>,
-    bifrost: Arc<BifrostClient>,
+    bifrost: Arc<dyn LlmProvider>,
     counter: TokenCounter,
     /// Optional model override for the subconscious pass (e.g. "openai/glm-5.1").
     /// If None, uses the primary agent's model.
@@ -155,7 +156,7 @@ impl ConsciousnessEngine {
     pub fn new(
         agents: Arc<AgentInventory>,
         sessions: Arc<SessionManager>,
-        bifrost: Arc<BifrostClient>,
+        bifrost: Arc<dyn LlmProvider>,
         subconscious_model: Option<String>,
         reflection_model: Option<String>,
         max_tokens: Option<u32>,

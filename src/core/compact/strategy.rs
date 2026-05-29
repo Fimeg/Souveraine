@@ -1,7 +1,10 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 
-use crate::bridge::bifrost::{BifrostClient, ChatCompletionRequest, Message};
+use crate::bridge::bifrost::{ChatCompletionRequest, Message};
 use crate::bridge::model_router::TokenCounter;
+use crate::bridge::LlmProvider;
 use crate::core::session::ConversationMessage;
 
 use super::config::{AgentCompactionConfig, CompactionStrategyKind};
@@ -50,7 +53,7 @@ pub trait CompactionStrategy: Send + Sync {
 
 /// Helper: call a Bifrost model with system+user prompt, get text response.
 async fn bifrost_complete(
-    client: &BifrostClient,
+    client: &Arc<dyn LlmProvider>,
     model: &str,
     system: &str,
     prompt: &str,
@@ -78,7 +81,7 @@ async fn bifrost_complete(
 /// the agent reads the boundary on the next turn and can resume with full
 /// awareness of intent, files, decisions, and pending work.
 pub struct SummaryStrategy {
-    pub client: BifrostClient,
+    pub client: Arc<dyn LlmProvider>,
     pub model: String,
     pub prompt_override: Option<String>,
 }
@@ -505,7 +508,7 @@ impl CompactionStrategy for SlidingWindowStrategy {
 /// available, falls back to plain SlidingWindow (no threads lost is better
 /// than no compaction at all).
 pub struct SlidingReflectStrategy {
-    pub client: BifrostClient,
+    pub client: Arc<dyn LlmProvider>,
     pub model: String,
     /// User-supplied prompt override from [compaction] reflect_prompt in config.
     /// When set, replaces the built-in REFLECT_TASK prompt entirely.

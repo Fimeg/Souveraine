@@ -1,7 +1,10 @@
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tracing::{debug, info, warn};
+
+use crate::bridge::provider::LlmProvider;
 
 /// Bifrost Inference Client
 ///
@@ -661,6 +664,35 @@ impl BifrostClient {
             finish_reason: choice.finish_reason.clone(),
             usage: parsed.usage,
         })
+    }
+}
+
+/// `BifrostClient` is the OpenAI-compatible gateway implementation of the
+/// provider seam. The inherent methods do the work; the trait just exposes them
+/// behind `dyn LlmProvider` so the engine can hold any provider uniformly.
+#[async_trait]
+impl LlmProvider for BifrostClient {
+    fn id(&self) -> &str {
+        "bifrost"
+    }
+
+    fn default_model(&self) -> &str {
+        &self.default_model
+    }
+
+    async fn list_models(&self) -> Result<Vec<String>> {
+        BifrostClient::list_models(self).await
+    }
+
+    async fn chat_completion_with_strain(
+        &self,
+        request: ChatCompletionRequest,
+    ) -> Result<(CompletionResult, Vec<InferenceStrain>)> {
+        BifrostClient::chat_completion_with_strain(self, request).await
+    }
+
+    async fn chat_completion(&self, request: ChatCompletionRequest) -> Result<CompletionResult> {
+        BifrostClient::chat_completion(self, request).await
     }
 }
 

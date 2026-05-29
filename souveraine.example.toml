@@ -3,12 +3,25 @@
 
 # === BIFROST INFERENCE ===
 [bifrost]
+# Active provider implementation:
+#   "bifrost"      (default) — any OpenAI-compatible gateway via base_url below.
+#   "openai-oauth"           — ride the Codex CLI's ChatGPT login (run
+#                              `codex login` first); drives
+#                              chatgpt.com/backend-api/codex/responses with no
+#                              API key. base_url/api_key/virtual_key are ignored
+#                              in this mode; set primary_model to a ChatGPT model
+#                              (e.g. "gpt-5.5"). Bifrost-namespaced ids are
+#                              tolerated and mapped to the provider default.
+# provider = "bifrost"
+
 # Bifrost is the OpenAI-compatible API gateway
 base_url = "http://127.0.0.1:3360"
 api_key = ""  # Set via `souveraine auth set` or BIFROST_KEY env var
 virtual_key = ""  # x-bf-vk header if required by provider
 
-# Default model for conversation
+# Default model for conversation.
+# Bifrost mode: a gateway route like "openai/kimi-k2.6".
+# openai-oauth mode: a ChatGPT model like "gpt-5.5".
 primary_model = "openai/kimi-k2.6"
 
 # Request timeout in seconds for each LLM call attempt (default: 120).

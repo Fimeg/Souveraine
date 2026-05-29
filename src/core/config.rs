@@ -187,6 +187,12 @@ pub struct BifrostConfig {
     /// Default: 120 (two minutes per attempt, 7 attempts = ~14 min total).
     #[serde(default = "default_bifrost_timeout")]
     pub timeout_secs: u64,
+
+    /// Active provider implementation: "bifrost" (OpenAI-compatible gateway,
+    /// default) or "openai-oauth" (ride the Codex CLI ChatGPT login →
+    /// backend-api/codex/responses). See `bridge::build_provider`.
+    #[serde(default = "default_provider")]
+    pub provider: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -208,6 +214,7 @@ impl Default for BifrostConfig {
             primary_model: default_primary_model(),
             models: HashMap::new(),
             timeout_secs: default_bifrost_timeout(),
+            provider: default_provider(),
         }
     }
 }
@@ -916,6 +923,7 @@ fn default_warning_2_threshold() -> f32 { 0.95 }
 fn default_sub_inter_round_delay() -> u64 { 300 }
 fn default_auto_model() -> String { "auto".to_string() }
 fn default_bifrost_url() -> String { "http://127.0.0.1:3360".to_string() }
+fn default_provider() -> String { "bifrost".to_string() }
 fn default_server_bind() -> String { "127.0.0.1".to_string() }
 fn default_server_port() -> u16 { 8484 }
 fn default_server_url() -> String { "http://127.0.0.1:8484".to_string() }

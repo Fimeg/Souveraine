@@ -1,4 +1,4 @@
-use crate::bridge::BifrostClient;
+use crate::bridge::{build_provider, LlmProvider};
 use crate::core::compact::{CompactionEngine, DefaultCompactionEngine, UtcClock};
 use crate::core::config::ConsciousnessConfig;
 use crate::core::identity::SeedId;
@@ -41,7 +41,7 @@ pub struct SouveraineServer {
     pub sessions: Arc<SessionManager>,
     pub consciousness: Arc<ConsciousnessEngine>,
     pub compaction_engine: Arc<dyn CompactionEngine>,
-    pub bifrost: Arc<BifrostClient>,
+    pub bifrost: Arc<dyn LlmProvider>,
     pub config: Arc<RwLock<ServerConfig>>,
     pub data_dir: PathBuf,
     pub memory: Option<Arc<ServerMemory>>,
@@ -133,18 +133,9 @@ impl SouveraineServer {
         let event_bus = crate::core::nervous::EventBus::default();
         let sessions = Arc::new(SessionManager::with_persistence(data_dir.join("agents")));
 
-        let primary = &config.bifrost.primary_model;
-        let mut fallbacks = Vec::new();
-        if !primary.ends_with("-precision") {
-            fallbacks.push(format!("{}-precision", primary));
-        }
-        let bifrost = Arc::new(BifrostClient::new(
-            &config.bifrost.base_url,
-            &config.bifrost.api_key,
-            &config.bifrost.virtual_key,
-            primary,
-            config.bifrost.timeout_secs,
-        ).with_fallbacks(fallbacks));
+        // Select the active LLM provider (OpenAI-compatible gateway or the
+        // OAuth-riding ChatGPT provider) from config.
+        let bifrost: Arc<dyn LlmProvider> = build_provider(&config)?;
 
         let rate_delay = Arc::new(AtomicU64::new(1000));
         tracing::info!("rate delay initialized at 1000ms");
@@ -197,7 +188,7 @@ impl SouveraineServer {
         let compaction_engine: Arc<dyn CompactionEngine> = Arc::new(DefaultCompactionEngine {
             config: app_cfg,
             counter: crate::bridge::model_router::TokenCounter::new(),
-            bifrost: Some((*bifrost).clone()),
+            bifrost: Some(bifrost.clone()),
             model: config.compaction.model.clone().or_else(|| config.subconscious.model.clone()),
             clock: Arc::new(UtcClock),
             get_messages,
