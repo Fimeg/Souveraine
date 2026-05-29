@@ -1,7 +1,7 @@
 import "./globals.css";
 
 export const metadata = {
-  title: "Ani Studio — Personal AI Interface",
+  title: "Souveraine Studio — Personal AI Interface",
   description: "A premium web interface for the Souveraine consciousness substrate. Interact with your personal AI agent in a beautiful, responsive environment.",
   icons: {
     icon: '/favicon.ico',

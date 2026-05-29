@@ -17,7 +17,7 @@ export default function Header({ agent, connectionStatus, onRefresh }) {
             <path d="M20 3v4"/>
             <path d="M22 5h-4"/>
           </svg>
-          <h1 className="header-title">Ani Studio</h1>
+          <h1 className="header-title">Souveraine Studio</h1>
         </div>
         {agent && (
           <div className="header-agent-info">

@@ -12,7 +12,7 @@ import ConsciousnessHub from '@/components/Consciousness/ConsciousnessHub';
 import SettingsPanel from '@/components/Settings/SettingsPanel';
 
 /**
- * Ani Studio — Main Application Page
+ * Souveraine Studio — Main Application Page
  *
  * Orchestrates the full UI: sidebar, header, chat area, and status bar.
  * Connects to the Souveraine server via REST + SSE + WebSocket.

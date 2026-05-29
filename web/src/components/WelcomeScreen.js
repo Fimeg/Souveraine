@@ -14,7 +14,7 @@ export default function WelcomeScreen({ connectionStatus, onRetry }) {
         </svg>
       </div>
 
-      <h1 className="welcome-title">Ani Studio</h1>
+      <h1 className="welcome-title">Souveraine Studio</h1>
       <p className="welcome-subtitle">
         {isError
           ? 'Unable to connect to Souveraine. Make sure the server is running.'
