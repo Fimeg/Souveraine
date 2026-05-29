@@ -35,7 +35,7 @@ export default function MessageBubble({ message }) {
       {/* Content */}
       <div className="message-content">
         <div className="message-header">
-          <span className="message-sender">{isUser ? 'You' : 'Ani'}</span>
+          <span className="message-sender">{isUser ? 'You' : 'Souveraine'}</span>
           {message.timestamp && (
             <span className="message-time">
               {new Date(message.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}

@@ -414,7 +414,7 @@ export default function SettingsPanel({ agent }) {
                     />
                     <div>
                       <strong>Auto-Push to Remote Fork</strong>
-                      <p>Pushes commits immediately to origin/ani-studio on GitHub.</p>
+                      <p>Pushes commits immediately to the workspace branch on GitHub.</p>
                     </div>
                   </label>
                 </div>

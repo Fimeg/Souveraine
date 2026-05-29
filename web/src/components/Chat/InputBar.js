@@ -56,7 +56,7 @@ export default function InputBar({ onSend, isStreaming, onToggleSubconscious, ha
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder={isStreaming ? 'Ani is thinking...' : 'Speak to Ani...'}
+          placeholder={isStreaming ? 'Souveraine is thinking...' : 'Speak to Souveraine...'}
           disabled={isStreaming}
           rows={1}
           id="message-input"

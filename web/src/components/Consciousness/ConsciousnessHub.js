@@ -199,7 +199,7 @@ export default function ConsciousnessHub({ firehoseEvents = [], agent }) {
             </h4>
             <div className="diag-footer">
               <span>git sync: </span>
-              <span className="text-highlight">origin/ani-studio</span>
+              <span className="text-highlight">origin/souveraine</span>
             </div>
           </div>
         </div>

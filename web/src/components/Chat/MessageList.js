@@ -23,7 +23,7 @@ export default function MessageList({ messages, isStreaming }) {
           </svg>
         </div>
         <h2 className="empty-chat-title">Begin a conversation</h2>
-        <p className="empty-chat-subtitle">Ani is ready. Speak, and the world listens.</p>
+        <p className="empty-chat-subtitle">Souveraine is ready. Speak, and the world listens.</p>
       </div>
     );
   }
