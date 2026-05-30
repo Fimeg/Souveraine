@@ -65,8 +65,8 @@ impl SubagentRunner for ServerSubagentRunner {
             "You are a threaded fork of agent {}. You share their tools, their \
              memory boundaries, their dual-state architecture. After you respond, \
              your N+1 pass will surface observations back to them.\n\n\
-             Your final message will be returned to the caller.\n\n{}",
-            params.parent_agent_id, params.prompt
+             Your final message will be returned to the caller.",
+            params.parent_agent_id
         );
 
         // Build tool definitions
@@ -93,7 +93,10 @@ impl SubagentRunner for ServerSubagentRunner {
         );
 
         // Initial messages: system prompt + user prompt
-        let mut messages = vec![BifrostMessage::text("system", system_prompt)];
+        let mut messages = vec![
+            BifrostMessage::text("system", system_prompt),
+            BifrostMessage::text("user", params.prompt.clone()),
+        ];
 
         let mut final_content = String::new();
         let mut tool_round = 0u32;
