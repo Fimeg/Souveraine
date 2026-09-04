@@ -1,0 +1,33 @@
+[Unit]
+Description=Souveraine sensor reporter (proximity, light, charge)
+# One reporter for every iio-sensor-proxy source. Replaces the per-sensor shell
+# scripts (blueline-proximity-lock and the light/accel copies that were about to
+# be written) — see DEVICE-STATE-MACHINE.md §10 and §12.
+#
+# A user unit, like sessiond: it talks to sessiond over
+# $XDG_RUNTIME_DIR/souveraine/sessiond.sock and needs no privilege at all.
+#
+# Bound to sessiond, NOT to graphical-session.target. It was WantedBy that
+# target until 2026-07-27, and on this device nothing ever starts it: greetd
+# launches Hyprland directly, and hyprland.lua starts each unit it wants by
+# name. So the reporter was `enabled` and dead from every boot, the machine ran
+# with no evidence at all, and — because a source that has never spoken sits at
+# SourceHealth::Unknown, which is silent by design — nothing said so.
+#
+# The dependency that is actually true is this one: the reporter exists to feed
+# the state machine, so it should live and die with the state machine. sessiond
+# is started explicitly at session start, needs no Wayland, and neither does
+# this: it reads iio-sensor-proxy on the system bus and writes a unix socket.
+PartOf=souveraine-sessiond.service
+After=souveraine-sessiond.service
+
+[Service]
+ExecStart=/usr/bin/souveraine-sensord
+# The reporter must outlive every transient failure it can hit — a dead sensor
+# stack, a restarting sessiond, monitor-sensor exiting. It handles those in
+# process; this covers the ones it cannot.
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=souveraine-sessiond.service

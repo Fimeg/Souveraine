@@ -1,0 +1,644 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%; width: 100%;
+    background: transparent; overflow: hidden;
+    -webkit-user-select: none; user-select: none;
+  }
+  * { box-sizing: border-box; }
+  button, input { font: inherit; }
+  #live2d-widget {
+    position: fixed; left: 0; right: 0; top: 0; height: 760px;
+    z-index: 1;
+  }
+
+  /*
+   * With the hand up, the room below her *is* the point: you are driving
+   * another screen and the trackpad is the instrument. So the rig gives most of
+   * its height back and keeps enough to be looked at, which is the only reason
+   * she is still on screen while you work. Casey, 2026-08-15: *"I want her, and
+   * then below her to have like a trackpad zone / keyboard zone stuff."*
+   *
+   * At 760/226 the controls had only 226px. At 320/the-rest the trackpad ate
+   * nearly half the glass. This split keeps her proportions and gives the pad
+   * one deliberate working area. The dock now yields only while this
+   * conditional surface is open; the remaining reserve belongs to the system
+   * gesture rail, not the dock.
+   */
+  :root { --gesture-rail-reserve: 32px; }
+  body.hid #live2d-widget { height: 520px; }
+  /*
+   * Keep her proportions when the box shrinks. The canvas fills its element and
+   * the rig has no letterboxing of its own, so a short full-width box draws the
+   * same model squashed. The ratio is the full-height box's, 540:760.
+   */
+  body.hid #live2d {
+    display: block; height: 100%; width: auto;
+    aspect-ratio: 540 / 760; margin: 0 auto;
+  }
+  body.hid #hands {
+    top: 526px;
+    height: auto;
+    bottom: var(--gesture-rail-reserve);
+    display: flex;
+    flex-direction: column;
+  }
+  body.hid #track-row { flex: 1; height: auto; min-height: 180px; }
+  #live2d { width: 100%; height: 100%; }
+  #bubble {
+    position: fixed; left: 8px; right: 8px; top: 12px;
+    padding: 10px 14px; border-radius: 14px;
+    background: rgba(20,20,24,0.82); color: #f2f2f2;
+    font: 15px/1.35 system-ui, sans-serif;
+    opacity: 0; transition: opacity .2s ease;
+    z-index: 4;
+  }
+  #bubble.up { opacity: 1; }
+
+  /*
+   * The room viewtop left under her, given a purpose. The dark sheer gradient
+   * keeps the controls legible without putting an app-shaped slab around her.
+   */
+  #hands {
+    position: fixed; left: 8px; right: 8px; top: 766px; height: 226px;
+    padding: 9px;
+    border: 1px solid rgba(221, 205, 237, .24);
+    border-radius: 20px;
+    background:
+      radial-gradient(140% 180% at 84% -50%, rgba(187, 142, 214, .25), transparent 58%),
+      linear-gradient(155deg, rgba(30, 25, 38, .92), rgba(9, 9, 14, .86));
+    box-shadow: 0 12px 35px rgba(0, 0, 0, .28), inset 0 1px rgba(255,255,255,.05);
+    color: rgba(255,255,255,.92);
+    font: 13px/1.2 system-ui, sans-serif;
+    opacity: 0;
+    transform: translateY(10px) scale(.985);
+    pointer-events: none;
+    transition: opacity .18s ease, transform .22s ease;
+    z-index: 5;
+  }
+  #hands.up { opacity: 1; transform: none; pointer-events: auto; }
+  #hands button {
+    min-width: 38px; height: 38px; padding: 0 10px;
+    border: 1px solid rgba(255,255,255,.10); border-radius: 13px;
+    background: rgba(255,255,255,.075); color: rgba(255,255,255,.90);
+    touch-action: manipulation;
+  }
+  #hands button:active, #hands button.on {
+    background: rgba(210, 177, 230, .23);
+    transform: scale(.96);
+  }
+  #hands button:disabled { opacity: .42; }
+  .hands-head { height: 26px; display: flex; align-items: center; gap: 6px; padding: 0 3px 5px; }
+  #hands-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: #d09191; box-shadow: 0 0 0 3px rgba(208,145,145,.10);
+  }
+  #hands.ready #hands-dot {
+    background: #9bd1ad; box-shadow: 0 0 10px rgba(155,209,173,.55);
+  }
+  #hands-listening { display: none; color: #e8b7d8; }
+  #hands.listening #hands-listening { display: inline; }
+  #hands-status { flex: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: rgba(255,255,255,.68); }
+  #agent-form { height: 40px; display: flex; gap: 6px; }
+  #agent-input {
+    min-width: 0; flex: 1; height: 40px; padding: 0 13px;
+    border: 1px solid rgba(255,255,255,.12); border-radius: 14px;
+    outline: none; color: #fff; background: rgba(0,0,0,.20);
+    -webkit-user-select: text; user-select: text;
+  }
+  #agent-input:focus { border-color: rgba(217,180,235,.55); }
+  #agent-input::placeholder { color: rgba(255,255,255,.43); }
+  #mic.listening { color: #f0b6db; box-shadow: inset 0 0 0 1px rgba(240,182,219,.45); }
+
+  #track-row { height: 92px; margin-top: 6px; }
+  #track-row { display: flex; gap: 6px; }
+  #trackpad, #scrollpad {
+    position: relative; overflow: hidden;
+    border: 1px solid rgba(255,255,255,.09); border-radius: 15px;
+    background:
+      linear-gradient(110deg, rgba(255,255,255,.035), transparent 45%),
+      rgba(0,0,0,.18);
+    touch-action: none;
+  }
+  #trackpad { flex: 1; }
+  #trackpad::after {
+    content: 'trackpad'; position: absolute; left: 12px; bottom: 9px;
+    color: rgba(255,255,255,.27); letter-spacing: .08em; font-size: 11px;
+  }
+  #scrollpad { width: 42px; }
+  #scrollpad::after {
+    content: '↕'; position: absolute; inset: 0; display: grid; place-items: center;
+    color: rgba(255,255,255,.35); font-size: 20px;
+  }
+  .hands-actions { height: 40px; display: flex; gap: 5px; margin-top: 6px; }
+  .hands-actions button { flex: 1; height: 40px !important; padding: 0 5px !important; }
+  #cad.holding {
+    background: linear-gradient(90deg, rgba(210,177,230,.30), rgba(255,255,255,.08));
+    transition: background .9s linear;
+  }
+</style>
+</head>
+<body>
+<div id="live2d-widget"><canvas id="live2d"></canvas></div>
+<div id="bubble"></div>
+<section id="hands" aria-label="USB Hands">
+  <div class="hands-head">
+    <span id="hands-dot"></span>
+    <span id="hands-status">USB hand asleep</span>
+    <span id="hands-listening">listening</span>
+  </div>
+  <form id="agent-form">
+    <button type="button" id="mic" aria-label="Start or stop listening">●</button>
+    <input id="agent-input" autocomplete="off" enterkeyhint="send"
+           placeholder="Tell your agent what the other screen needs…">
+    <button type="submit" aria-label="Send to agent">↑</button>
+  </form>
+  <div id="track-row">
+    <div id="trackpad" aria-label="Trackpad"></div>
+    <div id="scrollpad" aria-label="Scroll"></div>
+  </div>
+  <div class="hands-actions">
+    <button id="left-click">Left</button>
+    <button id="right-click">Right</button>
+    <button id="cad" title="Hold for Ctrl+Alt+Delete">CAD</button>
+  </div>
+</section>
+<!--
+  Not decoration, and not optional: `live2d.js` is not only the Cubism
+  runtime. It is the reference's webpack bundle, character layer included, and
+  `Live2DModel.update()` reads this element's value on **every frame** as its
+  motion-state slot — "1" starts a talk motion, "0" resets to idle and then
+  writes back "3". The reference supplies it from `_includes/live2d.html`; a
+  page that omits it throws
+
+      TypeError: null is not an object
+        (evaluating 'document.getElementById("live_talk").value')
+
+  on the first update, after the runtime has already logged its banner and
+  loaded the model and all four textures. So everything looks healthy —
+  assets 200, WebGL live, requestAnimationFrame running at 60 — and the rig
+  draws nothing at all. That is exactly the "canvas is there and nothing
+  draws" TASK-59 predicted would cost an afternoon, and it did (2026-08-06).
+  The runtime writes to this too, so it must be a real input, not a constant.
+
+  Starts at "0", not the reference's "1". "1" means *start a talk motion*, so
+  she came up mouthing words with no voice behind them — Casey, 2026-08-07:
+  "she is making mouth motions like she's saying something but nothing is
+  saying." "0" resets to idle and the runtime writes back "3" itself. Talking
+  is something the shell asks for when there is something to say.
+-->
+<input type="hidden" id="live_talk" value="0">
+<script src="live2d/js/live2d.js"></script>
+<script>
+// The character layer, reduced to what the shell drives. The reference's
+// message.js owns idle chatter, a talk box and sessionStorage position; none of
+// that belongs here — the shell owns the conversation and the summoning, and
+// idle chatter that is hers comes from the subconscious, not a random line
+// table (TASK-59 Q2).
+(function () {
+  var widget = document.getElementById('live2d-widget');
+  var canvas = document.getElementById('live2d');
+  var bubble = document.getElementById('bubble');
+  var hands = document.getElementById('hands');
+  var model = null;
+
+  function fit() {
+    var r = widget.getBoundingClientRect();
+    canvas.width = r.width * window.devicePixelRatio;
+    canvas.height = r.height * window.devicePixelRatio;
+  }
+  window.addEventListener('resize', fit);
+  fit();
+
+  // Claim the context before the runtime does, only to set one flag — and
+  // strictly **after** `fit()`, which is not a detail.
+  //
+  // `getContext` returns the existing context on every later call and ignores
+  // the attributes, so whoever asks first decides, and the runtime asks
+  // without `preserveDrawingBuffer`. Without that flag the drawing buffer is
+  // cleared the moment the frame is composited, which is before any callback
+  // can read it — so sampling her silhouette gets a blank image and the input
+  // region that depends on it collapses to a stray rectangle.
+  //
+  // Asking *before* `fit()` breaks her instead, and spectacularly: the canvas
+  // is still at its default 300x150 then, so the context is born that size and
+  // `gl.viewport` stays there while `fit()` grows the drawing buffer to the
+  // panel. The rig then draws into a 300x150 corner of a 1080x1994 buffer —
+  // and because GL's origin is bottom-left, she appears as a thumbnail in the
+  // bottom-left of the screen. Casey, 2026-08-06: "been getting a tiny version
+  // that's scaled odd". Same cause as the silhouette reading 9 lit cells out
+  // of 864: there really was almost nothing there.
+  try {
+    canvas.getContext('webgl', { preserveDrawingBuffer: true, alpha: true });
+  } catch (e) {}
+
+  // loadlive2d is live2d.js's entry point: canvas id, model.json url.
+  try {
+    loadlive2d('live2d', 'live2d/model/histoire/model.json');
+  } catch (e) {
+    console.error('rig failed to load', e);
+  }
+
+  var hideAt = null;
+  window.face = {
+    // One line of her speech. Called repeatedly as tokens stream, so it
+    // replaces rather than appends — the shell holds the accumulated text.
+    say: function (text) {
+      bubble.textContent = text;
+      bubble.classList.add('up');
+      hideAt = Date.now() + 6000;
+    },
+    clear: function () { bubble.classList.remove('up'); },
+    // Posture from the shell. The rig's own motion groups are named by the
+    // reference (idle, tap); anything richer waits on her own rig.
+    // Posture, driven through the levers the runtime actually has.
+    //
+    // This called `window.live2dMotion`, which **does not exist** — measured
+    // undefined on the device. So every posture tag she emitted was a no-op:
+    // nine states advertised to her in the prompt and wired to nothing.
+    //
+    // What the bundle really exposes is two things. `#live_talk` is a motion
+    // state slot it reads every frame ("1" talk, "0" reset to idle), and its
+    // own touch handler hit-tests head vs body and answers with an expression
+    // or a tap motion. Both are reachable from here; nothing else is, without
+    // a rig of her own.
+    //
+    // So the nine states collapse onto what exists rather than pretending:
+    // speaking talks, idle rests, and the rest are a look — head for the ones
+    // that are about attention, body for the ones that are about effort. The
+    // bundle rate-limits its own hit reaction to once per ~8s, so a burst of
+    // tags reads as one shift rather than a twitching model.
+    posture: function (name) {
+      var slot = document.getElementById('live_talk');
+      if (name === 'speaking' || name === 'talk') {
+        if (slot) slot.value = '1';
+        return;
+      }
+      if (name === 'idle' || name === 'rest') {
+        if (slot) slot.value = '0';
+        return;
+      }
+      var head = ['alert', 'affectionate', 'thinking', 'listening'].indexOf(name) >= 0;
+      var r = canvas.getBoundingClientRect();
+      var x = r.left + r.width / 2;
+      var y = r.top + r.height * (head ? 0.22 : 0.55);
+      ['mousedown', 'mouseup', 'click'].forEach(function (t) {
+        try {
+          canvas.dispatchEvent(new MouseEvent(t, { clientX: x, clientY: y, bubbles: true }));
+        } catch (e) {}
+      });
+    },
+    // Look at a point on the panel, in her window's own CSS pixels.
+    //
+    // Dispatched as a synthetic pointer move on the canvas rather than driven
+    // through the rig's parameters by hand: `live2d.js` already binds
+    // mousemove/touchmove and already turns a pointer into head angle and eye
+    // direction with its own damping. Feeding its path costs nothing and
+    // cannot drift from what a real finger does, because it *is* what a real
+    // finger does.
+    //
+    // Synthetic events are why this works at all now. Her input region is her
+    // silhouette, so the compositor stops handing her contacts that land on
+    // the wallpaper — which is what made her stop tracking unless you touched
+    // her first. These do not go through the compositor, so she can follow a
+    // finger she is deliberately not being given.
+    lookAt: function (x, y) {
+      if (window.__gazeSeen === undefined) window.__gazeSeen = 0;
+      if (window.__gazeSeen++ < 3) console.log('gaze: lookAt ' + Math.round(x) + ',' + Math.round(y));
+      try {
+        canvas.dispatchEvent(new MouseEvent('mousemove', {
+          clientX: x, clientY: y, bubbles: true
+        }));
+      } catch (e) {}
+    },
+    // Nobody is touching the glass. Without this she holds the last position
+    // she was told about and stares at it until someone touches the screen
+    // again.
+    lookAway: function () {
+      try {
+        canvas.dispatchEvent(new MouseEvent('mouseout', { bubbles: true }));
+      } catch (e) {}
+    }
+  };
+
+  setInterval(function () {
+    if (hideAt && Date.now() > hideAt) { hideAt = null; window.face.clear(); }
+  }, 500);
+
+  // ## USB Hands — one conversation wearing a trackpad
+  //
+  // The page reports gestures and words; HidController owns the persistent
+  // writer and Souveraine owns the conversation. Nothing here can compose a
+  // gadget or grow a second chat transport.
+  function hid(op, fields) {
+    if (!window.souveraine) return;
+    var message = fields || {};
+    message.op = op;
+    window.souveraine.hid(message);
+  }
+
+  var agentPending = false;
+  window.hands = {
+    state: function (state) {
+      state = state || {};
+      hands.classList.toggle('up', !!state.active);
+      // On the body, not on #hands: the rig sits *before* the pane in the DOM,
+      // so no sibling selector can reach back to it.
+      document.body.classList.toggle('hid', !!state.active);
+      hands.classList.toggle('ready', !!state.ready);
+      hands.classList.toggle('listening', !!state.listening);
+      document.getElementById('mic').classList.toggle('listening', !!state.listening);
+
+      var status = document.getElementById('hands-status');
+      if (state.error) status.textContent = state.error;
+      else if (state.ready) status.textContent = (state.agent || 'agent') + ' · hand awake · ' + state.mode;
+      else if (state.mode === 'hid' || state.mode === 'kvm') status.textContent = 'waking the HID hand…';
+      else status.textContent = (state.agent || 'agent') + ' · arm the USB hand';
+
+      document.getElementById('agent-input').placeholder = state.thinking
+        ? (state.agent || 'agent') + ' is thinking…'
+        : 'Tell ' + (state.agent || 'your agent') + ' what the other screen needs…';
+      hands.classList.toggle('thinking', !!state.thinking);
+      document.getElementById('agent-input').disabled = !!state.thinking || agentPending;
+      requestAnimationFrame(publishShape);
+    },
+    agentResult: function (result) {
+      result = result || {};
+      agentPending = false;
+      var input = document.getElementById('agent-input');
+      input.disabled = hands.classList.contains('thinking');
+      if (result.accepted) input.value = '';
+      else if (result.reason) document.getElementById('hands-status').textContent = result.reason;
+    }
+  };
+
+  document.getElementById('agent-form').addEventListener('submit', function (event) {
+    event.preventDefault();
+    var input = document.getElementById('agent-input');
+    var text = input.value.trim();
+    if (!text || !window.souveraine || agentPending || hands.classList.contains('thinking')) return;
+    agentPending = true;
+    input.disabled = true;
+    window.souveraine.say(text);
+  });
+
+  document.getElementById('mic').addEventListener('click', function () {
+    if (!window.souveraine) return;
+    window.souveraine.talk(hands.classList.contains('listening') ? 'end' : 'start');
+  });
+  var trackpad = document.getElementById('trackpad');
+  var trackDown = false, trackX = 0, trackY = 0, trackTravel = 0, trackAt = 0;
+  trackpad.addEventListener('pointerdown', function (event) {
+    trackDown = true; trackX = event.clientX; trackY = event.clientY;
+    trackTravel = 0; trackAt = Date.now();
+    try { trackpad.setPointerCapture(event.pointerId); } catch (_) {}
+  });
+  trackpad.addEventListener('pointermove', function (event) {
+    if (!trackDown) return;
+    var dx = event.clientX - trackX, dy = event.clientY - trackY;
+    trackX = event.clientX; trackY = event.clientY;
+    trackTravel += Math.abs(dx) + Math.abs(dy);
+    hid('move', { x: Math.round(dx * 1.45), y: Math.round(dy * 1.45), wheel: 0 });
+  });
+  function endTrack(event) {
+    if (!trackDown) return;
+    trackDown = false;
+    if (trackTravel < 9 && Date.now() - trackAt < 320)
+      hid('click', { button: 'left' });
+    try { trackpad.releasePointerCapture(event.pointerId); } catch (_) {}
+  }
+  trackpad.addEventListener('pointerup', endTrack);
+  trackpad.addEventListener('pointercancel', function () { trackDown = false; });
+
+  var scrollpad = document.getElementById('scrollpad');
+  var scrollDown = false, scrollY = 0, scrollCarry = 0;
+  scrollpad.addEventListener('pointerdown', function (event) {
+    scrollDown = true; scrollY = event.clientY;
+    try { scrollpad.setPointerCapture(event.pointerId); } catch (_) {}
+  });
+  scrollpad.addEventListener('pointermove', function (event) {
+    if (!scrollDown) return;
+    scrollCarry += (event.clientY - scrollY) / 11;
+    scrollY = event.clientY;
+    var steps = scrollCarry < 0 ? Math.ceil(scrollCarry) : Math.floor(scrollCarry);
+    if (steps !== 0) {
+      scrollCarry -= steps;
+      hid('move', { x: 0, y: 0, wheel: steps });
+    }
+  });
+  scrollpad.addEventListener('pointerup', function () { scrollDown = false; scrollCarry = 0; });
+  scrollpad.addEventListener('pointercancel', function () { scrollDown = false; scrollCarry = 0; });
+
+  document.getElementById('left-click').addEventListener('click', function () {
+    hid('click', { button: 'left' });
+  });
+  document.getElementById('right-click').addEventListener('click', function () {
+    hid('click', { button: 'right' });
+  });
+  // Ctrl+Alt+Delete is the one quick key a stray tap must not send. Its hold
+  // is local feedback; only the completed edge crosses to the HID owner.
+  var cad = document.getElementById('cad'), cadTimer = null, cadPointer = null;
+  cad.addEventListener('pointerdown', function (event) {
+    if (cadPointer !== null) return;
+    cadPointer = event.pointerId;
+    try { cad.setPointerCapture(event.pointerId); } catch (_) {}
+    cad.classList.add('holding');
+    cadTimer = setTimeout(function () {
+      cadTimer = null; cad.classList.remove('holding');
+      hid('key', { key: 'delete', modifiers: 'ctrl alt' });
+    }, 900);
+  });
+  ['pointerup', 'pointercancel', 'pointerleave', 'lostpointercapture'].forEach(function (name) {
+    cad.addEventListener(name, function (event) {
+      if (cadPointer !== null && event.pointerId !== undefined && event.pointerId !== cadPointer) return;
+      if (cadTimer) { clearTimeout(cadTimer); cadTimer = null; }
+      if (cadPointer !== null) {
+        try { cad.releasePointerCapture(cadPointer); } catch (_) {}
+      }
+      cadPointer = null;
+      cad.classList.remove('holding');
+    });
+  });
+
+  // Press and hold on her remains a voice path; a short press is still a tap.
+  //
+  // The 2026-08-06 shape was audio-only. USB Hands adds an explicit microphone
+  // and a small agent field beneath her, while keeping this gesture for the
+  // ordinary face. Every route still reports only its edges: the shell owns
+  // the recorder, endpoint and transcript.
+  //
+  // The threshold separates the two meanings of touching her rather than
+  // giving the tap a modifier. Below it she plays a motion; above it she
+  // listens. `pointercancel` matters as much as `pointerup`: a hold that
+  // becomes a drag, or a finger that leaves the surface, must stop the
+  // recorder — a listener nobody closed is the failure this gesture can
+  // actually cause.
+  var HOLD_MS = 350;
+  var holdTimer = null;
+  var listening = false;
+
+  function endHold(send) {
+    if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; }
+    if (!listening) return false;
+    listening = false;
+    if (window.souveraine) window.souveraine.talk(send ? 'end' : 'cancel');
+    return true;
+  }
+
+  canvas.addEventListener('pointerdown', function (e) {
+    if (holdTimer) clearTimeout(holdTimer);
+    holdTimer = setTimeout(function () {
+      holdTimer = null;
+      listening = true;
+      if (window.souveraine) window.souveraine.talk('start');
+    }, HOLD_MS);
+    // So a finger that slides off still delivers its release here.
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+  });
+
+  // Two quick taps send her away, mirroring the clock's own double tap that
+  // brought her here. Same window as the clock uses (350ms), so the gesture
+  // means one thing on this device rather than two.
+  var DOUBLE_MS = 350;
+  var lastTapAt = -1;
+
+  canvas.addEventListener('pointerup', function () {
+    // A hold that reached the threshold was speech, not a tap, and must not
+    // also count toward a double tap — releasing after speaking would
+    // otherwise be half of a dismissal.
+    if (endHold(true)) { lastTapAt = -1; return; }
+    if (!window.souveraine) return;
+    var now = Date.now();
+    if (lastTapAt > 0 && now - lastTapAt <= DOUBLE_MS) {
+      lastTapAt = -1;
+      window.souveraine.dismiss();
+      return;
+    }
+    lastTapAt = now;
+    // Single taps are hers to answer with a motion.
+    window.souveraine.tapped('body');
+  });
+
+  canvas.addEventListener('pointercancel', function () { endHold(false); });
+  window.addEventListener('blur', function () { endHold(false); });
+
+  // ## Her silhouette is where she takes touches; the rest is the home screen
+  //
+  // A transparent window is still a rectangle, and hers is the full width of
+  // the panel — so without this every tap meant for a widget behind her was
+  // swallowed by empty glass. The compositor cannot work the shape out: only
+  // this page knows which pixels she actually drew.
+  //
+  // Sampled from her own alpha rather than guessed as a box over her body,
+  // because she is a seated figure with gaps that matter — between her arms
+  // and her sides, under the book, either side of her hair — and a bounding
+  // box would hand all of them to her.
+  //
+  // Coarse on purpose. A grid cell is tens of pixels, the mask is the union of
+  // the cells that contain anything, and that costs one small readback instead
+  // of a per-pixel region the compositor would have to intersect on every
+  // contact. Erring outward by half a cell is the right direction: it is
+  // better to take a tap just off her elbow than to drop one on it.
+  var GRID_X = 24, GRID_Y = 36;
+  var shapeCanvas = document.createElement('canvas');
+  shapeCanvas.width = GRID_X;
+  shapeCanvas.height = GRID_Y;
+  var shapeCtx = shapeCanvas.getContext('2d', { willReadFrequently: true });
+  var lastShape = '';
+  // The first few attempts report unconditionally, including failures. An
+  // input region that silently never publishes looks exactly like one that
+  // published correctly — the glass is identical either way — so the quiet
+  // path is the one that needs a voice. Bounded, because after that it is
+  // just noise on every sample.
+  var shapeReports = 0;
+
+  function publishShape() {
+    if (!window.souveraine || !canvas.width || !canvas.height) {
+      if (shapeReports++ < 3)
+        console.log('shape: skipped — souveraine=' + (!!window.souveraine)
+          + ' canvas=' + canvas.width + 'x' + canvas.height
+          + ' shape_fn=' + (window.souveraine && typeof window.souveraine.shape));
+      return;
+    }
+    var canvasRect = canvas.getBoundingClientRect();
+    var cw = canvasRect.width / GRID_X, ch = canvasRect.height / GRID_Y;
+    try {
+      // Scaled down by the GPU on the way in, so the readback is 24x36 and
+      // not the full panel. Must happen inside a frame: the WebGL canvas has
+      // no preserveDrawingBuffer, so its pixels are gone after compositing.
+      shapeCtx.clearRect(0, 0, GRID_X, GRID_Y);
+      shapeCtx.drawImage(canvas, 0, 0, GRID_X, GRID_Y);
+      var data = shapeCtx.getImageData(0, 0, GRID_X, GRID_Y).data;
+    } catch (e) {
+      return;
+    }
+    var rects = [];
+    for (var gy = 0; gy < GRID_Y; gy++) {
+      var runStart = -1;
+      for (var gx = 0; gx <= GRID_X; gx++) {
+        var solid = gx < GRID_X && data[(gy * GRID_X + gx) * 4 + 3] > 8;
+        if (solid && runStart < 0) runStart = gx;
+        // Runs merged along the row, so a full-width band is one rectangle
+        // instead of 24 — the region is unioned rect by rect on the other side.
+        if (!solid && runStart >= 0) {
+          rects.push([Math.floor(canvasRect.left + runStart * cw),
+                      Math.floor(canvasRect.top + gy * ch),
+                      Math.ceil((gx - runStart) * cw), Math.ceil(ch)]);
+          runStart = -1;
+        }
+      }
+    }
+    if (hands.classList.contains('up')) {
+      var hr = hands.getBoundingClientRect();
+      rects.push([Math.floor(hr.left), Math.floor(hr.top),
+                  Math.ceil(hr.width), Math.ceil(hr.height)]);
+    }
+    // Nothing drawn yet: say nothing. An empty report means "all of it" to the
+    // host, and publishing that on every frame before the rig loads would make
+    // her briefly swallow the screen each time she is summoned.
+    if (rects.length === 0) {
+      if (shapeReports++ < 3) {
+        var solid = 0;
+        for (var i = 3; i < data.length; i += 4) if (data[i] > 8) solid++;
+        console.log('shape: nothing drawn — ' + solid + ' of ' + (GRID_X * GRID_Y)
+          + ' cells had alpha; the sample read a blank buffer');
+      }
+      return;
+    }
+    var key = JSON.stringify(rects);
+    if (key === lastShape) return;
+    lastShape = key;
+    // Reported, because the shape is invisible on the glass and wrong is
+    // indistinguishable from right by looking: a single rectangle means the
+    // sampling read a blank buffer and she is swallowing the screen again.
+    if (shapeReports++ < 3) {
+      var lit = 0, rowsLit = 0;
+      for (var gy2 = 0; gy2 < GRID_Y; gy2++) {
+        var any = false;
+        for (var gx2 = 0; gx2 < GRID_X; gx2++)
+          if (data[(gy2 * GRID_X + gx2) * 4 + 3] > 8) { lit++; any = true; }
+        if (any) rowsLit++;
+      }
+      // Cells and rows, not just rectangles: a low rect count can mean either
+      // "she is a compact shape" or "the sample barely saw her", and only the
+      // coverage separates them.
+      console.log('shape: ' + rects.length + ' rects, ' + lit + '/' + (GRID_X * GRID_Y)
+        + ' cells lit across ' + rowsLit + '/' + GRID_Y + ' rows');
+    }
+    window.souveraine.shape(rects);
+  }
+
+  // Her outline changes when she moves, but slowly and not by much, so this
+  // does not belong in the draw loop. Twice a second is well inside the time
+  // it takes to reach for something behind her, and it costs one 24x36
+  // readback.
+  setInterval(function () { requestAnimationFrame(publishShape); }, 500);
+  if (window.souveraine) window.souveraine.ready();
+})();
+</script>
+</body>
+</html>

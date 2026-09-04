@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Workspace
+Comment=Jump to a numbered workspace
+Exec=sh -c 'exec "$HOME/.config/quickshell/souveraine/modules/common/workspace-selector.sh"'
+Icon=view-grid-symbolic
+Terminal=false
+Categories=Utility;

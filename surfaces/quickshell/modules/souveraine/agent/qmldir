@@ -1,0 +1,7 @@
+singleton ToolVocabulary 1.0 ToolVocabulary.qml
+ToolCard 1.0 ToolCard.qml
+ThinkingCard 1.0 ThinkingCard.qml
+AgentMessage 1.0 AgentMessage.qml
+AgentPaneMenu 1.0 AgentPaneMenu.qml
+ConversationMenu 1.0 ConversationMenu.qml
+ItineraryRibbon 1.0 ItineraryRibbon.qml

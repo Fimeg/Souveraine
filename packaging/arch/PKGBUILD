@@ -1,0 +1,56 @@
+# Maintainer: Fimeg <casey.tunturi@gmail.com>
+# Souveraine — sovereign agent substrate. Part of the SouveraineOS layer;
+# the phone runs the same server + agents as the desktop.
+pkgname=souveraine
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Sovereign agent substrate — server, TUI, surfaces"
+arch=('aarch64' 'x86_64')
+url="https://github.com/Fimeg/souveraine"
+license=('MIT')
+depends=('gcc-libs' 'polkit')
+makedepends=('cargo' 'git')
+options=('!lto')
+
+# Build from the local checkout synced by deploy-souveraine.sh (or a git
+# clone at $HOME/souveraine-src on device). No network fetch — the
+# phone builds what the laptop ships. Override with SOUVERAINE_SRCDIR.
+_srcdir="${SOUVERAINE_SRCDIR:-$HOME/souveraine-src}"
+
+pkgver() {
+    cd "$_srcdir"
+    git describe --tags --always 2>/dev/null | sed 's/^v//;s/-/./g' || echo "$pkgver"
+}
+
+build() {
+    cd "$_srcdir"
+    cargo build --release --locked
+}
+
+package() {
+    cd "$_srcdir"
+    install -Dm755 target/release/souveraine "$pkgdir/usr/bin/souveraine"
+    # repo unit points at ~/.local/bin (desktop dev install); packaged unit
+    # runs the pacman-owned binary
+    sed 's|%h/.local/bin/souveraine|/usr/bin/souveraine|' packaging/souveraine.service \
+        | install -Dm644 /dev/stdin "$pkgdir/usr/lib/systemd/user/souveraine.service"
+
+    # System tier: machine identity daemon + its service user. pacman runs
+    # systemd-sysusers on install, so the `souveraine` user exists before
+    # anyone runs `souveraine machine init`.
+    install -Dm755 target/release/souveraine-admit "$pkgdir/usr/bin/souveraine-admit"
+    install -Dm755 target/release/souveraine-machined "$pkgdir/usr/bin/souveraine-machined"
+    install -Dm644 packaging/souveraine-machined.service \
+        "$pkgdir/usr/lib/systemd/system/souveraine-machined.service"
+    install -Dm644 packaging/arch/souveraine.sysusers \
+        "$pkgdir/usr/lib/sysusers.d/souveraine.conf"
+
+    # Let the active local session power off / reboot / suspend / hibernate
+    # without an interactive polkit challenge — otherwise the lock surface
+    # (no agent above session lock) silently no-ops these and every shutdown
+    # is a fastboot hard-reboot.
+    install -Dm644 packaging/arch/souveraine-login1.rules \
+        "$pkgdir/etc/polkit-1/rules.d/49-souveraine-login1.rules"
+
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

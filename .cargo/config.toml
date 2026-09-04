@@ -1,0 +1,10 @@
+# ponytail: cross-build target for the Pixel 3 / any aarch64 Arch box.
+# Sysroot (/usr/aarch64-linux-gnu, from the aarch64-linux-gnu-gcc/glibc Arch
+# packages) holds glibc 2.43 + the cross alsa-lib we built in. Linker is the
+# cross gcc.
+#
+# The PKG_CONFIG_* vars alsa-sys needs are NOT set here — cargo's [env] block
+# doesn't reliably reach build-script pkg-config probes. scripts/build-cross.sh
+# exports them on the cargo invocation so they inherit to every build script.
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"

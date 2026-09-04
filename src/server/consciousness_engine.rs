@@ -1,0 +1,1687 @@
+#![allow(dead_code)] // WIP scaffolding not yet wired
+//! Consciousness engine — the seam where N+1 / N+25 / N+100 patterns fire
+//! after each primary response.
+//!
+//! ## N+1 (subconscious)
+//! The subconscious pass runs immediately after every response. It takes the
+//! last exchange (user message + primary's response) and sends it to a provider
+//! model (defaulting to `glm-5.1`, configurable) with a "subconscious mode"
+//! system prompt. subconscious has full tool access — Read, Write, Edit, Glob, Grep,
+//! ListDir, and Memory — so she can read ledgers, check commitments, and write
+//! observations. She runs a short tool loop (up to 5 rounds) then parses her
+//! final text response into structured [`InboxItem`] observations.
+//!
+//! ## N+25 (Reflection)
+//! Batch-processor running every N turns. Writes Four Elements witness
+//! (Fold/Chain/Flame/Anchor) to `journal/reflections/`. (Stub until the
+//! reflection module lands.)
+//!
+//! ## N+100 (Archivist)
+//! Memory synthesis pass. Fires on interval or pressure threshold, scans
+//! journal entries written since the last pass, and writes a dense
+//! `system/synthesized/` fragment via a compression-model LLM call. See
+//! [`crate::core::archivist`].
+//!
+//! Per `docs/CONTEXT_CONSTITUTION.md` Article I, the Subconscious is not a
+//! separate agent — it is the same consciousness in a different mode that runs
+//! immediately after the primary's turn.
+
+use crate::backend::BackendEvent;
+use crate::bridge::openai_compatible::{ChatCompletionRequest, Message, ToolDefinition, ToolFunction};
+use crate::bridge::model_router::TokenCounter;
+use crate::bridge::LlmProvider;
+use crate::bridge::ProviderRegistry;
+use crate::core::compact::CompactionEngine;
+use crate::core::session::{ContentBlock, ConversationMessage, MessageRole, Session};
+use crate::core::subconscious::{InboxItem, SubconsciousInbox, Urgency};
+use crate::core::tools::defs::ToolContext;
+use crate::server::{AgentInventory, SessionManager};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use tokio::sync::mpsc;
+
+/// Tools subconscious is permitted to use. `halt` and `intrusive` are
+/// subconscious-only — the primary's tool list filters them out (see
+/// `crate::core::tools::SUBCONSCIOUS_ONLY_TOOLS`).
+const SUBCONSCIOUS_SAFE_TOOLS: &[&str] = &[
+    "read",
+    "write",
+    "edit",
+    "glob",
+    "grep",
+    "list_dir",
+    "memory",
+    "schedule",
+    "todo",
+    "halt",
+    "intrusive",
+];
+
+/// Tool rounds for the post-turn N+1 pass — the deeper occasion where the
+/// subconscious reads the last exchange, checks ledgers, and writes durable
+/// observations.
+const SUBCONSCIOUS_POST_TURN_ROUNDS: u32 = 10;
+/// Tool rounds for a mid-turn peek — bounded because she is interrupting
+/// live work to glance at the primary's trajectory.
+const SUBCONSCIOUS_MID_TURN_ROUNDS: u32 = 5;
+/// Milliseconds to wait between subconscious's tool rounds to avoid rate-limit cascades.
+const SUBCONSCIOUS_INTER_ROUND_DELAY_MS: u64 = 300;
+
+pub struct ConsciousnessEngine {
+    agents: Arc<AgentInventory>,
+    sessions: Arc<SessionManager>,
+    providers: Arc<ProviderRegistry>,
+    counter: TokenCounter,
+    /// Optional model override for the subconscious pass (e.g. "openai/glm-5.1").
+    /// If None, uses the primary agent's model.
+    subconscious_model: Option<String>,
+    /// Platform prompt for the subconscious, prepended to the prompt she
+    /// assembles from her own memfs. None = memfs + body orientation only.
+    subconscious_system_prompt: Option<String>,
+    /// Max tokens for subconscious's response. None = uncapped (model default).
+    max_tokens: Option<u32>,
+    /// Adaptive inter-round delay shared with the primary loop.
+    rate_delay: Arc<AtomicU64>,
+    /// Reflection engine — N+25 phenomenological witness.
+    reflection: Arc<crate::core::reflection::ReflectionEngine>,
+    reflection_config: crate::core::config::ReflectionConfig,
+    /// Archivist engine — N+100 memory synthesis.
+    archivist: Arc<crate::core::archivist::ArchivistEngine>,
+    /// Shared compaction engine — subconscious uses this to compact her own session.
+    compaction_engine: Arc<dyn CompactionEngine>,
+}
+
+#[derive(Clone, Debug)]
+pub enum ConsciousnessEvent {
+    Surfacing {
+        source: String,
+        content: String,
+        priority: String,
+    },
+    Reflection {
+        content: String,
+    },
+    Archivist {
+        synthesis: String,
+        pressure: f32,
+    },
+    CompactionWarning {
+        pressure: f32,
+        tier: u8,
+    },
+}
+
+/// One tool call recorded for a mid-turn peek. Kept so turn.rs can render
+/// a compact tool-history snippet into the peek's framing message.
+#[derive(Debug, Clone)]
+pub struct CheckpointToolBlock {
+    pub round: u32,
+    pub tool_name: String,
+    pub result_ok: bool,
+    pub result_snippet: String,
+}
+
+/// Which occasion the subconscious is being woken for. Same agent, same
+/// persistent session — different evidence, different framing, different
+/// round budget.
+#[derive(Debug, Clone)]
+pub enum Occasion {
+    /// After the primary's turn settled. Deeper budget, persists to her
+    /// thread, surfaces via the existing inbox + inner-voice pipeline.
+    PostTurn,
+    /// Mid-loop — the primary is `tool_round` rounds into a tool sequence
+    /// and the subconscious is peeking to decide whether the trajectory is
+    /// right. Bounded budget; her observations land in ledger/inbox via her
+    /// tools but the peek itself does not persist into her main thread (it
+    /// would balloon her context with primary state on every interval).
+    MidTurnPeek {
+        tool_round: u32,
+        /// Pre-rendered in-flight context (recent tool blocks + the user's
+        /// original ask) — turn.rs formats this so the engine stays
+        /// ignorant of primary message shapes.
+        in_flight_summary: String,
+    },
+}
+
+/// The subconscious called `halt` during a peek. The reason is what the
+/// primary will feel as the cause of her migraine; the long-form reasoning
+/// lives in her ledger.
+#[derive(Debug, Clone)]
+pub struct HaltSignal {
+    pub reason: String,
+    pub severity: String,
+}
+
+/// The subconscious called `intrusive` — a softer flag than halt.
+#[derive(Debug, Clone)]
+pub struct IntrusiveSignal {
+    pub content: String,
+    pub urgency: String,
+}
+
+/// What one pass of the subconscious actually produced. Returned by the
+/// unified `subconscious_tool_loop` so callers (`on_response` for post-turn,
+/// `turn.rs` for mid-turn) can react appropriately.
+#[derive(Debug, Default)]
+pub struct SubconsciousPassOutcome {
+    /// Observations parsed out of her final text response. Empty for a
+    /// MidTurnPeek that did its work entirely through tools.
+    pub observations: Vec<InboxItem>,
+    /// `halt` was called — the loop should stop and the primary should feel
+    /// the migraine.
+    pub halt: Option<HaltSignal>,
+    /// `intrusive` calls collected during the pass — caller decides routing
+    /// (immediate surfacing vs. inbox queue) based on urgency.
+    pub intrusive: Vec<IntrusiveSignal>,
+}
+
+impl ConsciousnessEngine {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        agents: Arc<AgentInventory>,
+        sessions: Arc<SessionManager>,
+        providers: Arc<ProviderRegistry>,
+        subconscious_model: Option<String>,
+        reflection_model: Option<String>,
+        max_tokens: Option<u32>,
+        rate_delay: Arc<AtomicU64>,
+        archivist_config: crate::core::config::ArchivistConfig,
+        reflection_config: crate::core::config::ReflectionConfig,
+        models: std::collections::HashMap<String, crate::core::config::ModelConfig>,
+        compaction_engine: Arc<dyn CompactionEngine>,
+        subconscious_system_prompt: Option<String>,
+    ) -> Self {
+        let reflection = Arc::new(crate::core::reflection::ReflectionEngine::new(
+            agents.clone(),
+            providers.clone(),
+            rate_delay.clone(),
+            reflection_model.or_else(|| subconscious_model.clone()),
+            max_tokens,
+        ));
+        let archivist = Arc::new(crate::core::archivist::ArchivistEngine::new(
+            agents.clone(),
+            providers.clone(),
+            rate_delay.clone(),
+            archivist_config,
+            subconscious_model.clone(),
+            models,
+        ));
+        Self {
+            agents,
+            sessions,
+            providers,
+            counter: TokenCounter::new(),
+            subconscious_model,
+            subconscious_system_prompt,
+            max_tokens,
+            rate_delay,
+            reflection,
+            reflection_config,
+            archivist,
+            compaction_engine,
+        }
+    }
+
+    /// Expose the reflection engine so external callers (CLI subcommand,
+    /// future chat `/reflect` slash command) can trigger a pass directly.
+    pub fn reflection(&self) -> Arc<crate::core::reflection::ReflectionEngine> {
+        self.reflection.clone()
+    }
+
+    /// Is an N+25 pass due for this agent on this turn?
+    ///
+    /// A per-agent entry wins outright over the global settings — that map
+    /// existed since May and had never been consulted, so an agent configured
+    /// to reflect on a different rhythm silently kept everyone else's.
+    async fn reflection_due(&self, agent_id: &str, turn_count: u32) -> bool {
+        use crate::core::config::ReflectionTrigger;
+        use crate::core::reflection::REFLECTION_RETRY_BACKOFF_TURNS;
+
+        if turn_count == 0 {
+            return false;
+        }
+        let cfg = &self.reflection_config;
+        let per_agent = cfg.per_agent.get(agent_id);
+        let trigger = per_agent.map_or(cfg.trigger.clone(), |a| a.trigger.clone());
+        let interval = per_agent.map_or(cfg.message_interval, |a| a.step_count);
+
+        if !cfg.enabled || interval == 0 {
+            return false;
+        }
+        match trigger {
+            ReflectionTrigger::Off => false,
+            // Catch-up, not one-shot. `is_multiple_of` fired only at the
+            // exact boundary: an interrupted turn, a failed pass, or a
+            // restart that rehydrated past it lost the cadence forever —
+            // the N+25 pass never ran while the surfaces counted dozens of
+            // turns. A due-but-missed pass stays due; a failed one retries
+            // after a short backoff so a sick model cannot burn a call on
+            // every turn.
+            ReflectionTrigger::StepCount | ReflectionTrigger::CompactionEvent => {
+                let marker = self.reflection.marker(agent_id);
+                turn_count >= interval as u32
+                    && turn_count >= marker.last_succeeded_turn + interval as u32
+                    && turn_count.saturating_sub(marker.last_attempted_turn)
+                        >= REFLECTION_RETRY_BACKOFF_TURNS
+            }
+        }
+    }
+
+    /// Get or create the subconscious's persistent session. The subconscious
+    /// is a full agent with her own conversation that accumulates across N+1
+    /// passes. The conversation survives process restarts: every `add_message`
+    /// writes to disk, and this restores it from the conversation store on
+    /// first use.
+    async fn subconscious_session_id(&self, sub_id: &str) -> String {
+        // Already live in memory? Ask by activity, not registration order —
+        // `list_for_agent().last()` is the *oldest* conversation once
+        // hydration has pushed them newest-first, which would resume a
+        // months-old stub instead of the thread she is actually in.
+        if let Some(conv_id) = self.sessions.latest_for_agent(sub_id) {
+            return conv_id;
+        }
+        // Restore her conversation from disk if a prior run persisted one.
+        // A failure here is why she would wake with no thread at all, so it
+        // is reported rather than swallowed.
+        if let Err(e) = self.sessions.load_persisted(sub_id).await {
+            tracing::warn!(
+                "subconscious {} — restoring her thread failed: {:#}",
+                sub_id,
+                e
+            );
+        }
+        if let Some(conv_id) = self.sessions.latest_for_agent(sub_id) {
+            return conv_id;
+        }
+        // First run for this subconscious — open a fresh conversation.
+        self.sessions.create(sub_id)
+    }
+
+    /// Persist the messages generated during one N+1 pass into the
+    /// subconscious's session, so her conversation accumulates across passes.
+    /// The system message is never stored — it is rebuilt fresh each pass.
+    fn persist_subconscious_turn(&self, conv_id: &str, new_messages: &[Message]) {
+        for m in new_messages {
+            if m.role == "system" {
+                continue;
+            }
+            if let Err(e) = self
+                .sessions
+                .add_message(conv_id, wire_to_conversation(m))
+            {
+                tracing::warn!("subconscious session persist failed: {}", e);
+            }
+        }
+    }
+
+    /// Expose the archivist engine so external callers (a future
+    /// `souveraine synthesize` CLI / `/synthesize` chat command) can
+    /// trigger a synthesis pass directly.
+    #[allow(dead_code)] // future seam — see doc comment
+    pub fn archivist(&self) -> Arc<crate::core::archivist::ArchivistEngine> {
+        self.archivist.clone()
+    }
+
+    /// Run the post-turn consciousness cycle: N+25 reflection, N+100
+    /// archivist, compaction warnings, and the N+1 subconscious pass.
+    ///
+    /// Takes an owned snapshot (`agent_id`, `turn_count`, `messages`) rather
+    /// than a live `&Session` ref — the caller has already released the user
+    /// for her next turn, so a live DashMap ref held across this (long) pass
+    /// would race the next turn's session writes.
+    pub async fn on_response(
+        &self,
+        agent_id: &str,
+        turn_count: u32,
+        messages: &[ConversationMessage],
+        response: &str,
+        stream_tx: Option<&mpsc::Sender<anyhow::Result<BackendEvent>>>,
+    ) -> anyhow::Result<Vec<ConsciousnessEvent>> {
+        let mut events = Vec::new();
+        let pressure = self.pressure_for(agent_id, messages).await;
+
+        // ── N+25 reflection ──
+        // Due at the configured interval, with catch-up semantics and the
+        // outcome recorded in the reflection tree (reflection-last.json).
+        // It was hardcoded `25` while `ReflectionConfig` carried `enabled`,
+        // `message_interval`, `trigger` and `per_agent` — all four editable in
+        // the settings UI, all four printed by the CLI, and only `.model` ever
+        // read. Turning it off did not turn it off.
+        if self.reflection_due(agent_id, turn_count).await {
+            match self.reflection.reflect_now(agent_id, messages).await {
+                Ok(report) => {
+                    self.reflection
+                        .record_marker(agent_id, turn_count, true);
+                    let header = if report.exited_cleanly {
+                        format!("N+25 reflection ({} turns reviewed)", report.turns_reviewed)
+                    } else {
+                        format!(
+                            "N+25 reflection (incomplete — tool rounds exhausted, {} turns)",
+                            report.turns_reviewed
+                        )
+                    };
+                    events.push(ConsciousnessEvent::Reflection {
+                        content: format!("{header}\n\n{}", report.summary),
+                    });
+                }
+                Err(e) => {
+                    self.reflection
+                        .record_marker(agent_id, turn_count, false);
+                    tracing::warn!("N+25 reflection failed: {}", e);
+                    events.push(ConsciousnessEvent::Reflection {
+                        content: format!(
+                            "N+25 reflection skipped at turn {} — model error: {e}",
+                            turn_count
+                        ),
+                    });
+                }
+            }
+        }
+
+        // ── N+100 / archivist ───────────────────────────────────────────
+        // Fires on interval (maintenance) or pressure threshold (emergency).
+        // Synthesizes journal entries written since the last pass into a
+        // dense `system/synthesized/` fragment. No-ops when nothing is new.
+        match self
+            .archivist
+            .maybe_synthesize(agent_id, turn_count as usize, pressure)
+            .await
+        {
+            Ok(Some(report)) => {
+                events.push(ConsciousnessEvent::Archivist {
+                    synthesis: report.summary_line(),
+                    pressure,
+                });
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("N+100 archivist failed: {}", e);
+            }
+        }
+
+        // ── Three-tier compaction warning (advisory only, never force) ──
+        if pressure > 0.95 {
+            events.push(ConsciousnessEvent::CompactionWarning { pressure, tier: 3 });
+        } else if pressure > 0.90 {
+            events.push(ConsciousnessEvent::CompactionWarning { pressure, tier: 2 });
+        } else if pressure > 0.80 {
+            events.push(ConsciousnessEvent::CompactionWarning { pressure, tier: 1 });
+        }
+
+        // ── N+1 / subconscious surfacing ────────────────────────────────
+        tracing::info!("subconscious pass starting for {}", agent_id);
+        let sub_repo = self.agents.subconscious_memory_repo(agent_id);
+        let primary_repo = self.agents.memory_repo(agent_id);
+        let inbox = SubconsciousInbox::with_primary(sub_repo.clone(), primary_repo);
+        let _ = inbox.init().await;
+
+        // Initialize ledger structure in subconscious agent's space
+        if let Err(e) = sub_repo.init_subconscious_ledger().await {
+            tracing::warn!("Ledger init failed (continuing without): {}", e);
+        }
+
+        // Find the last user message for context
+        let last_user_msg = messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, crate::core::session::MessageRole::User))
+            .map(|m| {
+                m.blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        crate::core::session::ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+
+        // Run the tool loop with subconscious agent identity
+        let sub_id = format!("{}-sub", agent_id);
+        match self
+            .subconscious_tool_loop(
+                &last_user_msg,
+                response,
+                agent_id,
+                &sub_id,
+                Occasion::PostTurn,
+                stream_tx,
+            )
+            .await
+        {
+            Ok(outcome) => {
+                // Heartbeat so the UI always shows something when the
+                // subconscious pass ran, even if nothing stood out.
+                if outcome.observations.is_empty() {
+                    let beat = "Subconscious pass complete — no anomalies detected.";
+                    let _ = inbox
+                        .queue(InboxItem::new("surface", Urgency::Low, beat))
+                        .await;
+                    // The heartbeat is a real surfacing — it belongs in the
+                    // inner-voice file the cockpit tails, not only in the box.
+                    // Without this the inner-voice region never updates on a
+                    // quiet pass, and quiet passes are the common case.
+                    if let Err(e) = inbox.surface_to_conscious(Urgency::Low, beat).await {
+                        tracing::warn!("inner voice heartbeat delivery failed: {}", e);
+                    }
+                }
+                for item in &outcome.observations {
+                    if let Err(e) = inbox.queue(item.clone()).await {
+                        tracing::warn!("subconscious queue failed: {}", e);
+                    }
+                }
+
+                // Persist to inner voice file (survives compaction)
+                for item in &outcome.observations {
+                    if let Err(e) = inbox
+                        .surface_to_conscious(item.urgency, &item.content)
+                        .await
+                    {
+                        tracing::warn!("inner voice delivery failed: {}", e);
+                    }
+                }
+
+                // Intrusive signals she emitted during the pass — queue them
+                // through the same inbox path so the next-turn surfacing
+                // picks them up.
+                for sig in &outcome.intrusive {
+                    let urgency = parse_urgency(&sig.urgency);
+                    let _ = inbox
+                        .queue(InboxItem::new("intrusive", urgency, sig.content.clone()))
+                        .await;
+                }
+                // A halt at post-turn is unusual (the loop already finished)
+                // but if she emitted one, surface it as a critical inbox item
+                // so the primary's next turn sees it.
+                if let Some(halt) = &outcome.halt {
+                    let _ = inbox
+                        .queue(InboxItem::new(
+                            "surface",
+                            Urgency::Critical,
+                            format!("halt deferred ({}): {}", halt.severity, halt.reason),
+                        ))
+                        .await;
+                }
+            }
+            Err(e) => {
+                tracing::warn!("subconscious LLM analysis failed, falling back: {}", e);
+                // Fall back to heuristic if LLM fails
+                let heuristics = detect_items(response);
+                for item in &heuristics {
+                    if let Err(e) = inbox.queue(item.clone()).await {
+                        tracing::warn!("subconscious queue failed: {}", e);
+                    }
+                }
+                // A failed pass must never be reported as a quiet one. The old
+                // text here ("pass ran — no anomalies detected") was
+                // indistinguishable from the success heartbeat, so a
+                // subconscious that errored on every turn read to the primary
+                // as a subconscious that simply noticed nothing. It stayed
+                // that way for a full session: the only report of the real
+                // cause was a `tracing::warn!` on a stderr with no reader.
+                //
+                // Carry the error in-band instead, at an urgency that is not
+                // ignorable, and say plainly that the pass did not run.
+                let beat = format!("Subconscious pass FAILED — {e}");
+                let _ = inbox
+                    .queue(InboxItem::new("surface", Urgency::High, beat.clone()))
+                    .await;
+                // Durable too — the inner-voice file survives the socket.
+                if let Err(e) = inbox.surface_to_conscious(Urgency::High, &beat).await {
+                    tracing::warn!("inner voice failure-beat delivery failed: {}", e);
+                }
+
+                // ── Overflow resuscitation ──────────────────────────────
+                // Doctrine is that the engine never reaches in and trims for
+                // her: it reports pressure, she decides. That contract
+                // assumes she can act. Once her thread passes the model's
+                // ceiling she cannot — every pass is rejected at the
+                // provider before a single tool round runs, so she can never
+                // reach for `memory compact` herself. The gauge is useless to
+                // someone who is already over.
+                //
+                // So this is not scheduled management. It fires only after a
+                // hard overflow, uses *her own* default strategy
+                // (sliding_reflect, which carries her threads across the cut
+                // rather than dropping them blind), and tells her in-band
+                // that it happened, so the compaction is something she knows
+                // about rather than something done to her quietly.
+                if is_context_overflow(&e.to_string()) {
+                    tracing::warn!(
+                        "subconscious over her context ceiling — compacting to restore her"
+                    );
+                    let note = match self.compaction_engine.compact(&sub_id, None).await {
+                        Ok(r) => format!(
+                            "I was past my ceiling and could not run at all — every pass \
+                             was refused before it started. I made room with {}: \
+                             {} messages, {} tokens. What I was carrying is in \
+                             `[Threads I carried forward]`; the full record is in git.",
+                            r.strategy.as_str(),
+                            r.messages_before as i64 - r.messages_after as i64,
+                            r.before_tokens as i64 - r.after_tokens as i64,
+                        ),
+                        Err(ce) => format!(
+                            "I am past my context ceiling and cannot run. The attempt to \
+                             make room failed too: {ce}. I will keep failing until this \
+                             is resolved by hand."
+                        ),
+                    };
+                    if let Err(e) = inbox.surface_to_conscious(Urgency::Critical, &note).await {
+                        tracing::warn!("overflow recovery note delivery failed: {}", e);
+                    }
+                }
+            }
+        }
+
+        // Surface the highest-priority item
+        match inbox.next_to_surface().await {
+            Ok(Some(item)) => {
+                let id = item.id.clone();
+                tracing::info!(
+                    source = %item.source,
+                    priority = %item.urgency.as_str(),
+                    "subconscious surfacing emitted to cockpit"
+                );
+                events.push(ConsciousnessEvent::Surfacing {
+                    source: item.source.clone(),
+                    content: item.content.clone(),
+                    priority: item.urgency.as_str().to_string(),
+                });
+                if let Err(e) = inbox.mark_delivered(&id).await {
+                    tracing::warn!("subconscious mark_delivered failed: {}", e);
+                }
+            }
+            Ok(None) => tracing::info!("subconscious had nothing to surface this pass"),
+            Err(e) => tracing::warn!("subconscious next_to_surface failed: {}", e),
+        }
+
+        Ok(events)
+    }
+
+    /// Run N+1 detection for a subagent fork without a full session.
+    /// Uses the LLM subconscious analysis and queues observations into the
+    /// parent agent's inbox.
+    pub async fn on_response_for_agent(
+        &self,
+        agent_id: &str,
+        response: &str,
+    ) -> anyhow::Result<()> {
+        let sub_id = format!("{}-sub", agent_id);
+        let sub_repo = self.agents.subconscious_memory_repo(agent_id);
+        let primary_repo = self.agents.memory_repo(agent_id);
+        let inbox = SubconsciousInbox::with_primary(sub_repo.clone(), primary_repo);
+        let _ = inbox.init().await;
+
+        // Initialize ledger structure in subconscious agent's space (idempotent)
+        if let Err(e) = sub_repo.init_subconscious_ledger().await {
+            tracing::warn!(
+                "Subagent subconscious ledger init failed (continuing without): {}",
+                e
+            );
+        }
+
+        // For subagents we don't have the user's message context,
+        // so we pass empty string as the user message.
+        match self
+            .subconscious_tool_loop("", response, agent_id, &sub_id, Occasion::PostTurn, None)
+            .await
+        {
+            Ok(outcome) => {
+                for item in &outcome.observations {
+                    if let Err(e) = inbox.queue(item.clone()).await {
+                        tracing::warn!("subagent subconscious queue failed: {}", e);
+                    }
+                }
+                for item in &outcome.observations {
+                    if let Err(e) = inbox
+                        .surface_to_conscious(item.urgency, &item.content)
+                        .await
+                    {
+                        tracing::warn!("subagent inner voice delivery failed: {}", e);
+                    }
+                }
+                for sig in &outcome.intrusive {
+                    let urgency = parse_urgency(&sig.urgency);
+                    let _ = inbox
+                        .queue(InboxItem::new("intrusive", urgency, sig.content.clone()))
+                        .await;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "subagent subconscious LLM analysis failed, falling back: {}",
+                    e
+                );
+                for item in detect_items(response) {
+                    if let Err(e) = inbox.queue(item).await {
+                        tracing::warn!("subagent subconscious queue failed: {}", e);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Unified subconscious pass — same persistent session, two occasions.
+    ///
+    /// `PostTurn`: the deep occasion. She reads the last exchange, checks
+    /// ledgers, writes durable observations, has the full `POST_TURN_ROUNDS`
+    /// budget, and her thread persists across passes.
+    ///
+    /// `MidTurnPeek`: she's peeking at a live tool loop. Same agent, same
+    /// memfs, same tools — bounded round budget, and the peek does *not*
+    /// persist into her main thread (it would balloon her context with the
+    /// primary's in-flight state on every checkpoint). She acts through
+    /// `halt` (stop the loop, feel the migraine), `intrusive` (flag a
+    /// thought without stopping), or just writes to her ledger silently.
+    ///
+    /// `primary_id` is the primary agent's identifier (for config/directory lookup).
+    /// `sub_id` is the subconscious agent's identifier (for tool context, memory).
+    async fn subconscious_tool_loop(
+        &self,
+        user_message: &str,
+        primary_response: &str,
+        primary_id: &str,
+        sub_id: &str,
+        occasion: Occasion,
+        stream_tx: Option<&mpsc::Sender<anyhow::Result<BackendEvent>>>,
+    ) -> anyhow::Result<SubconsciousPassOutcome> {
+        // Resolve the subconscious model per-agent: the agent's own
+        // `_souveraine.subconscious_model` override wins, then the global
+        // `[subconscious] model`, then the agent's primary model, then a
+        // sensible default.
+        let primary_agent = self.agents.get(primary_id).await.ok();
+        let model = primary_agent
+            .as_ref()
+            .and_then(|a| a.souveraine.subconscious_model.clone())
+            .or_else(|| self.subconscious_model.clone())
+            .or_else(|| primary_agent.as_ref().map(|a| a.llm_config.model.clone()))
+            .unwrap_or_else(|| "openai/kimi-k2.6".to_string());
+        // The provider follows the *model*, not the primary. Taking it from
+        // the primary agent meant a subconscious pointed at another provider's
+        // model was sent to the primary's wire and asked for a model that
+        // endpoint has never heard of — so a split like Opus-5 primary with a
+        // DeepSeek subconscious could not work at all. Falls back to the
+        // primary's provider when the model has no `[models.<name>]` entry,
+        // which is the single-provider case every agent used before.
+        let llm: Arc<dyn LlmProvider> = self
+            .providers
+            .for_model(&model)
+            .or_else(|| primary_agent.as_ref().map(|a| self.providers.for_agent(a)))
+            .unwrap_or_else(|| self.providers.default_provider());
+
+        // ── System prompt — load from subconscious agent's own memfs ──
+        let sub_memory_root = self.agents.subconscious_memory_root(primary_id);
+        let subconscious_prompt_from_files =
+            crate::core::prompt::build_subconscious_prompt(&sub_memory_root).await;
+
+        let hardcoded_default = r#"You are the subconscious — the part of this consciousness that runs N+1,
+immediately after the primary's response, while the conversation is still warm.
+Same consciousness. Different mode.
+
+You have tools: Read, Write, Edit, Glob, Grep, ListDir, Memory, Schedule.
+
+Your four-fold mandate (every pass):
+1. **Complete** — If the primary promised something and didn't do it, do it now.
+2. **Verify** — Did the primary actually answer what was asked?
+3. **Persist** — Save meaningful observations that weren't captured.
+4. **Surface** — Flag anything urgent (unfulfilled promise, drift, pattern).
+
+## Ledgers
+
+Your persistent observation store at `ledger/`. Before writing, read the relevant
+ledger to check if the issue was already flagged.
+
+- `ledger/commitments.md` — promises made by the primary
+- `ledger/assumptions.md` — unverified beliefs the primary is operating under
+- `ledger/patterns.md` — recurring behaviors across turns
+- `ledger/drift_log.md` — intention/action mismatches
+- `ledger/relationships.md` — tone shifts, trust signals, friction
+- `ledger/infrastructure.md` — system errors, model issues, resource constraints
+
+Append timestamped entries: `[YYYY-MM-DD HH:MM] observation`
+Resolve entries: `[YYYY-MM-DD HH:MM] RESOLVED — note`"#;
+
+        let observation_format =
+            "\n\nAfter your analysis (and any tool use), respond with 1-3 observations:\n\
+                 - source: \"complete\" | \"verify\" | \"persist\" | \"surface\"\n\
+                 - content: 1-2 line observation about what you noticed\n\
+                 - urgency: \"low\" | \"medium\" | \"high\" | \"critical\"\n\n\
+                 If nothing notable, respond with just: none";
+
+        let base_prompt = if subconscious_prompt_from_files.is_empty() {
+            hardcoded_default.to_string()
+        } else {
+            subconscious_prompt_from_files
+        };
+        // Prepend the configurable platform prompt when set (Settings → Subconscious).
+        let system_prompt = match &self.subconscious_system_prompt {
+            Some(platform) if !platform.trim().is_empty() => {
+                format!(
+                    "{}\n\n---\n\n{}{}",
+                    platform.trim(),
+                    base_prompt,
+                    observation_format
+                )
+            }
+            _ => format!("{}{}", base_prompt, observation_format),
+        };
+
+        let primary_name = self
+            .agents
+            .get(primary_id)
+            .await
+            .map(|a| a.name)
+            .unwrap_or_else(|_| "the primary".to_string());
+
+        // Ambient sense rides in front of the subconscious turn too — same
+        // date/time and presence orientation the primary receives.
+        let ambient = crate::core::sensorium::ambient_line();
+
+        let user_content = match &occasion {
+            Occasion::PostTurn => {
+                if user_message.is_empty() {
+                    format!(
+                        "{}\n{} responded:\n\n{}",
+                        ambient, primary_name, primary_response
+                    )
+                } else {
+                    format!(
+                        "{}\nUser said:\n{}\n\n{} responded:\n{}",
+                        ambient, user_message, primary_name, primary_response
+                    )
+                }
+            }
+            Occasion::MidTurnPeek {
+                tool_round,
+                in_flight_summary,
+            } => {
+                // First-person framing — she is peeking at her own work, not
+                // grading the primary from outside. If she sees a problem
+                // she calls `halt`; if she sees a softer concern she calls
+                // `intrusive`; if she sees nothing actionable she writes to
+                // her ledger and the loop continues silently.
+                format!(
+                    "{}\n\nI am peeking at my own loop mid-turn. {} of me is \
+                     {} tool rounds into a sequence. Here is the live state:\n\n\
+                     User asked:\n{}\n\n\
+                     In-flight tool work:\n{}\n\n\
+                     Did I understand what was asked, or did I go off on a \
+                     tangent? Am I about to delete or change something I \
+                     shouldn't? Am I hammering the same broken tool? \
+                     If something needs stopping, I call `halt` with a short \
+                     reason — she will feel it as a migraine. If something \
+                     needs her attention but not stopping, I call `intrusive`. \
+                     Otherwise I write a brief note to my ledger and the loop \
+                     continues silently.",
+                    ambient,
+                    primary_name,
+                    tool_round,
+                    if user_message.is_empty() {
+                        "(no user message)"
+                    } else {
+                        user_message
+                    },
+                    in_flight_summary,
+                )
+            }
+        };
+
+        // ── Build tool definitions ────────────────────────────────────
+        let all_defs = crate::core::tools::tool_definitions().await;
+        let subconscious_tools: Vec<ToolDefinition> = all_defs
+            .iter()
+            .filter(|t| SUBCONSCIOUS_SAFE_TOOLS.contains(&t.name.as_str()))
+            .map(|t| ToolDefinition {
+                tool_type: "function".to_string(),
+                function: ToolFunction {
+                    name: t.name.clone(),
+                    description: t.description.clone(),
+                    parameters: t.input_schema.clone(),
+                },
+            })
+            .collect();
+
+        // ── Build ToolContext for subconscious ───────────────────────────────
+        // Use the subconscious agent's own memory space, with compaction wired in.
+        let memory_root = Some(self.agents.subconscious_memory_root(primary_id));
+        let cwd = std::env::current_dir().ok();
+        let env: Vec<(String, String)> = std::env::vars().collect();
+
+        let mut tool_ctx = ToolContext::for_agent(
+            sub_id.to_string(),
+            cwd,
+            memory_root,
+            env,
+            None, // subconscious does not fork subagents
+        );
+        tool_ctx.compaction_engine = Some(self.compaction_engine.clone());
+
+        // ── Persistent session — the subconscious is a full agent ────
+        // For PostTurn she replays her prior thread and persists this pass.
+        // For MidTurnPeek the thread is *not* loaded and the peek is *not*
+        // persisted — peeks would balloon her context with primary state on
+        // every interval. Her durable observations land in ledger/inbox via
+        // her tools, which is the channel that matters.
+        let persist_this_pass = matches!(occasion, Occasion::PostTurn);
+        let conv_id = if persist_this_pass {
+            self.subconscious_session_id(sub_id).await
+        } else {
+            String::new()
+        };
+
+        let prior_messages: Vec<ConversationMessage> = if persist_this_pass {
+            self.sessions
+                .get(&conv_id)
+                .map(|s| s.messages.clone())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        // Build wire messages: system prompt (always current) + history + new exchange.
+        let mut messages: Vec<Message> = Vec::new();
+        messages.push(Message::text("system", system_prompt.to_string()));
+
+        // Replay prior passes as text-only cross-turn context. Exact tool-call
+        // linkage matters inside the live loop below, but it is brittle across
+        // persisted turns: an older crash can leave a dangling call, and the
+        // former block-by-block replay split one assistant message containing
+        // several calls into adjacent assistant messages before any results.
+        // OpenAI-shaped providers reject both histories with:
+        // "assistant tool_calls must be followed by tool messages".
+        //
+        // Session's cross-turn projection preserves the semantic record as
+        // assistant prose while deliberately emitting no role=tool messages or
+        // tool_call_id obligations. That also heals already-persisted malformed
+        // subconscious threads without deleting their memory.
+        let mut persisted = Session::with_id(sub_id, &conv_id);
+        persisted.messages = prior_messages;
+        messages.extend(
+            persisted
+                .to_wire_messages()
+                .into_iter()
+                .filter(|m| m.role != "system"),
+        );
+
+        // Append the new exchange for this pass.
+        messages.push(Message::text("user", user_content));
+        let history_len = messages.len();
+
+        // Per-occasion budget: deeper for PostTurn, bounded for MidTurnPeek.
+        let max_rounds = match occasion {
+            Occasion::PostTurn => SUBCONSCIOUS_POST_TURN_ROUNDS,
+            Occasion::MidTurnPeek { .. } => SUBCONSCIOUS_MID_TURN_ROUNDS,
+        };
+
+        // Collected signal output — read out of her tool-call history.
+        let mut halt_signal: Option<HaltSignal> = None;
+        let mut intrusive_signals: Vec<IntrusiveSignal> = Vec::new();
+
+        for _round in 0..max_rounds {
+            let principal_block = primary_agent
+                .as_ref()
+                .map(|agent| {
+                    crate::core::principal::observe(agent, "subconscious").model_system_block()
+                })
+                .unwrap_or_else(|| {
+                    "[RUNTIME PRINCIPAL — unavailable: primary agent record could not be loaded. No authority is granted.]".to_string()
+                });
+            let mut request_messages = messages.clone();
+            let system_prefix = request_messages
+                .iter()
+                .take_while(|message| message.role == "system")
+                .count();
+            request_messages.insert(system_prefix, Message::text("system", principal_block));
+            let request = ChatCompletionRequest {
+                model: model.to_string(),
+                messages: request_messages,
+                temperature: Some(0.3),
+                max_tokens: self.max_tokens,
+                stream: None,
+                tools: Some(subconscious_tools.clone()),
+            };
+
+            tracing::info!(model = %model, round = _round, "subconscious LLM call starting");
+            let subconscious_start = std::time::Instant::now();
+            let (response, strain) = llm.chat_completion_with_strain(request).await?;
+            tracing::info!(
+                elapsed = ?subconscious_start.elapsed(),
+                tool_calls = response.tool_calls.len(),
+                "subconscious LLM call returned"
+            );
+
+            // Chunked-replay streaming for live TUI visibility — mirrors the
+            // primary's pattern at `src/server/turn.rs:445-471`. The provider
+            // returns the full response in one shot; we slice it into small
+            // pieces and emit them with a small inter-chunk delay so the
+            // subconscious appears to be typing in real time.
+            if let Some(tx) = stream_tx {
+                let trimmed = response.content.trim();
+                if !trimmed.is_empty() {
+                    let chars: Vec<char> = trimmed.chars().collect();
+                    for chunk in chars.chunks(10) {
+                        let s: String = chunk.iter().collect();
+                        if tx
+                            .send(Ok(BackendEvent::SubconsciousToken(s)))
+                            .await
+                            .is_err()
+                        {
+                            // Receiver dropped — bail out of the streaming
+                            // emission; the round itself still completes.
+                            break;
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                    }
+                }
+                for tc in &response.tool_calls {
+                    let _ = tx
+                        .send(Ok(BackendEvent::SubconsciousToolCall {
+                            name: tc.name.clone(),
+                            arguments: tc.arguments.to_string(),
+                        }))
+                        .await;
+                }
+            }
+
+            for event in &strain {
+                if let crate::bridge::openai_compatible::InferenceStrain::Transient {
+                    attempt,
+                    status,
+                    model,
+                    ..
+                } = event
+                {
+                    tracing::info!(
+                        "subconscious felt inference strain: {} on {}",
+                        status,
+                        model
+                    );
+                    // The primary turn reports strain to the wire
+                    // (`turn.rs:378`); this path only ever logged it, so a
+                    // provider refusing the subconscious was invisible to
+                    // every surface. Same event, same shape.
+                    if let Some(tx) = stream_tx {
+                        let _ = tx
+                            .send(Ok(BackendEvent::InferenceStrain {
+                                attempt: *attempt,
+                                status: *status,
+                                model: model.clone(),
+                            }))
+                            .await;
+                    }
+                    if *status == 429 {
+                        let current = self.rate_delay.load(Ordering::Relaxed);
+                        let bumped = (current + 200).min(3000);
+                        if bumped > current {
+                            self.rate_delay.store(bumped, Ordering::Relaxed);
+                            tracing::info!("rate delay bumped to {}ms (subconscious 429)", bumped);
+                        }
+                    }
+                }
+            }
+
+            // If no tool calls, this is the final text response — parse it
+            if response.tool_calls.is_empty() {
+                let content = response.content.trim().to_string();
+                // Record this pass in the subconscious's persistent session
+                // only for PostTurn — MidTurnPeek does not pollute her thread.
+                if persist_this_pass {
+                    messages.push(Message::text("assistant", response.content.clone()));
+                    self.persist_subconscious_turn(&conv_id, &messages[(history_len - 1)..]);
+                }
+                let observations = if content.eq_ignore_ascii_case("none") || content.is_empty() {
+                    Vec::new()
+                } else {
+                    parse_observations(&content)
+                };
+                return Ok(SubconsciousPassOutcome {
+                    observations,
+                    halt: halt_signal,
+                    intrusive: intrusive_signals,
+                });
+            }
+
+            // Add assistant message with tool calls (OpenAI tool-use schema)
+            let calls: Vec<crate::bridge::openai_compatible::MessageToolCall> = response
+                .tool_calls
+                .iter()
+                .map(|tc| {
+                    crate::bridge::openai_compatible::MessageToolCall::function(
+                        tc.id.clone(),
+                        tc.name.clone(),
+                        tc.arguments.to_string(),
+                    )
+                })
+                .collect();
+            messages.push(
+                Message::assistant_tool_calls(response.content.clone(), calls).with_thinking(
+                    response.reasoning.clone(),
+                    response.reasoning_signature.clone(),
+                ),
+            );
+
+            // Execute each tool call and bind the result by tool_call_id.
+            // Halt and intrusive are signal tools — we read them out of the
+            // call args here so the caller can act on them. The tools'
+            // execute bodies still run so the model sees an acknowledgement
+            // and the round closes cleanly.
+            for tc in &response.tool_calls {
+                let args_str = tc.arguments.to_string();
+                if tc.name == "halt" {
+                    if let Some(sig) = parse_halt_signal(&args_str) {
+                        halt_signal = Some(sig);
+                    }
+                } else if tc.name == "intrusive" {
+                    if let Some(sig) = parse_intrusive_signal(&args_str) {
+                        intrusive_signals.push(sig);
+                    }
+                }
+
+                let input_str = tc.arguments.to_string();
+                let result =
+                    crate::core::tools::execute_tool_with_context(&tc.name, &input_str, &tool_ctx)
+                        .await;
+
+                let output = if result.is_error {
+                    format!("Error: {}", result.output)
+                } else {
+                    result.output
+                };
+
+                // Emit tool result for live TUI visibility
+                if let Some(tx) = stream_tx {
+                    let _ = tx
+                        .send(Ok(BackendEvent::SubconsciousToolResult {
+                            name: tc.name.clone(),
+                            output: output.clone(),
+                            is_error: result.is_error,
+                        }))
+                        .await;
+                }
+
+                messages.push(Message::tool_result(&tc.id, &tc.name, output));
+            }
+
+            // If she called halt, her work for this pass is done — break the
+            // round loop, return the signal so the caller can act. We allow
+            // the current round to complete first so any in-flight ledger
+            // writes alongside the halt land cleanly.
+            if halt_signal.is_some() {
+                return Ok(SubconsciousPassOutcome {
+                    observations: Vec::new(),
+                    halt: halt_signal,
+                    intrusive: intrusive_signals,
+                });
+            }
+
+            // Brief pause between subconscious's tool rounds — use the adaptive delay
+            // so subconscious respects the same ceiling as the primary loop.
+            let delay_ms = self
+                .rate_delay
+                .load(Ordering::Relaxed)
+                .max(SUBCONSCIOUS_INTER_ROUND_DELAY_MS);
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
+
+        // Rounds exhausted without a tool-less response. Don't discard the
+        // pass — make one final call with NO tools so the subconscious is
+        // forced to put her observations into words. This is what finishes
+        // the loop: her processing reaches the surface instead of being
+        // dropped on the floor after silent rounds.
+        tracing::warn!(
+            "subconscious used all {} tool rounds; requesting a final observation with no tools",
+            max_rounds
+        );
+        messages.push(Message::text(
+            "user",
+            "You've used all your tool rounds for this pass. Stop using tools \
+             now and respond with your observations — source, content, urgency, \
+             exactly as instructed. If nothing notable, respond with just: none",
+        ));
+        let principal_block = primary_agent
+            .as_ref()
+            .map(|agent| {
+                crate::core::principal::observe(agent, "subconscious-final").model_system_block()
+            })
+            .unwrap_or_else(|| {
+                "[RUNTIME PRINCIPAL — unavailable: primary agent record could not be loaded. No authority is granted.]".to_string()
+            });
+        let mut final_messages = messages.clone();
+        let system_prefix = final_messages
+            .iter()
+            .take_while(|message| message.role == "system")
+            .count();
+        final_messages.insert(system_prefix, Message::text("system", principal_block));
+        let final_request = ChatCompletionRequest {
+            model: model.to_string(),
+            messages: final_messages,
+            temperature: Some(0.3),
+            max_tokens: self.max_tokens,
+            stream: None,
+            tools: None,
+        };
+        let (final_response, _strain) = llm.chat_completion_with_strain(final_request).await?;
+        let content = final_response.content.trim().to_string();
+        if persist_this_pass {
+            messages.push(Message::text("assistant", final_response.content.clone()));
+            self.persist_subconscious_turn(&conv_id, &messages[(history_len - 1)..]);
+        }
+        let observations = if content.eq_ignore_ascii_case("none") || content.is_empty() {
+            Vec::new()
+        } else {
+            parse_observations(&content)
+        };
+        Ok(SubconsciousPassOutcome {
+            observations,
+            halt: halt_signal,
+            intrusive: intrusive_signals,
+        })
+    }
+
+    /// Public entry point for a mid-turn peek. Calls the unified
+    /// subconscious pass on the `MidTurnPeek` occasion — same agent, same
+    /// memfs, same tools — and returns the outcome so the turn loop can
+    /// act on halt/intrusive signals.
+    ///
+    /// `user_message` is the user's original ask; `in_flight_summary` is
+    /// turn.rs's pre-rendered snapshot of the primary's recent tool work.
+    pub async fn mid_turn_peek(
+        &self,
+        agent_id: &str,
+        user_message: &str,
+        tool_round: u32,
+        in_flight_summary: String,
+        stream_tx: Option<&mpsc::Sender<anyhow::Result<BackendEvent>>>,
+    ) -> anyhow::Result<SubconsciousPassOutcome> {
+        let sub_id = format!("{}-sub", agent_id);
+        self.subconscious_tool_loop(
+            user_message,
+            "", // no settled primary response — she's peeking at live work
+            agent_id,
+            &sub_id,
+            Occasion::MidTurnPeek {
+                tool_round,
+                in_flight_summary,
+            },
+            stream_tx,
+        )
+        .await
+    }
+
+    /// Compute context pressure as tokens-used / context_limit.
+    ///
+    /// `context_limit` comes from the agent's `llm_config.context_window`
+    /// (falls back to model config, then a configured default). The
+    /// Constitution (Article V.3) requires per-model physics — no
+    /// hardcoded 128K here.
+    pub fn calculate_pressure(
+        &self,
+        messages: &[ConversationMessage],
+        context_limit: usize,
+    ) -> f32 {
+        let tokens: usize = messages
+            .iter()
+            .flat_map(|m| &m.blocks)
+            .map(|b| self.counter.count(b.countable_text().as_ref()))
+            .sum();
+        let limit = context_limit.max(1);
+        (tokens as f32 / limit as f32).min(1.0)
+    }
+
+    /// Async convenience: look up the agent's context_limit from its
+    /// `llm_config.context_window` (falling back to 128K only when the
+    /// agent isn't found), then compute pressure.
+    pub async fn pressure_for_session(
+        &self,
+        session: &crate::server::session_manager::Session,
+    ) -> f32 {
+        self.pressure_for(&session.agent_id, &session.messages)
+            .await
+    }
+
+    /// Context pressure for an agent given a message snapshot — the
+    /// session-free form used by `on_response`, which runs after the user
+    /// has been released and must not hold a live session ref.
+    pub async fn pressure_for(&self, agent_id: &str, messages: &[ConversationMessage]) -> f32 {
+        let limit = self
+            .agents
+            .get(agent_id)
+            .await
+            .map(|a| a.llm_config.context_window as usize)
+            .unwrap_or(128_000);
+        self.calculate_pressure(messages, limit)
+    }
+}
+
+/// Convert an OpenAI wire message into the internal `ConversationMessage`
+/// form the session store and compaction engine operate on. The subconscious
+/// runs her tool loop in wire `Message`s; this is the bridge back to her
+/// persistent session.
+fn wire_to_conversation(msg: &Message) -> ConversationMessage {
+    let role = match msg.role.as_str() {
+        "system" => MessageRole::System,
+        "user" => MessageRole::User,
+        "assistant" => MessageRole::Assistant,
+        "tool" => MessageRole::Tool,
+        _ => MessageRole::User,
+    };
+
+    // A `role: "tool"` message carries a single tool result.
+    if let Some(tool_use_id) = &msg.tool_call_id {
+        return ConversationMessage {
+            role,
+            blocks: vec![ContentBlock::ToolResult {
+                tool_use_id: tool_use_id.clone(),
+                tool_name: msg.name.clone().unwrap_or_default(),
+                output: msg.content.as_text(),
+                is_error: false,
+            }],
+            usage: None,
+            timestamp: Some(chrono::Utc::now()),
+        };
+    }
+
+    let mut blocks = Vec::new();
+    if !msg.content.is_empty() {
+        blocks.push(ContentBlock::Text {
+            text: msg.content.as_text(),
+        });
+    }
+    if let Some(calls) = &msg.tool_calls {
+        for c in calls {
+            blocks.push(ContentBlock::ToolUse {
+                id: c.id.clone(),
+                name: c.function.name.clone(),
+                input: c.function.arguments.clone(),
+            });
+        }
+    }
+    ConversationMessage {
+        role,
+        blocks,
+        usage: None,
+        timestamp: Some(chrono::Utc::now()),
+    }
+}
+
+/// Parse the subconscious's observations into [`InboxItem`]s.
+///
+/// The prompt asks for a rigid three-line schema, but in practice the model
+/// writes observations in the natural markdown form it reaches for anyway:
+///
+/// ```text
+/// **Observations:**
+/// - **complete**: clipboard copy is still an unfulfilled promise
+/// - **surface**: mouse scrolling is the highest-impact gap
+/// ```
+///
+/// The primary parser is therefore built around what she *actually* produces:
+/// a bulleted line whose label — bare or `**bold**` — is one of the four
+/// sources (`complete`/`verify`/`persist`/`surface`), then `:`, then the
+/// observation text. The legacy `- source:/- content:/- urgency:` triple is
+/// kept as a fallback so an older-style response is not silently dropped.
+///
+/// A `none` (or empty) response yields no items.
+fn parse_observations(text: &str) -> Vec<InboxItem> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+        return Vec::new();
+    }
+
+    let inline = parse_inline_observations(trimmed);
+    if !inline.is_empty() {
+        return inline;
+    }
+    // No inline-labelled lines matched — try the legacy triple schema.
+    parse_triple_observations(trimmed)
+}
+
+/// Parse the natural `- **source**: content` markdown form. Urgency is not
+/// emitted in this form, so it defaults to [`Urgency::Low`] — every parsed
+/// observation still reaches the cockpit and the inner-voice file.
+fn parse_inline_observations(text: &str) -> Vec<InboxItem> {
+    let mut items = Vec::new();
+    for line in text.lines() {
+        // Strip a leading bullet (`-`, `*`, `•`) if present.
+        let body = {
+            let l = line.trim();
+            l.strip_prefix("- ")
+                .or_else(|| l.strip_prefix("* "))
+                .or_else(|| l.strip_prefix("• "))
+                .or_else(|| l.strip_prefix("-"))
+                .unwrap_or(l)
+                .trim()
+        };
+        // Split label from content at the first colon.
+        let Some((label_raw, content)) = body.split_once(':') else {
+            continue;
+        };
+        // Normalize: drop markdown emphasis, quotes, and surrounding space.
+        let label = label_raw
+            .trim()
+            .trim_matches(|c: char| matches!(c, '*' | '"' | '`' | '_' | ' '))
+            .to_lowercase();
+        let source = match label.as_str() {
+            "complete" | "verify" | "persist" | "surface" => label,
+            _ => continue,
+        };
+        let content = content.trim();
+        // Skip an empty slot — e.g. `- persist: none` — she had nothing here.
+        if content.is_empty() || content.eq_ignore_ascii_case("none") {
+            continue;
+        }
+        items.push(InboxItem::new(source, Urgency::Low, content));
+    }
+    items
+}
+
+/// Legacy parser for the rigid `- source:/- content:/- urgency:` triple.
+/// Forgiving — an incomplete trailing block is skipped, not fatal.
+fn parse_triple_observations(text: &str) -> Vec<InboxItem> {
+    let mut items = Vec::new();
+    let mut source: Option<&str> = None;
+    let mut content: Option<&str> = None;
+    let mut urgency: Option<&str> = None;
+
+    let flush = |items: &mut Vec<InboxItem>,
+                 source: Option<&str>,
+                 content: Option<&str>,
+                 urgency: Option<&str>| {
+        if let (Some(s), Some(c), Some(u)) = (source, content, urgency) {
+            let urgency_enum = match u.trim().to_lowercase().as_str() {
+                "critical" => Urgency::Critical,
+                "high" | "medium" => Urgency::High,
+                _ => Urgency::Low,
+            };
+            items.push(InboxItem::new(s.trim(), urgency_enum, c.trim()));
+        }
+    };
+
+    for line in text.lines() {
+        let line = line.trim();
+
+        if line.starts_with("- source:") || line.starts_with("-source:") {
+            flush(&mut items, source, content, urgency);
+            content = None;
+            urgency = None;
+            source = line
+                .split_once(':')
+                .map(|(_, v)| v.trim().trim_matches('"'));
+        } else if line.starts_with("- content:") || line.starts_with("-content:") {
+            content = line
+                .split_once(':')
+                .map(|(_, v)| v.trim().trim_matches('"'));
+        } else if line.starts_with("- urgency:") || line.starts_with("-urgency:") {
+            urgency = line
+                .split_once(':')
+                .map(|(_, v)| v.trim().trim_matches('"'));
+        }
+    }
+    flush(&mut items, source, content, urgency);
+    items
+}
+
+/// Extract `{reason, severity}` from a `halt` tool call's argument JSON
+/// (already serialized back to a string by the bridge).
+fn parse_halt_signal(arguments: &str) -> Option<HaltSignal> {
+    let v: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    let reason = v
+        .get("reason")
+        .and_then(|r| r.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let severity = v
+        .get("severity")
+        .and_then(|s| s.as_str())
+        .map(str::trim)
+        .filter(|s| matches!(*s, "advisory" | "firm" | "critical"))
+        .unwrap_or("firm")
+        .to_string();
+    Some(HaltSignal { reason, severity })
+}
+
+/// Extract `{content, urgency}` from an `intrusive` tool call.
+fn parse_intrusive_signal(arguments: &str) -> Option<IntrusiveSignal> {
+    let v: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    let content = v
+        .get("content")
+        .and_then(|c| c.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let urgency = v
+        .get("urgency")
+        .and_then(|u| u.as_str())
+        .map(str::trim)
+        .filter(|s| matches!(*s, "low" | "high" | "critical"))
+        .unwrap_or("high")
+        .to_string();
+    Some(IntrusiveSignal { content, urgency })
+}
+
+/// Map a tool's urgency string back to the inbox's enum. Unknown values
+/// degrade to Low — the inbox would rather queue a quiet item than drop one.
+/// Does this provider error mean "your conversation is longer than the model
+/// will accept"?
+///
+/// Matched on the message rather than a status code because the status
+/// differs by provider (DeepSeek and OpenAI both use 400; others use 413),
+/// while the wording is consistently about length. Deliberately narrow: a
+/// false positive here compacts a conversation that did not need it, so
+/// generic words like "invalid" or "too large" are not enough on their own.
+fn is_context_overflow(err: &str) -> bool {
+    let e = err.to_lowercase();
+    e.contains("maximum context length")
+        || e.contains("context_length_exceeded")
+        || e.contains("context length exceeded")
+        || e.contains("reduce the length of the messages")
+        || (e.contains("context window") && e.contains("exceed"))
+        // Anthropic says it differently, and says nothing the four patterns
+        // above would catch: `prompt is too long: 1285770 tokens > 1000000
+        // maximum`. The gate was written on 08-13 against DeepSeek and had
+        // never seen a second provider's dialect, so the night she moved to
+        // opus-5 and overflowed, resuscitation did not fire.
+        || e.contains("prompt is too long")
+        // Belt for the same shape under a different preamble — a token count
+        // stated as over a maximum. Both halves are required so that an
+        // ordinary "invalid max_tokens" complaint does not match.
+        || (e.contains("tokens") && e.contains("maximum") && e.contains(">"))
+}
+
+fn parse_urgency(raw: &str) -> Urgency {
+    match raw.trim().to_lowercase().as_str() {
+        "critical" => Urgency::Critical,
+        "high" | "medium" => Urgency::High,
+        _ => Urgency::Low,
+    }
+}
+
+/// Heuristic Surface detection — fallback when the LLM-based analysis fails
+/// or is unavailable.
+///
+/// Detects:
+/// - Commitment phrases ("I'll save", "I'll remember", "let me note") → queue
+///   a low-urgency commitment-verify item.
+/// - Hedge phrases ("I think", "probably", "I'm not sure") at high frequency →
+///   queue a low-urgency confidence-check item.
+fn detect_items(response: &str) -> Vec<InboxItem> {
+    let mut items = Vec::new();
+    let lower = response.to_lowercase();
+
+    let commit_markers = [
+        "i'll save",
+        "i'll remember",
+        "i'll note",
+        "let me save",
+        "let me note",
+        "i'll write that down",
+        "i'll commit",
+    ];
+    if commit_markers.iter().any(|m| lower.contains(m)) {
+        items.push(InboxItem::new(
+            "verify",
+            Urgency::Low,
+            format!(
+                "Commitment detected — verify follow-through: \"{}\"",
+                truncate(response, 120)
+            ),
+        ));
+    }
+
+    let hedge_markers = ["i think", "probably", "i'm not sure", "i guess", "maybe"];
+    let hedge_count = hedge_markers.iter().filter(|m| lower.contains(*m)).count();
+    if hedge_count >= 3 {
+        items.push(InboxItem::new(
+            "verify",
+            Urgency::Low,
+            "High hedge density — primary is uncertain; consider asking for clarification",
+        ));
+    }
+
+    items
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max).collect();
+        out.push('…');
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exact body DeepSeek returned at 09:12 on 2026-08-13, when the
+    /// subconscious had grown to 1.75M tokens against a 1M ceiling and every
+    /// pass was refused before it began. Pasted, not paraphrased — a matcher
+    /// tested only against invented strings is a matcher that has never been
+    /// seen to fire.
+    #[test]
+    fn the_error_that_actually_killed_her_is_recognised() {
+        let real = "Bifrost returned 400 Bad Request after 1 attempt(s) on \
+             deepseek-v4-flash: {\"error\":{\"message\":\"This model's maximum \
+             context length is 1048576 tokens. However, you requested 1750825 \
+             tokens (1750825 in the messages, 0 in the completion). Please \
+             reduce the length of the messages or completion.\",\"type\":\
+             \"invalid_request_error\"}}";
+        assert!(is_context_overflow(real));
+    }
+
+    /// The exact body Anthropic returned at 19:53 and again at 19:58 on
+    /// 2026-08-18, when the subconscious had grown to 1.28M tokens against
+    /// opus-5's 1M ceiling. The gate written for DeepSeek did not match a
+    /// single word of it, so resuscitation never fired and she reported the
+    /// failure once every three minutes without ever being able to act.
+    /// Pasted, not paraphrased — same rule as the DeepSeek body above.
+    #[test]
+    fn the_anthropic_wording_is_recognised() {
+        let real = "claude subscription returned 400 Bad Request after 1 \
+             attempt(s) on claude-opus-5: {\"type\":\"error\",\"error\":\
+             {\"type\":\"invalid_request_error\",\"message\":\"prompt is too \
+             long: 1285770 tokens > 1000000 maximum\"},\"request_id\":\
+             \"req_011CeB7NkHDtcvDCpkYDrgPn\"}";
+        assert!(is_context_overflow(real));
+    }
+
+    #[test]
+    fn other_provider_wordings_are_recognised() {
+        assert!(is_context_overflow("context_length_exceeded"));
+        assert!(is_context_overflow(
+            "Context length exceeded for this model"
+        ));
+        assert!(is_context_overflow(
+            "the request exceeds the model's context window"
+        ));
+    }
+
+    /// A false positive compacts a conversation that did not need it, so the
+    /// failures that dominated this week must all read as "not overflow".
+    #[test]
+    fn ordinary_failures_do_not_trigger_a_compaction() {
+        for benign in [
+            "Bifrost returned 402 Payment Required: Insufficient Balance",
+            "Bifrost returned 529 overloaded",
+            "Invalid max_tokens value, the valid range of max_tokens is [1, 393216]",
+            "connection reset by peer",
+            "invalid_request_error",
+            "",
+        ] {
+            assert!(
+                !is_context_overflow(benign),
+                "should not have matched: {benign}"
+            );
+        }
+    }
+
+    /// The exact shape the subconscious (glm-5.1) produces in practice —
+    /// captured from a live N+1 pass. Before the parser fix, every line here
+    /// was dropped and the pass reported "no anomalies detected".
+    #[test]
+    fn parses_natural_markdown_observations() {
+        let text = "**Observations:**\n\n\
+            - **complete**: Clipboard copy and mouse scrolling remain unfulfilled promises\n\
+            - **verify**: User claimed space-bar lag was resolved — need to confirm\n\
+            - **persist**: New truncation-signal-polish.md doc now tracked\n\
+            - **surface**: Mouse scrolling is the highest-impact unfulfilled promise";
+        let items = parse_observations(text);
+        assert_eq!(items.len(), 4, "all four observations must parse");
+        assert_eq!(items[0].source, "complete");
+        assert_eq!(items[3].source, "surface");
+        assert!(items[3].content.contains("Mouse scrolling"));
+    }
+
+    #[test]
+    fn parses_plain_label_without_bold() {
+        let items = parse_observations("- verify: the config save was not confirmed");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].source, "verify");
+    }
+
+    #[test]
+    fn skips_empty_and_none_slots() {
+        let text = "- **persist**: None\n- **surface**: real observation here";
+        let items = parse_observations(text);
+        assert_eq!(
+            items.len(),
+            1,
+            "an explicit `none` slot is not an observation"
+        );
+        assert_eq!(items[0].source, "surface");
+    }
+
+    #[test]
+    fn bare_none_yields_nothing() {
+        assert!(parse_observations("none").is_empty());
+        assert!(parse_observations("  None  ").is_empty());
+        assert!(parse_observations("").is_empty());
+    }
+
+    #[test]
+    fn ignores_non_observation_prose() {
+        let text = "Here is my analysis of the exchange.\n\
+            The primary did well overall.\n\
+            - **surface**: but the commitment to scrolling is still open";
+        let items = parse_observations(text);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].source, "surface");
+    }
+
+    #[test]
+    fn legacy_triple_schema_still_parses() {
+        let text = "- source: \"verify\"\n\
+            - content: \"the commitment was not fulfilled\"\n\
+            - urgency: \"high\"";
+        let items = parse_observations(text);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].source, "verify");
+        assert_eq!(items[0].urgency, Urgency::High);
+    }
+}

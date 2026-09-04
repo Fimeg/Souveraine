@@ -1,0 +1,6 @@
+source=https://github.com/end-4/dots-hyprland
+commit=d1fac1677528f99e564fd619c43fbd3de4d76fc3
+tree=d326d7b60c88882787a4ff61ccdc7552de1e11cd
+path=dots/.config/quickshell/ii
+shapes_source=https://github.com/end-4/rounded-polygon-qmljs.git
+shapes_commit=e31ec4cb4ebf6a46b267f5c42eabf6874916fa16

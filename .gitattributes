@@ -1,0 +1,2 @@
+# Preserve vendored upstream bytes; style checks apply to our overlays.
+surfaces/quickshell/ii-base/** -whitespace

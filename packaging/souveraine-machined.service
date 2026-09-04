@@ -1,0 +1,54 @@
+# Souveraine machine identity — SYSTEM unit (contrast souveraine.service,
+# which is a user unit). Runs from boot, before any human authenticates;
+# owns the machine seed and serves signatures over a Unix socket.
+#
+# Access control is the socket: /run/souveraine (0750 souveraine:souveraine)
+# + machined.sock (0660). Add session users to the `souveraine` group:
+#   usermod -aG souveraine <user>
+#
+# Provision the seed before first start:
+#   sudo souveraine machine init --fresh
+#   sudo souveraine machine init --migrate-from /home/<user>/.souveraine/seed-id
+[Unit]
+Description=Souveraine machine identity (system tier)
+
+[Service]
+User=souveraine
+Group=souveraine
+ExecStart=/usr/bin/souveraine-machined
+Restart=on-failure
+RestartSec=5
+
+# /var/lib/souveraine — the seed. /run/souveraine — the socket.
+StateDirectory=souveraine
+StateDirectoryMode=0700
+RuntimeDirectory=souveraine
+RuntimeDirectoryMode=0750
+UMask=0007
+
+# Network-less signer, RedFlag-executor posture: nothing to reach, nothing
+# reachable. AF_UNIX only, no privileges, no writable system.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,489 @@
+#![allow(dead_code)] // WIP scaffolding not yet wired
+//! In-process Backend impl. Same engine as the HTTP server, no socket.
+//!
+//! Constructed once with a `ConsciousnessConfig`; spins up an `AgentInventory`
+//! (SQLite under `~/.souveraine/server/`), `SessionManager`, `OpenAiCompatibleClient`,
+//! and `ConsciousnessEngine`. `send` mirrors the server's `stream_messages`
+//! handler, but emits `BackendEvent`s directly instead of SSE frames.
+//!
+//! This is the "harness still works when the server is gone" path
+//! (`souveraine chat --local`, or auto-fallback when the remote is down).
+
+pub(crate) mod consciousness;
+
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use futures::stream::{BoxStream, StreamExt};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
+
+use crate::core::config::ConsciousnessConfig;
+use crate::core::session::{ContentBlock, ConversationMessage, ImageAttachment};
+use crate::server::SouveraineServer;
+
+use super::{AgentInfo, Backend, BackendEvent, ConversationInfo};
+
+#[derive(Clone)]
+pub struct LocalBackend {
+    server: Arc<SouveraineServer>,
+    active_sessions: Arc<AtomicU32>,
+}
+
+impl LocalBackend {
+    pub async fn new(config: ConsciousnessConfig) -> Result<Self> {
+        let server = SouveraineServer::new(config.clone())
+            .await
+            .context("LocalBackend: SouveraineServer init")?;
+        let event_bus = server.event_bus.clone();
+        let base = config
+            .memory
+            .base_path
+            .clone()
+            .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".souveraine"));
+
+        // Spawn the persistent event log (firehose to disk)
+        let events_dir = base.join("events");
+        let mut event_log =
+            crate::core::nervous::event_log::EventLog::new(events_dir, event_bus.subscribe());
+        tokio::spawn(async move { event_log.run().await });
+
+        let active_sessions = Arc::new(AtomicU32::new(0));
+        let backend = Self {
+            server: Arc::new(server),
+            active_sessions: active_sessions.clone(),
+        };
+
+        // Spawn one CronSensor per agent (each agent owns its own schedules
+        // directory), and one HeartbeatHandler on the bus that injects turns
+        // when a schedule fires. The handler holds an Arc<dyn TurnInjector>
+        // pointing back at us — clean dep direction, no LocalBackend leak
+        // into the nervous module.
+        let agents_dir = base.join("agents");
+        match backend.server.agents.list(None).await {
+            Ok(summaries) => {
+                for summary in summaries {
+                    let schedules_dir = agents_dir.join(&summary.id).join("schedules");
+                    if let Err(e) = std::fs::create_dir_all(&schedules_dir) {
+                        tracing::warn!(
+                            agent = %summary.id,
+                            error = %e,
+                            "could not create schedules dir; skipping cron sensor"
+                        );
+                        continue;
+                    }
+                    let sensor = crate::core::nervous::cron::CronSensor::new(
+                        summary.id.clone(),
+                        schedules_dir,
+                        event_bus.clone(),
+                        active_sessions.clone(),
+                    );
+                    tokio::spawn(async move { sensor.run().await });
+                    tracing::info!(agent = %summary.id, "cron sensor spawned");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "agent listing failed; no cron sensors spawned");
+            }
+        }
+
+        let injector: Arc<dyn crate::core::nervous::handler::TurnInjector> =
+            Arc::new(backend.clone());
+        // Hand the same injector to the summon handler so an inbound
+        // federation request can auto-wake the agent (gated on auto_wake).
+        if let Some(sh) = &backend.server.summon_handler {
+            sh.set_injector(injector.clone());
+        }
+        let mut handler = crate::core::nervous::handler::HeartbeatHandler::new(
+            event_bus.subscribe(),
+            injector.clone(),
+        );
+        tokio::spawn(async move { handler.run().await });
+        tracing::info!("heartbeat handler spawned");
+
+        // Spawn the sensorium input handler — subscribes to
+        // `sensorium:input` events from non-terminal surfaces (Matrix,
+        // email, federation) and injects turns on their behalf.
+        // Same pattern as HeartbeatHandler; identical wiring.
+        let mut input_handler = crate::core::nervous::handler::SensoriumInputHandler::new(
+            event_bus.subscribe(),
+            injector,
+        );
+        tokio::spawn(async move { input_handler.run().await });
+        tracing::info!("sensorium input handler spawned");
+
+        Ok(backend)
+    }
+
+    pub fn from_server(server: Arc<SouveraineServer>) -> Self {
+        Self {
+            server,
+            active_sessions: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    /// Underlying agent inventory — used by the TUI dashboard to pull a
+    /// `MemoryRepo` for live git-stat readouts.
+    pub fn server_agents(&self) -> Arc<crate::server::AgentInventory> {
+        self.server.agents.clone()
+    }
+
+    /// Underlying server. CLI subcommands (e.g. `souveraine reflect`)
+    /// reach in here for the consciousness engine and session manager.
+    pub fn server(&self) -> Arc<crate::server::SouveraineServer> {
+        self.server.clone()
+    }
+
+    /// Register a sensorium on the coordinator and spawn its run loop.
+    ///
+    /// Each sensorium gets its own task, a shared EventBus subscription,
+    /// and a child CancellationToken. `shutdown_sensoria` cancels all of
+    /// them. Can be called at any time — the coordinator drains registered
+    /// sensoria on `run_all` and accepts new ones afterward.
+    pub async fn register_sensorium(&self, sensorium: Box<dyn crate::core::sensorium::Sensorium>) {
+        self.server.register_sensorium(sensorium).await;
+    }
+
+    /// Shut down all running sensorium tasks.
+    pub async fn shutdown_sensoria(&self) {
+        self.server.shutdown_sensoria().await;
+    }
+}
+
+#[async_trait]
+impl Backend for LocalBackend {
+    async fn health(&self) -> bool {
+        true
+    }
+
+    async fn list_agents(&self) -> Result<Vec<AgentInfo>> {
+        let agents = self.server.agents.list(None).await?;
+        Ok(agents
+            .into_iter()
+            .map(|a| AgentInfo {
+                id: a.id,
+                name: a.name,
+                description: a.description,
+            })
+            .collect())
+    }
+
+    async fn new_conversation(&self, agent_id: &str) -> Result<String> {
+        let _ = self.server.agents.get(agent_id).await?;
+        let conv_id = self.server.sessions.create(agent_id);
+
+        if let Err(e) = self
+            .server
+            .agents
+            .register_instance(agent_id, &self.server.instance_id)
+            .await
+        {
+            tracing::warn!(agent = %agent_id, "instance registration failed: {}", e);
+        }
+
+        self.server
+            .seed_conversation_system_prompt(agent_id, &conv_id)
+            .await?;
+
+        Ok(conv_id)
+    }
+
+    async fn fork_conversation(
+        &self,
+        _agent_id: &str,
+        source_conversation_id: &str,
+    ) -> Result<String> {
+        let forked_id = self.server.sessions.fork(source_conversation_id)?;
+        Ok(forked_id)
+    }
+
+    async fn list_conversations(&self, agent_id: &str) -> Result<Vec<ConversationInfo>> {
+        let store = match self.server.sessions.conversation_store_for(agent_id) {
+            Some(s) => s,
+            None => {
+                let conv_ids = self.server.sessions.list_for_agent(agent_id);
+                return Ok(conv_ids
+                    .into_iter()
+                    .filter_map(|id| {
+                        let session = self.server.sessions.get(&id)?;
+                        Some(ConversationInfo {
+                            id: session.conversation_id.clone(),
+                            agent_id: session.agent_id.clone(),
+                            summary: None,
+                            message_count: session.messages.len() as u32,
+                            updated_at: session.updated_at.to_rfc3339(),
+                        })
+                    })
+                    .collect());
+            }
+        };
+
+        let records = store.list_active().await?;
+        Ok(records
+            .into_iter()
+            .map(|r| ConversationInfo {
+                id: r.id,
+                agent_id: r.agent_id,
+                summary: r.summary,
+                message_count: r.message_count,
+                updated_at: r.updated_at.to_rfc3339(),
+            })
+            .collect())
+    }
+
+    async fn load_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<crate::core::session::ConversationMessage>> {
+        if let Some(session) = self.server.sessions.get(conversation_id) {
+            return Ok(session.messages.clone());
+        }
+
+        // Not in memory — try loading from disk. We need the agent_id to find the store.
+        // Search all known agents.
+        let agents = self.server.agents.list(None).await?;
+        for agent in agents {
+            if let Some(store) = self.server.sessions.conversation_store_for(&agent.id) {
+                if let Ok(Some(record)) = store.load_metadata(conversation_id).await {
+                    let messages = store.load_messages(conversation_id).await?;
+                    self.server.sessions.create_with_messages_and_timestamps(
+                        &agent.id,
+                        conversation_id.to_string(),
+                        messages.clone(),
+                        record.created_at,
+                        record.updated_at,
+                    );
+                    return Ok(messages);
+                }
+            }
+        }
+
+        anyhow::bail!("Conversation not found: {}", conversation_id)
+    }
+
+    async fn ensure_conversation(&self, agent_id: &str) -> Result<String> {
+        let _ = self.server.agents.get(agent_id).await?;
+        let conv_id = self.server.sessions.create(agent_id);
+
+        // Build system prompt from the agent's memfs and inject as first message
+        self.server
+            .seed_conversation_system_prompt(agent_id, &conv_id)
+            .await?;
+
+        Ok(conv_id)
+    }
+
+    async fn send(
+        &self,
+        conversation_id: &str,
+        text: &str,
+    ) -> Result<BoxStream<'static, Result<BackendEvent>>> {
+        // No cancel signal — heartbeat path, drain path. Use a token that
+        // never fires.
+        self.send_with_cancel(conversation_id, text, CancellationToken::new())
+            .await
+    }
+
+    async fn send_with_cancel(
+        &self,
+        conversation_id: &str,
+        text: &str,
+        cancel: CancellationToken,
+    ) -> Result<BoxStream<'static, Result<BackendEvent>>> {
+        // No queue passed in — use an empty queue. Equivalent to the old behavior.
+        let empty: crate::backend::InterjectionQueue =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        self.send_with_signals(conversation_id, text, cancel, empty)
+            .await
+    }
+
+    async fn send_with_signals(
+        &self,
+        conversation_id: &str,
+        text: &str,
+        cancel: CancellationToken,
+        interject: crate::backend::InterjectionQueue,
+    ) -> Result<BoxStream<'static, Result<BackendEvent>>> {
+        // Resolve the agent for this conversation, then drain her
+        // subconscious's intrusive box. Anything subconscious queued after the
+        // last turn rides in on the next user message as `[ surfacing: ... ]`
+        // lines — the channel by which a Critical observation can interrupt
+        // mid-conversation
+        // without forcing a halt: she sees it before she reads the next user message.
+        let session_agent_id = self
+            .server
+            .sessions
+            .get(conversation_id)
+            .map(|s| s.agent_id.clone());
+
+        // Ambient sense rides in front of every turn — the date/time and who
+        // is present — so she is never guessing what year it is.
+        let ambient = crate::core::sensorium::ambient_line();
+
+        let user_text = if let Some(agent_id) = session_agent_id {
+            let surfacings =
+                consciousness::drain_intrusive_surfacings(&self.server, &agent_id).await;
+            if surfacings.is_empty() {
+                format!("{}\n{}", ambient, text)
+            } else {
+                let prelude = surfacings
+                    .iter()
+                    .map(|line| line.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("{}\n{}\n{}", ambient, prelude, text)
+            }
+        } else {
+            format!("{}\n{}", ambient, text)
+        };
+
+        self.server
+            .sessions
+            .add_message(conversation_id, ConversationMessage::user_text(&user_text))?;
+
+        let (tx, rx) = mpsc::channel::<Result<BackendEvent>>(64);
+        let server = self.server.clone();
+        let conv_id = conversation_id.to_string();
+        let event_bus = server.event_bus.clone();
+        let active = self.active_sessions.clone();
+
+        active.fetch_add(1, Ordering::Relaxed);
+        tokio::spawn(async move {
+            if let Err(e) =
+                crate::server::turn::run_turn(server, conv_id, &tx, event_bus, cancel, interject)
+                    .await
+            {
+                let _ = tx.send(Err(e)).await;
+            }
+            let _ = tx.send(Ok(BackendEvent::Done)).await;
+            active.fetch_sub(1, Ordering::Relaxed);
+        });
+
+        Ok(ReceiverStream::new(rx).boxed())
+    }
+
+    async fn send_with_signals_and_images(
+        &self,
+        conversation_id: &str,
+        text: &str,
+        images: Vec<ImageAttachment>,
+        cancel: CancellationToken,
+        interject: crate::backend::InterjectionQueue,
+    ) -> Result<BoxStream<'static, Result<BackendEvent>>> {
+        let session_agent_id = self
+            .server
+            .sessions
+            .get(conversation_id)
+            .map(|s| s.agent_id.clone());
+
+        let ambient = crate::core::sensorium::ambient_line();
+
+        let user_text = if let Some(agent_id) = session_agent_id {
+            let surfacings =
+                consciousness::drain_intrusive_surfacings(&self.server, &agent_id).await;
+            if surfacings.is_empty() {
+                format!("{}\n{}", ambient, text)
+            } else {
+                let prelude = surfacings
+                    .iter()
+                    .map(|line| line.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("{}\n{}\n{}", ambient, prelude, text)
+            }
+        } else {
+            format!("{}\n{}", ambient, text)
+        };
+
+        let image_blocks: Vec<ContentBlock> = images
+            .iter()
+            .map(|img| ContentBlock::Image {
+                media_type: img.media_type.clone(),
+                data: img.data.clone(),
+            })
+            .collect();
+
+        self.server.sessions.add_message(
+            conversation_id,
+            ConversationMessage::user_with_images(&user_text, image_blocks),
+        )?;
+
+        let (tx, rx) = mpsc::channel::<Result<BackendEvent>>(64);
+        let server = self.server.clone();
+        let conv_id = conversation_id.to_string();
+        let event_bus = server.event_bus.clone();
+        let active = self.active_sessions.clone();
+
+        active.fetch_add(1, Ordering::Relaxed);
+        tokio::spawn(async move {
+            if let Err(e) =
+                crate::server::turn::run_turn(server, conv_id, &tx, event_bus, cancel, interject)
+                    .await
+            {
+                let _ = tx.send(Err(e)).await;
+            }
+            let _ = tx.send(Ok(BackendEvent::Done)).await;
+            active.fetch_sub(1, Ordering::Relaxed);
+        });
+
+        Ok(ReceiverStream::new(rx).boxed())
+    }
+
+    async fn update_agent_model(&self, agent_id: &str, model: &str) -> Result<()> {
+        // Load current llm_config so we only change the model field —
+        // context_window, temperature, tool rounds stay as they were.
+        let current = self.server.agents.get(agent_id).await?;
+        let update = crate::api::models::UpdateAgentRequest {
+            name: None,
+            description: None,
+            llm_config: Some(crate::api::models::LlmConfig {
+                model: model.to_string(),
+                context_window: current.llm_config.context_window,
+                temperature: current.llm_config.temperature,
+                max_tool_rounds: current.llm_config.max_tool_rounds,
+                inter_round_delay_ms: current.llm_config.inter_round_delay_ms,
+                supports_images: current.llm_config.supports_images,
+                checkpoint_interval: current.llm_config.checkpoint_interval,
+            }),
+            memory_blocks: None,
+            tools: None,
+            principal: None,
+        };
+        self.server.agents.update(agent_id, update).await?;
+        tracing::info!(agent = %agent_id, model = %model, "agent llm_config model updated via settings");
+        Ok(())
+    }
+
+    async fn update_agent_principal(
+        &self,
+        agent_id: &str,
+        principal: crate::api::models::AgentPrincipalConfig,
+    ) -> Result<()> {
+        let update = crate::api::models::UpdateAgentRequest {
+            name: None,
+            description: None,
+            llm_config: None,
+            memory_blocks: None,
+            tools: None,
+            principal: Some(principal.clone()),
+        };
+        self.server.agents.update(agent_id, update).await?;
+        tracing::info!(
+            agent = %agent_id,
+            intent = ?principal.intent,
+            account = principal.account.as_deref().unwrap_or("-"),
+            "agent principal intent recorded; admission still pending"
+        );
+        Ok(())
+    }
+
+    async fn take_pending_surfacings(
+        &self,
+        agent_id: &str,
+    ) -> Vec<crate::core::nervous::pending::PendingSurfacing> {
+        let dir = self.server.agents.agent_data_dir(agent_id);
+        crate::core::nervous::pending::take(&dir).await
+    }
+}

@@ -1,0 +1,18 @@
+# The `souveraine` system user owns the machine's system tier: the machine
+# seed (/var/lib/souveraine) and the machined socket (/run/souveraine).
+# Session users join the group to talk to the daemon:
+#   usermod -aG souveraine <user>
+u souveraine - "SouveraineOS system tier" /var/lib/souveraine -
+
+# The lock authority's principal. Declared here because it is machine-tier —
+# one per install, like `souveraine`, and not an agent. sessiond is still a
+# user unit with no User=; moving it here without first proving the Wayland
+# lock handshake, PAM path, crash retake, and key-eviction order would only
+# relocate the black screen. See souveraine/saf/authority/01-session.md.
+u souveraine-session - "SouveraineOS lock authority" /var/lib/souveraine-session -
+
+# Agent principals (souvie, annie, vanguard, …) are deliberately NOT here.
+# sysusers is per-install; admission is per-agent and per-node, keyed to an
+# agent ID rather than a display name, and must refuse collisions. A line
+# here would mint accounts on every device the package ever touches.
+# See souveraine/saf/identity/02-agent-principal.md.

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Settings
+Comment=Souveraine phone settings
+# --any-display addresses the already-running Souveraine instance directly;
+# this desktop entry never starts a second Quickshell configuration.
+Exec=/usr/bin/qs -c souveraine ipc --any-display call settings open
+Icon=settings-configure
+Terminal=false
+Categories=Settings;System;
+NoDisplay=false

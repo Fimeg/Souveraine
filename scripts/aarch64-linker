@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# aarch64-linker — Cargo linker wrapper for the SouveraineOS ARM sysroot.
+#
+# GCC's default aarch64 linker scripts contain absolute library paths.  Cargo
+# supplies -lm before its late rustflags, so --sysroot alone is insufficient:
+# ld can select the host's x86 library.  build-cross.sh supplies an overlay
+# containing sysroot-relative copies of those scripts; put it first.
+set -euo pipefail
+
+SYSROOT="${SOUVERAINE_AARCH64_SYSROOT:-/usr/aarch64-linux-gnu}"
+SCRIPTS="${SOUVERAINE_AARCH64_LINKER_SCRIPTS:?run scripts/build-cross.sh, not this wrapper directly}"
+
+exec aarch64-linux-gnu-gcc \
+    --sysroot="$SYSROOT" \
+    -L"$SCRIPTS" \
+    -L"$SYSROOT/usr/lib" \
+    "$@"

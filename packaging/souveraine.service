@@ -1,0 +1,14 @@
+# Souveraine server — systemd user unit.
+# Install: cp to ~/.config/systemd/user/ && systemctl --user enable --now souveraine
+# The quickshell surface starts this on demand when autostart is enabled.
+[Unit]
+Description=Souveraine server
+After=network.target
+
+[Service]
+ExecStart=%h/.local/bin/souveraine server
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,360 @@
+import qs.services
+import qs.modules.common
+import qs.modules.common.widgets
+import QtQuick
+import QtQuick.Layouts
+import Quickshell
+import Quickshell.Bluetooth
+
+import qs.modules.ii.sidebarRight.quickToggles.androidStyle
+
+AbstractQuickPanel {
+    id: root
+    property bool editMode: false
+    Layout.fillWidth: true
+
+    // Sizes
+    implicitHeight: (editMode ? contentItem.implicitHeight : usedRows.implicitHeight) + root.padding * 2
+    Behavior on implicitHeight {
+        animation: Appearance.animation.elementMove.numberAnimation.createObject(this)
+    }
+    property real spacing: 6
+    property real padding: 6
+    readonly property real baseCellWidth: {
+        // This is the wrong calculation, but it looks correct in reality???
+        // (theoretically spacing should be multiplied by 1 column less)
+        const availableWidth = root.width - (root.padding * 2) - (root.spacing * (root.columns))
+        return availableWidth / root.columns
+    }
+    readonly property real baseCellHeight: 56
+
+    // Toggles
+    //
+    // The one enumeration of what a toggle can be is the chooser's own list of
+    // choices. This used to be a second, hand-written array here, and it drifted
+    // — as a duplicated list always eventually does. Five configured toggles
+    // (vpn, autoRotate, wallpaperShuffle, fullScreenshot, waydroidTerminate)
+    // were silently dropped by validToggles below as "ghosts" while their
+    // models and their android delegates sat complete in the tree: the phone
+    // rendered 12 of the 17 in its config, with no error in the journal and
+    // none in quickshell's own log, because a filtered entry is silent by
+    // design. Asking the chooser is the only arrangement in which the two
+    // cannot disagree — and it gets the phone's extra choices right for free,
+    // since ii-phone/ overrides the chooser and this file is shared.
+    //
+    // Read once at completion rather than bound: DelegateChooser.choices is a
+    // CONSTANT property with no change signal, so a binding that happened to
+    // evaluate before the probe's choices were parented would never re-run.
+    property list<string> availableToggleTypes: []
+
+    AndroidToggleDelegateChooser {
+        id: toggleTypeProbe
+        // Never renders anything — it exists to be asked what it can build.
+        // DelegateChoice holds a Component; nothing is instantiated until a
+        // view actually selects it.
+        baseCellWidth: 0
+        baseCellHeight: 0
+        spacing: 0
+        startingIndex: 0
+    }
+
+    Component.onCompleted: {
+        const types = [];
+        for (let i = 0; i < toggleTypeProbe.choices.length; i++) {
+            const value = toggleTypeProbe.choices[i].roleValue;
+            if (value !== undefined && value !== null)
+                types.push(String(value));
+        }
+        if (types.length === 0) {
+            // Never silently. An empty list here filters away every configured
+            // toggle and leaves a blank panel, which is a worse failure than
+            // the one this replaced.
+            console.log("[quickToggles] chooser reported NO types — the panel will be empty");
+        } else {
+            console.log("[quickToggles] " + types.length + " types from chooser: " + types.join(", "));
+        }
+        root.availableToggleTypes = types;
+    }
+    readonly property int columns: Config.options.sidebar.quickToggles.android.columns
+    readonly property list<var> toggles: Config.ready ? Config.options.sidebar.quickToggles.android.toggles : []
+    // Filter out ghost items (config entries with types that have no matching delegate).
+    // Each entry carries its original config-array index so edit operations can target
+    // the right slot even when ghosts are interspersed.
+    readonly property list<var> validToggles: {
+        const result = []
+        const seen = new Set()
+        for (let i = 0; i < toggles.length; i++) {
+            const t = toggles[i]
+            if (t && availableToggleTypes.includes(t.type) && !seen.has(t.type)) {
+                result.push({ type: t.type, size: t.size, _configIndex: i })
+                seen.add(t.type)
+            } else if (t && availableToggleTypes.length > 0 && !seen.has(t.type)) {
+                // Say it out loud. A dropped entry used to vanish without a
+                // trace — that silence is what made vpn/autoRotate/
+                // wallpaperShuffle look like a rendering bug for a whole
+                // session, when the panel was simply refusing to build them.
+                console.log("[quickToggles] config lists '" + t.type
+                    + "' but the chooser cannot build it — skipping")
+            }
+        }
+        return result
+    }
+    readonly property list<var> toggleRows: toggleRowsForList(validToggles)
+    readonly property list<var> unusedToggles: {
+        const types = availableToggleTypes.filter(type => !validToggles.some(toggle => toggle.type === type))
+        return types.map(type => { return { type: type, size: 1 } })
+    }
+    readonly property list<var> unusedToggleRows: toggleRowsForList(unusedToggles)
+
+    property int dragIndex: -1  // flat config index of item being dragged (-1 = none)
+
+    // Map (x, y) in usedRows coordinates → flat config index.
+    // Uses the same stride math as the RowLayout so no item references are needed.
+    function toggleIndexAt(x, y) {
+        const rowH = root.baseCellHeight + root.spacing
+        const rowIdx = Math.max(0, Math.min(root.toggleRows.length - 1, Math.floor(y / rowH)))
+        if (root.toggleRows.length === 0) return -1
+        let flatStart = 0
+        for (let r = 0; r < rowIdx; r++) flatStart += root.toggleRows[r].length
+        const row = root.toggleRows[rowIdx]
+        if (!row || row.length === 0) return -1
+        // Each column slot is (baseCellWidth + spacing) wide; a size-2 button takes 2 slots.
+        const stride = root.baseCellWidth + root.spacing
+        let accumulated = 0
+        for (let c = 0; c < row.length; c++) {
+            accumulated += row[c].size * stride
+            // Drop target switches at the midpoint of the gap between buttons
+            if (x < accumulated - root.spacing / 2) return flatStart + c
+        }
+        return -1  // Click is in empty space past all buttons in this row
+    }
+
+    // Map a visual flat index (into validToggles) to the real config-array index.
+    function configIndexAt(visualIndex) {
+        if (visualIndex < 0 || visualIndex >= validToggles.length) return -1
+        return validToggles[visualIndex]._configIndex
+    }
+
+    function swapToggles(fromIdx, toIdx) {
+        const fromConfig = configIndexAt(fromIdx)
+        const toConfig   = configIndexAt(toIdx)
+        if (fromConfig < 0 || toConfig < 0) return
+        const list = Config.options.sidebar.quickToggles.android.toggles
+        const temp = list[fromConfig]
+        list[fromConfig] = list[toConfig]
+        list[toConfig] = temp
+    }
+
+    function removeToggleAt(index) {
+        const configIdx = configIndexAt(index)
+        if (configIdx < 0) return
+        Config.options.sidebar.quickToggles.android.toggles.splice(configIdx, 1)
+    }
+
+    function resizeToggleAt(index) {
+        const configIdx = configIndexAt(index)
+        if (configIdx < 0) return
+        const list = Config.options.sidebar.quickToggles.android.toggles
+        list[configIdx] = { type: list[configIdx].type, size: 3 - list[configIdx].size }
+    }
+
+    function toggleRowsForList(togglesList) {
+        var rows = [];
+        var row = [];
+        var totalSize = 0; // Total cols taken in current row
+        for (var i = 0; i < togglesList.length; i++) {
+            if (!togglesList[i]) continue;
+            if (totalSize + togglesList[i].size > columns) {
+                rows.push(row);
+                row = [];
+                totalSize = 0;
+            }
+            row.push(togglesList[i]);
+            totalSize += togglesList[i].size;
+        }
+        if (row.length > 0) {
+            rows.push(row);
+        }
+        return rows;
+    }
+
+    Column {
+        id: contentItem
+        anchors {
+            fill: parent
+            margins: root.padding
+        }
+        spacing: 12
+        
+        Column {
+            id: usedRows
+            spacing: root.spacing
+
+            Repeater {
+                id: usedRowsRepeater
+                model: ScriptModel {
+                    values: Array(root.toggleRows.length)
+                }
+                delegate: ButtonGroup {
+                    id: toggleRow
+                    required property int index
+                    property var modelData: root.toggleRows[index]
+                    property int startingIndex: {
+                        const rows = root.toggleRows;
+                        let sum = 0;
+                        for (let i = 0; i < index; i++) {
+                            sum += rows[i].length;
+                        }
+                        return sum;
+                    }
+                    spacing: root.spacing
+
+                    Repeater {
+                        model: ScriptModel {
+                            values: toggleRow?.modelData ?? []
+                            objectProp: "type"
+                        }
+                        delegate: AndroidToggleDelegateChooser {
+                            startingIndex: toggleRow.startingIndex
+                            editMode: root.editMode
+                            dragIndex: root.dragIndex
+                            baseCellWidth: root.baseCellWidth
+                            baseCellHeight: root.baseCellHeight
+                            spacing: root.spacing
+                            onOpenAudioOutputDialog: root.openAudioOutputDialog()
+                            onOpenAudioInputDialog: root.openAudioInputDialog()
+                            onOpenBluetoothDialog: root.openBluetoothDialog()
+                            onOpenNightLightDialog: root.openNightLightDialog()
+                            onOpenWifiDialog: root.openWifiDialog()
+                        }
+                    }
+                }
+            }
+        }
+
+        FadeLoader {
+            shown: root.editMode
+            anchors {
+                left: parent.left
+                right: parent.right
+                leftMargin: root.baseCellHeight / 2
+                rightMargin: root.baseCellHeight / 2
+            }
+            sourceComponent: Rectangle {
+                implicitHeight: 1
+                color: Appearance.colors.colOutlineVariant
+            }
+        }
+
+        FadeLoader {
+            shown: root.editMode
+            sourceComponent: Column {
+                id: unusedRows
+                spacing: root.spacing
+
+                Repeater {
+                    model: ScriptModel {
+                        values: Array(root.unusedToggleRows.length)
+                    }
+                    delegate: ButtonGroup {
+                        id: unusedToggleRow
+                        required property int index
+                        property var modelData: root.unusedToggleRows[index]
+                        spacing: root.spacing
+
+                        Repeater {
+                            model: ScriptModel {
+                                values: unusedToggleRow?.modelData ?? []
+                                objectProp: "type"
+                            }
+                            delegate: AndroidToggleDelegateChooser {
+                                startingIndex: -1
+                                editMode: root.editMode
+                                baseCellWidth: root.baseCellWidth
+                                baseCellHeight: root.baseCellHeight
+                                spacing: root.spacing
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Edit-mode drag overlay
+    // Direct child of root so it floats above contentItem (z:100).
+    // Positioned to exactly cover usedRows in root's coordinate space:
+    //   contentItem has margins=root.padding, usedRows is contentItem's first child.
+    // Intercepts all pointer events on the used-section buttons so drag, click,
+    // and resize are all handled here. Unused-section buttons sit below this
+    // overlay's height, so their own editModeInteraction MouseArea still fires.
+    MouseArea {
+        id: editDragOverlay
+        z: 100
+        x: root.padding
+        y: root.padding
+        width:  usedRows.width
+        height: usedRows.height
+        visible: root.editMode
+        enabled: root.editMode
+        acceptedButtons: Qt.AllButtons
+        hoverEnabled: true
+        cursorShape: root.dragIndex >= 0 ? Qt.ClosedHandCursor : Qt.OpenHandCursor
+
+        property int  sourceIndex:   -1
+        property bool dragActive:    false
+        property real pressX:        0
+        property real pressY:        0
+        property int  pressedButton: Qt.NoButton
+        readonly property real dragThreshold: 6
+
+        onPressed: (mouse) => {
+            pressX        = mouse.x
+            pressY        = mouse.y
+            dragActive    = false
+            pressedButton = mouse.button
+            sourceIndex   = root.toggleIndexAt(mouse.x, mouse.y)
+            if (mouse.button === Qt.RightButton && sourceIndex >= 0) {
+                root.resizeToggleAt(sourceIndex)
+                sourceIndex = -1
+            }
+        }
+
+        onPositionChanged: (mouse) => {
+            if (!dragActive && pressedButton === Qt.LeftButton) {
+                const dx = mouse.x - pressX
+                const dy = mouse.y - pressY
+                if (Math.sqrt(dx * dx + dy * dy) > dragThreshold) {
+                    dragActive     = true
+                    root.dragIndex = sourceIndex
+                }
+            }
+            if (dragActive && root.dragIndex >= 0) {
+                const targetIdx = root.toggleIndexAt(mouse.x, mouse.y)
+                if (targetIdx >= 0 && targetIdx !== root.dragIndex) {
+                    root.swapToggles(root.dragIndex, targetIdx)
+                    root.dragIndex = targetIdx   // follow the dragged item
+                }
+            }
+        }
+
+        onPressAndHold: {
+            if (sourceIndex >= 0 && !dragActive) {
+                root.resizeToggleAt(sourceIndex)
+                sourceIndex = -1   // suppress the upcoming release click
+            }
+        }
+
+        onReleased: (mouse) => {
+            if (!dragActive && mouse.button === Qt.LeftButton && sourceIndex >= 0)
+                root.removeToggleAt(sourceIndex)
+            root.dragIndex = -1
+            sourceIndex    = -1
+            dragActive     = false
+        }
+
+        // Consume wheel events — scroll-to-reorder is replaced by drag
+        onWheel: (wheel) => wheel.accepted = true
+    }
+    // ────────────────────────────────────────────────────────────────────────
+}

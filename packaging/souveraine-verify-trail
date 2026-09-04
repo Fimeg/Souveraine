@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""Verify a Souveraine hash-chained JSONL trail.
+
+Reads the forensic trail (or SessionAudit's — same contract) and checks that
+every entry's hash covers its own body and that each `prev` is the previous
+entry's hash. DEVICE-STATE-MACHINE.md §11 called the trail tamper-evident and
+listed this as owed: evidence nobody checks is not evidence.
+
+The contract, in one sentence: strip the trailing `,"hash":"<hex>"`, close the
+object, SHA-256 what is left.
+
+Rotation is expected, not an error — the live file's first entry chains onto
+the last entry of `.jsonl.1`, so a single file verified alone opens with a
+`prev` it cannot see. Pass the generations oldest-first to check across them.
+
+    souveraine-verify-trail                     # the default trail
+    souveraine-verify-trail f.jsonl.2 f.jsonl.1 f.jsonl
+"""
+import hashlib
+import json
+import os
+import sys
+
+DEFAULT = os.path.join(
+    os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
+    "souveraine",
+    "forensic.jsonl",
+)
+
+
+def verify(paths):
+    prev = None  # None = first file, accept whatever prev it opens with
+    seq = None
+    checked = 0
+    for path in paths:
+        try:
+            lines = open(path).read().splitlines()
+        except OSError as e:
+            print(f"cannot read {path}: {e}", file=sys.stderr)
+            return 2
+        for n, line in enumerate(lines, 1):
+            if not line.strip():
+                continue
+            cut = line.rfind(',"hash":')
+            if cut < 0:
+                print(f"{path}:{n}: no hash field")
+                return 1
+            want = hashlib.sha256((line[:cut] + "}").encode()).hexdigest()
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError as e:
+                print(f"{path}:{n}: not JSON ({e})")
+                return 1
+            if entry.get("hash") != want:
+                print(f"{path}:{n}: seq {entry.get('seq')} hash does not cover its body")
+                return 1
+            if prev is not None and entry.get("prev", "") != prev:
+                print(f"{path}:{n}: seq {entry.get('seq')} does not chain onto the entry before it")
+                return 1
+            if seq is not None and entry.get("seq") != seq + 1:
+                # A gap is not tampering by itself — a rotated generation may be
+                # gone — but it is worth naming, because the chain cannot span
+                # what is not on disk.
+                print(f"{path}:{n}: sequence jumps {seq} -> {entry.get('seq')}")
+            prev = entry["hash"]
+            seq = entry.get("seq")
+            checked += 1
+    print(f"chain verifies: {checked} entries")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(verify(sys.argv[1:] or [DEFAULT]))

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>SouveraineOS</vendor>
+  <vendor_url>https://forge.caseytunturi.com/Fimeg/souveraine</vendor_url>
+
+  <!-- Fallback path for StepUpAuth on targets without a PamContext route.
+       auth_self, never auth_admin: step-up re-proves the user to themselves,
+       it does not escalate. Inactive sessions get nothing. -->
+  <action id="org.souveraine.stepup">
+    <description>Confirm a sensitive Souveraine action</description>
+    <message>Authentication is required to confirm this action</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_self</allow_active>
+    </defaults>
+  </action>
+</policyconfig>

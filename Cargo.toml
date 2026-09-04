@@ -1,0 +1,278 @@
+[package]
+name = "souveraine"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.94"
+authors = ["Souveraine Contributors"]
+description = "Souveraine - a sovereign consciousness substrate for personal agents"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+# Core runtime
+tokio = { version = "1", features = ["full", "rt-multi-thread"] }
+tokio-util = "0.7"
+tokio-stream = { version = "0.1", features = ["fs"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# Web/WebSocket (for external clients)
+axum = { version = "0.7", features = ["ws"] }
+tower = "0.4"
+tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
+tokio-tungstenite = "0.24"  # Outbound WS client — federation bridge connects to peer endpoints
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+toml = "0.8"
+
+# Git operations
+git2 = { version = "0.19", default-features = false }
+
+# Database (server mode)
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite", "migrate", "chrono", "json"] }
+
+
+# Concurrent collections (server sessions)
+dashmap = "5"
+
+# File system
+notify = "7"  # File watching
+
+# Environment (.env file loading)
+dotenvy = "0.15"
+tempfile = "3"
+walkdir = "2"
+
+# HTTP client (for Bifrost/Ollama)
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "multipart"] }
+
+# Voice channel — mic capture, mp3 playback, WAV encoding, STT/TTS HTTP clients
+cpal = "0.15"
+rodio = { version = "0.19", default-features = false, features = ["mp3"] }
+hound = "3.5"
+
+# Embeddings/ML
+# tokenizers = "0.15"  # For local tokenization
+
+# Terminal/UI
+crossterm = { version = "0.28", features = ["bracketed-paste"] }  # Terminal control (bracketed paste for paste detection) — kept for old TUI
+ratatui = { version = "0.30", features = ["crossterm"] }  # TUI framework with crossterm backend — kept for old TUI
+tuie = { path = "../tuie", features = ["harmonious", "images"] }  # New composable widget toolkit — replacing ratatui
+chord_macro = { path = "../tuie/chord_macro" }  # chord!() input-matching macro — the one the tuie-demo widgets use
+axis2d = "0.1.0"  # Axis2D/Vec2 geometry — re-exported by tuie, used directly by the demo widgets
+unicode-width = "0.1"
+arboard = { version = "3", features = ["wayland-data-control"] }  # Clipboard — click-to-copy a message bubble
+colored = "2"       # Color gradients and effects
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }  # Per-agent portraits (assets/portrait.{png,jpg}) + multimodal images
+ratatui-image = { version = "11", default-features = false, features = ["crossterm", "image-defaults"] }  # Real photo rendering in TUI (kitty/sixel/halfblock) — chafa-dyn default dropped, souveraine uses picker/protocols only, avoids a cross chafa+glib sysroot
+ratatui-ratty = { version = "0.2", optional = true }  # Inline 3D graphics via Ratty Graphics Protocol
+
+# Logging/tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Full USB KVM receiver. Optional because only the aarch64 phone package ships
+# it; the main substrate and desktop builds do not need a windowing stack.
+gadgetry-most-foul = { version = "0.1.1", optional = true }
+gud-gadget = { git = "https://github.com/samcday/gud-gadget", rev = "33024b6152633eb8359375419281fa3ebac9c9cb", optional = true }
+softbuffer = { version = "0.4", optional = true }
+winit = { version = "0.30", optional = true }
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Process management (subagents)
+sysinfo = "0.30"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# UUIDs for conversation IDs
+uuid = { version = "1", features = ["v4"] }
+
+# Regex
+regex = "1"
+
+# Token counting (cl100k_base for context pressure estimation)
+tiktoken = "3"
+
+# System directories
+dirs = "5"
+
+# OS-native credential storage
+keyring = "4"
+keyring-core = "1"
+
+# Cryptographic identity (seed-id, event signing, federation trust root)
+ed25519-dalek = { version = "2", features = ["rand_core", "pem"] }
+sha2 = "0.10"
+rand = "0.8"
+# SO_PEERCRED on the machined socket — the daemon logs who asked for what
+libc = "0.2"
+
+# Cron expression parsing (schedule system)
+cron = "0.13"
+
+# Markdown parsing for the TUI chat renderer (lift from jcode pattern)
+pulldown-cmark = "0.12"
+
+# Tauri (desktop app wrapper)
+tauri = { version = "2", features = ["tray-icon", "devtools"], optional = true }
+tauri-plugin-shell = { version = "2", optional = true }
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
+
+# Interactive REPL
+rustyline = "13"
+shellexpand = "3"
+figlet-rs = { version = "1.0.0", optional = true }
+cowsay = { version = "0.14.0", optional = true }
+tui-big-text = "0.8.4"
+tui-widgets = "0.7.2"
+base64 = "0.22.1"
+hex = "0.4"
+once_cell = "1.21.4"
+glob = "0.3"
+
+# Matrix sensorium — optional surface. matrix-sdk is only compiled in when
+# the `matrix` feature is enabled; a default build never links it.
+# matrix-sdk 0.17 always uses rustls (no tls feature flag).
+# NOTE: `e2e-encryption` disabled for Phase 3 — it pulls matrix-sdk-sqlite
+# → rusqlite → libsqlite3-sys 0.35, conflicting with sqlx 0.7's
+# libsqlite3-sys 0.26 (both `links = "sqlite3"`). Phase 3 uses the
+# in-memory store; e2ee + sqlite store return in Phase 6.
+matrix-sdk = { version = "0.17", optional = true, default-features = false }
+
+# Secret Service daemon (org.freedesktop.secrets) — optional binary target.
+# Backs libsecret clients (Chatty/libcmatrix, and our own keyring-core above)
+# from the existing SeedId, so the machine identity is the trust root instead
+# of gnome-keyring/KWallet. zbus = session bus; aes/cbc = AES-128-CBC + PKCS7
+# (the OpenSession "dh-ietf1024-sha256-aes128-cbc-pkcs7" transport); hkdf =
+# session key derivation (sha2/rand already plain deps above); num-bigint =
+# RFC 2409 MODP-1024 group math for the OpenSession DH exchange itself.
+zbus = { version = "5", optional = true, default-features = false, features = ["tokio"] }
+zvariant = { version = "5", optional = true }
+aes = { version = "0.8", optional = true }
+cbc = { version = "0.1", optional = true, features = ["alloc"] }
+cipher = { version = "0.4", optional = true }
+hkdf = { version = "0.12", optional = true }
+num-bigint = { version = "0.4", optional = true }
+num-traits = { version = "0.2", optional = true }
+# At-rest sealing per STORAGE-ENCRYPTION.md: AES-256-GCM for the item store
+# and key wraps (the AEAD the tree previously lacked), Argon2id for the
+# passphrase KEK — the slot that puts the user's real lockscreen passphrase
+# into the at-rest hierarchy.
+aes-gcm = { version = "0.10", optional = true }
+argon2 = { version = "0.5", optional = true }
+
+# Session authority daemon (souveraine-sessiond) — ext-session-lock client.
+# Pure-Rust Wayland stack. The daemon owns locking and the holding surface; it
+# deliberately has no unlock UI or PAM conversation (`src/sessiond/lock.rs`).
+wayland-client = { version = "0.31", optional = true }
+wayland-protocols = { version = "0.32", optional = true, features = ["client", "staging"] }
+wry = { version = "0.56.0", optional = true }
+tao = { version = "0.36.0", optional = true }
+gtk = { version = "0.18", optional = true }
+
+
+
+
+
+
+
+
+
+[dev-dependencies]
+tokio-test = "0.4"
+colored = "2"
+tempfile = "3"
+
+[[example]]
+name = "demo"
+path = "examples/demo.rs"
+
+[[bin]]
+name = "souveraine"
+path = "src/main.rs"
+
+[[bin]]
+name = "souveraine-secrets"
+path = "src/bin/souveraine-secrets.rs"
+required-features = ["secrets"]
+
+# System-tier machine identity daemon. No feature gate: zero new heavy deps,
+# and the phone package should always ship it.
+[[bin]]
+name = "souveraine-machined"
+path = "src/bin/souveraine-machined.rs"
+
+# The admission executor. Root-only, no feature gate, no daemon: agents get
+# their Unix principal through exactly one writer, and admission is a rare
+# deliberate ceremony rather than something a background service does.
+[[bin]]
+name = "souveraine-admit"
+path = "src/bin/souveraine-admit.rs"
+
+[[bin]]
+name = "souveraine-sessiond"
+path = "src/bin/souveraine-sessiond.rs"
+required-features = ["sessiond"]
+
+# The sensor reporter. No features: it speaks to sessiond over the socket like
+# any other client and pulls in none of the lock/PAM/Wayland machinery.
+[[bin]]
+name = "souveraine-sensord"
+path = "src/bin/souveraine-sensord.rs"
+
+# The agent-session collector. Not to be confused with souveraine-sessiond:
+# that one is the device's proprioception, this one reads agent transcripts.
+# No features — it needs only serde/chrono/dirs, all already default.
+[[bin]]
+name = "souveraine-agentsd"
+path = "src/bin/souveraine-agentsd.rs"
+
+[[bin]]
+name = "souveraine-usb-kvm"
+path = "src/bin/souveraine-usb-kvm.rs"
+required-features = ["usb-kvm"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[features]
+web = ["dep:wry", "dep:tao", "dep:gtk"]
+default = ["figlet-rs"]
+figlet-rs = ["dep:figlet-rs"]
+cowsay = ["dep:cowsay"]
+tauri-desktop = ["dep:tauri", "dep:tauri-plugin-shell"]
+rgp = ["dep:ratatui-ratty"]
+# Matrix sensorium — opt-in surface. `cargo build --features matrix`.
+matrix = ["dep:matrix-sdk"]
+# GUI render mode — forwards to tuie's windowed backend (winit/wgpu). Gates the
+# color-scheme / font-size controls in theme.rs and global_chords.rs.
+gui = ["tuie/gui"]
+# Secret Service daemon (org.freedesktop.secrets), backed by the existing SeedId.
+secrets = ["dep:zbus", "dep:zvariant", "dep:aes", "dep:cbc", "dep:cipher", "dep:hkdf", "dep:num-bigint", "dep:num-traits", "dep:aes-gcm", "dep:argon2"]
+# Session authority daemon — holds ext-session-lock before/under the shell.
+sessiond = ["dep:wayland-client", "dep:wayland-protocols"]
+usb-kvm = ["dep:gadgetry-most-foul", "dep:gud-gadget", "dep:softbuffer", "dep:winit"]
+wry = ["dep:wry"]
+tao = ["dep:tao"]
+gtk = ["dep:gtk"]
+
+[patch."https://github.com/samcday/gadgetry-most-foul.git"]
+gadgetry-most-foul = { version = "0.1.1" }
+
+[[bin]]
+name = "souveraine-web"
+path = "src/bin/souveraine-web.rs"
+required-features = ["web"]

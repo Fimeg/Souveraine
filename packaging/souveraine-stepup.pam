@@ -1,0 +1,14 @@
+# Step-up authentication for SouveraineOS (SESSION-AUTHORITY-DOCTRINE §3).
+# Never unlocks the session; a success mints a short-lived in-memory grant.
+#
+# Same stack as the lock surface, for the same reason souveraine-sessiond gives:
+# step-up must accept exactly the credentials the lockscreen accepts, no more.
+#
+# The leading '-' loads the FPC factor only where it is installed, so one file
+# serves the phone and the laptop. blueline-fingerprintd ships the module; it
+# accepts only PAM_SERVICE=polkit-1 today and returns PAM_IGNORE here, falling
+# through to the password stack until its service check is widened.
+-auth		sufficient	pam_souveraine_fpc.so
+auth		include		login
+
+account		include		login

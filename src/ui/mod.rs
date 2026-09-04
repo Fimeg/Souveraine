@@ -1,0 +1,24 @@
+pub mod animation;
+pub mod app;
+pub mod atmosphere;
+pub mod chat;
+pub mod cockpit_panel;
+pub mod color_support;
+pub mod component;
+pub mod expressions;
+pub mod health_panel;
+pub mod markdown;
+pub mod portrait;
+pub mod presence;
+pub mod rgp;
+pub mod schedules;
+pub mod screens;
+pub mod settings;
+pub mod setup;
+pub mod theme;
+pub mod tuie_app;
+pub mod tuie_markdown;
+pub mod voice;
+pub mod widgets;
+
+pub use app::App;

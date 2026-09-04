@@ -1,0 +1,40 @@
+[Unit]
+Description=Commission the local Souveraine machine identity
+Documentation=https://forge.caseytunturi.com/Fimeg/SouveraineOS/src/branch/main/saf/federation/02-commissioning.md
+After=systemd-sysusers.service systemd-tmpfiles-setup.service
+Before=souveraine-machined.service
+Wants=souveraine-machined.service
+ConditionPathExists=!/var/lib/souveraine/seed-id
+
+[Service]
+Type=oneshot
+# The CLI opens its relative souveraine.log before dispatching the machine
+# command. Keep that transient file inside PrivateTmp; `/` is read-only below.
+WorkingDirectory=/tmp
+ExecStart=/usr/bin/souveraine machine init --fresh
+UMask=0077
+
+# The guarded CLI writes only the body-local machine seed.
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+ProtectSystem=strict
+ReadWritePaths=/var/lib/souveraine
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

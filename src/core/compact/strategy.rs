@@ -1,0 +1,1000 @@
+#![allow(dead_code)] // WIP scaffolding not yet wired
+use std::sync::Arc;
+
+use async_trait::async_trait;
+
+use crate::bridge::openai_compatible::{ChatCompletionRequest, Message};
+use crate::bridge::model_router::TokenCounter;
+use crate::bridge::LlmProvider;
+use crate::core::session::ConversationMessage;
+
+use super::config::{AgentCompactionConfig, CompactionStrategyKind};
+use super::plan::CompactionPlan;
+
+/// Tools whose results are considered compactable (large outputs, rarely
+/// needed verbatim once surpassed). Matches Souveraine's actual sensor names.
+const COMPACTABLE_TOOLS: &[&str] = &["read", "bash", "grep", "glob", "list_dir", "edit", "write"];
+
+/// Placeholder text written into tool result blocks that get microcompacted.
+/// Placeholder used so logs read consistently across runs.
+const TIME_BASED_MC_CLEARED_MESSAGE: &str = "[Old tool result content cleared]";
+
+/// Token-count a slice of messages using the bridge's TokenCounter.
+///
+/// Routes through `ContentBlock::countable_text`, the one authority for block
+/// weight. It previously had its own `_ => None` arm here and so counted Text
+/// only — meaning microcompact, which exists to clear old ToolResult content,
+/// could not see a single byte of what it was built to reclaim.
+pub fn count_messages(counter: &TokenCounter, messages: &[ConversationMessage]) -> usize {
+    messages
+        .iter()
+        .flat_map(|m| &m.blocks)
+        .map(|b| counter.count(&b.countable_text()))
+        .sum()
+}
+
+/// A single compaction strategy.
+///
+/// Each strategy is an async function from messages+config to a plan.
+/// A strategy does NOT modify messages directly — it returns a plan
+/// describing what to keep, what to replace, and what to drop.
+#[async_trait]
+pub trait CompactionStrategy: Send + Sync {
+    fn kind(&self) -> CompactionStrategyKind;
+
+    /// Analyze messages and produce a compaction plan.
+    async fn plan(
+        &self,
+        messages: &[ConversationMessage],
+        config: &AgentCompactionConfig,
+        counter: &TokenCounter,
+    ) -> anyhow::Result<CompactionPlan>;
+}
+
+/// Helper: call a provider model with system+user prompt, get text response.
+async fn provider_complete(
+    client: &Arc<dyn LlmProvider>,
+    model: &str,
+    system: &str,
+    prompt: &str,
+    max_tokens: u32,
+) -> anyhow::Result<String> {
+    let request = ChatCompletionRequest {
+        model: model.to_string(),
+        messages: vec![
+            Message::text("system", system.to_string()),
+            Message::text("user", prompt.to_string()),
+        ],
+        temperature: Some(0.3),
+        max_tokens: Some(max_tokens),
+        stream: None,
+        tools: None,
+    };
+    let result = client.chat_completion(request).await?;
+    Ok(result.content)
+}
+
+// ── Summary Strategy ─────────────────────────────────────────────────────────
+
+/// LLM-based summarization producing a structured 9-section boundary message.
+/// The structure is what makes the compact *survivable*:
+/// the agent reads the boundary on the next turn and can resume with full
+/// awareness of intent, files, decisions, and pending work.
+pub struct SummaryStrategy {
+    pub client: Arc<dyn LlmProvider>,
+    pub model: String,
+    pub prompt_override: Option<String>,
+}
+
+const SUMMARY_SYSTEM_PROMPT: &str = "Respond with TEXT ONLY. Do not call any tools — you already have all the context you need in the messages above. Your response must be plain text: an <analysis> block followed by a <summary> block.";
+
+const SUMMARY_USER_PROMPT: &str = r#"Create a detailed summary of the conversation so far. This summary will replace the earlier messages, so it must capture all important information.
+
+First, draft your analysis inside <analysis> tags. Walk through the conversation chronologically and extract:
+- Every user request and intent (explicit and implicit)
+- The approach taken and technical decisions made
+- Specific code, files, and configurations discussed (with paths and line numbers where available)
+- All errors encountered and how they were fixed
+- Any user feedback or corrections
+
+Then, produce a structured summary inside <summary> tags with these sections:
+
+1. **Primary Request and Intent**: All user requests in full detail, including nuances and constraints.
+2. **Key Technical Concepts**: Technologies, frameworks, patterns, and conventions discussed.
+3. **Files and Code Sections**: Every file examined or modified, with specific code snippets and line numbers.
+4. **Errors and Fixes**: Every error encountered, its cause, and how it was resolved.
+5. **Problem Solving**: Problems solved and approaches that worked vs. didn't work.
+6. **All User Messages**: Non-tool-result user messages (preserve exact wording for context).
+7. **Pending Tasks**: Explicitly requested work that hasn't been completed yet.
+8. **Current Work**: Detailed description of the last task being worked on before compaction.
+9. **Optional Next Step**: The single most logical next step, directly aligned with the user's recent request.
+
+REMINDER: Respond with plain text only — an <analysis> block followed by a <summary> block. Do not call any tools."#;
+
+#[async_trait]
+impl CompactionStrategy for SummaryStrategy {
+    fn kind(&self) -> CompactionStrategyKind {
+        CompactionStrategyKind::Summary
+    }
+
+    async fn plan(
+        &self,
+        messages: &[ConversationMessage],
+        config: &AgentCompactionConfig,
+        _counter: &TokenCounter,
+    ) -> anyhow::Result<CompactionPlan> {
+        if messages.len() < 3 {
+            return Ok(CompactionPlan::empty());
+        }
+
+        let preserve_count = config.preserve_recent.min(messages.len().saturating_sub(2));
+        let cutoff = messages.len().saturating_sub(preserve_count);
+
+        let to_summarize = &messages[1..cutoff];
+        if to_summarize.is_empty() {
+            return Ok(CompactionPlan::empty());
+        }
+
+        // Render the segment as a labelled transcript so the model has clear
+        // role boundaries (vs collapsing all text into one stream).
+        let conversation_text = render_segment_for_summary(to_summarize);
+        let truncated: String = conversation_text
+            .chars()
+            .take(config.max_summary_length * 4)
+            .collect();
+
+        let user_prompt = match &self.prompt_override {
+            Some(custom) => format!("{}\n\nConversation to summarize:\n\n{}", custom, truncated),
+            None => format!(
+                "{}\n\nConversation to summarize:\n\n{}",
+                SUMMARY_USER_PROMPT, truncated
+            ),
+        };
+
+        let summary = provider_complete(
+            &self.client,
+            &self.model,
+            SUMMARY_SYSTEM_PROMPT,
+            &user_prompt,
+            config.max_summary_length as u32,
+        )
+        .await?;
+
+        // Index 0 is the system anchor — persona, covenant, human context. It
+        // is deliberately excluded from `to_summarize` above because it must
+        // not be compressed, and it was then dropped from `keep_indices` too,
+        // so the primary lost who she was on her first compaction. Every other
+        // strategy seeds this with `vec![0]`; `culled_count` below already
+        // counted as though it did.
+        let mut keep_indices: Vec<usize> = vec![0];
+        keep_indices.extend(cutoff..messages.len());
+        keep_indices.dedup();
+
+        Ok(CompactionPlan {
+            keep_indices,
+            summary_text: Some(summary),
+            culled_count: cutoff.saturating_sub(1),
+            token_savings: cutoff * 100,
+            replacement_messages: None,
+        })
+    }
+}
+
+/// Render a slice of messages as a transcript suitable for feeding to the
+/// summary model. Tool calls and results render as inline labels so the model
+/// can attribute outcomes to actions.
+fn render_segment_for_summary(messages: &[ConversationMessage]) -> String {
+    use crate::core::session::{ContentBlock, MessageRole};
+    let mut out = String::new();
+    for msg in messages {
+        let role = match msg.role {
+            MessageRole::System => "system",
+            MessageRole::User => "user",
+            MessageRole::Assistant => "assistant",
+            MessageRole::Tool => "tool",
+        };
+        for block in &msg.blocks {
+            match block {
+                ContentBlock::Text { text } => {
+                    out.push_str(&format!("[{}] {}\n", role, text));
+                }
+                ContentBlock::ToolUse { name, input, .. } => {
+                    out.push_str(&format!("[{} -> tool_call:{}] {}\n", role, name, input));
+                }
+                ContentBlock::ToolResult {
+                    tool_name,
+                    output,
+                    is_error,
+                    ..
+                } => {
+                    let prefix = if *is_error { "ERROR " } else { "" };
+                    out.push_str(&format!(
+                        "[{} <- tool_result:{}] {}{}\n",
+                        role, tool_name, prefix, output
+                    ));
+                }
+                ContentBlock::Reasoning { .. } => {}
+                ContentBlock::Image { media_type, .. } => {
+                    out.push_str(&format!("[{}] [Image: {}]\n", role, media_type));
+                }
+            }
+        }
+    }
+    out
+}
+
+// ── Microcompact Strategy ────────────────────────────────────────────────────
+
+/// Cheap pre-pass that replaces the contents of old tool results with a
+/// placeholder, keeping the most recent `microcompact_keep_recent` results
+/// intact. No LLM call.
+///
+/// The agent typically reaches for this *first*: it gets back significant
+/// context room without losing the structure of the conversation. The tool
+/// call shells (id, name, args) remain so the model knows what was done,
+/// only the verbose outputs are replaced.
+pub struct MicrocompactStrategy;
+
+#[async_trait]
+impl CompactionStrategy for MicrocompactStrategy {
+    fn kind(&self) -> CompactionStrategyKind {
+        CompactionStrategyKind::Microcompact
+    }
+
+    async fn plan(
+        &self,
+        messages: &[ConversationMessage],
+        _config: &AgentCompactionConfig,
+        counter: &TokenCounter,
+    ) -> anyhow::Result<CompactionPlan> {
+        use crate::core::session::ContentBlock;
+
+        if messages.is_empty() {
+            return Ok(CompactionPlan::empty());
+        }
+
+        // 1) Walk messages, collect ordered tool_use IDs that are compactable.
+        let mut ordered_ids: Vec<String> = Vec::new();
+        let mut tool_names: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for msg in messages {
+            for block in &msg.blocks {
+                if let ContentBlock::ToolUse { id, name, .. } = block {
+                    if COMPACTABLE_TOOLS.contains(&name.as_str()) {
+                        ordered_ids.push(id.clone());
+                        tool_names.insert(id.clone(), name.clone());
+                    }
+                }
+            }
+        }
+
+        let keep_recent = 5usize;
+        if ordered_ids.len() <= keep_recent {
+            return Ok(CompactionPlan::empty());
+        }
+        let clear_set: std::collections::HashSet<&str> = ordered_ids
+            [..ordered_ids.len() - keep_recent]
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+
+        // 2) Build replacement message list with cleared blocks.
+        let mut new_messages: Vec<ConversationMessage> = Vec::with_capacity(messages.len());
+        let mut tokens_saved: usize = 0;
+        let mut cleared_count: usize = 0;
+        for msg in messages {
+            let mut new_blocks: Vec<ContentBlock> = Vec::with_capacity(msg.blocks.len());
+            for block in &msg.blocks {
+                match block {
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        tool_name,
+                        output,
+                        is_error,
+                    } if clear_set.contains(tool_use_id.as_str())
+                        && output != TIME_BASED_MC_CLEARED_MESSAGE =>
+                    {
+                        tokens_saved += counter.count(output);
+                        cleared_count += 1;
+                        new_blocks.push(ContentBlock::ToolResult {
+                            tool_use_id: tool_use_id.clone(),
+                            tool_name: tool_name.clone(),
+                            output: TIME_BASED_MC_CLEARED_MESSAGE.to_string(),
+                            is_error: *is_error,
+                        });
+                    }
+                    other => new_blocks.push(other.clone()),
+                }
+            }
+            new_messages.push(ConversationMessage {
+                role: msg.role,
+                blocks: new_blocks,
+                usage: msg.usage,
+                timestamp: msg.timestamp,
+            });
+        }
+
+        if cleared_count == 0 {
+            return Ok(CompactionPlan::empty());
+        }
+
+        Ok(CompactionPlan {
+            keep_indices: (0..messages.len()).collect(),
+            summary_text: None,
+            culled_count: cleared_count,
+            token_savings: tokens_saved,
+            replacement_messages: Some(new_messages),
+        })
+    }
+}
+
+// ── Cull Strategy ────────────────────────────────────────────────────────────
+
+/// Drop trivial messages. No LLM dependency. Role-aware: never drops System,
+/// Tool, or assistant messages carrying tool calls.
+pub struct CullStrategy;
+
+fn is_trivial(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let lower = trimmed.to_lowercase();
+    matches!(
+        lower.as_str(),
+        "ok" | "okay"
+            | "thanks"
+            | "ty"
+            | "got it"
+            | "sure"
+            | "yes"
+            | "no"
+            | "thx"
+            | "k"
+            | "👍"
+            | "🙏"
+            | "done"
+            | "yep"
+            | "nope"
+            | "right"
+            | "cool"
+            | "great"
+            | "will do"
+            | "on it"
+    )
+}
+
+/// A message that must never be culled regardless of content length.
+/// System messages anchor identity; Tool results carry execution outputs
+/// the model relied on; assistant messages with ToolUse blocks are the
+/// call side of a tool pair.
+fn is_load_bearing(msg: &ConversationMessage) -> bool {
+    use crate::core::session::{ContentBlock, MessageRole};
+    if matches!(msg.role, MessageRole::System | MessageRole::Tool) {
+        return true;
+    }
+    msg.blocks.iter().any(|b| {
+        matches!(
+            b,
+            ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. }
+        )
+    })
+}
+
+#[async_trait]
+impl CompactionStrategy for CullStrategy {
+    fn kind(&self) -> CompactionStrategyKind {
+        CompactionStrategyKind::Cull
+    }
+
+    async fn plan(
+        &self,
+        messages: &[ConversationMessage],
+        config: &AgentCompactionConfig,
+        _counter: &TokenCounter,
+    ) -> anyhow::Result<CompactionPlan> {
+        use crate::core::session::ContentBlock;
+
+        if messages.len() < 3 {
+            return Ok(CompactionPlan::empty());
+        }
+
+        let preserve_count = config.preserve_recent.min(messages.len().saturating_sub(2));
+        let cutoff = messages.len().saturating_sub(preserve_count);
+
+        let mut keep_indices: Vec<usize> = vec![0];
+        let mut culled_count = 0;
+
+        for i in cutoff..messages.len() {
+            keep_indices.push(i);
+        }
+
+        #[allow(clippy::needless_range_loop)] // index pushed into keep_indices
+        for i in 1..cutoff {
+            if is_load_bearing(&messages[i]) {
+                keep_indices.push(i);
+                continue;
+            }
+            // Only check Text blocks for triviality; presence of any
+            // non-trivial Text block keeps the message.
+            let all_text_trivial = messages[i].blocks.iter().all(|b| match b {
+                ContentBlock::Text { text } => is_trivial(text),
+                ContentBlock::Reasoning { .. } => true,
+                _ => false,
+            });
+            if all_text_trivial {
+                culled_count += 1;
+            } else {
+                keep_indices.push(i);
+            }
+        }
+
+        keep_indices.sort();
+        keep_indices.dedup();
+
+        Ok(CompactionPlan {
+            keep_indices,
+            summary_text: None,
+            culled_count,
+            token_savings: culled_count * 60,
+            replacement_messages: None,
+        })
+    }
+}
+
+// ── Sliding Window Strategy ──────────────────────────────────────────────────
+
+/// Keep the system message + the last `preserve_recent_n` messages, drop the
+/// middle. No LLM dependency — the cheap, fast default for analytical agents
+/// (subconscious) and ephemeral subagents.
+///
+/// Tool-pair aware: if the cut would split a tool-call message from its
+/// matching tool-result, the cut slides back to keep the pair together.
+pub struct SlidingWindowStrategy;
+
+/// Walk the cut index backward until it does not split a tool call from its
+/// result. The result-side of a pair is identified by `MessageRole::Tool` or
+/// by an assistant message starting with `ContentBlock::ToolResult` (shouldn't
+/// happen but defensive). The call-side is an assistant message containing
+/// `ContentBlock::ToolUse`.
+///
+/// We walk back at most a small bounded distance so a pathological transcript
+/// of all tool calls doesn't cause us to skip the entire middle.
+fn adjust_cutoff_for_tool_pair(messages: &[ConversationMessage], cutoff: usize) -> usize {
+    use crate::core::session::{ContentBlock, MessageRole};
+    let mut c = cutoff;
+    let max_walk_back = 8usize;
+    for _ in 0..max_walk_back {
+        if c == 0 || c >= messages.len() {
+            break;
+        }
+        let head = &messages[c];
+        let split_pair = matches!(head.role, MessageRole::Tool)
+            || head
+                .blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolResult { .. }));
+        if !split_pair {
+            break;
+        }
+        c -= 1;
+    }
+    c
+}
+
+#[async_trait]
+impl CompactionStrategy for SlidingWindowStrategy {
+    fn kind(&self) -> CompactionStrategyKind {
+        CompactionStrategyKind::SlidingWindow
+    }
+
+    async fn plan(
+        &self,
+        messages: &[ConversationMessage],
+        config: &AgentCompactionConfig,
+        _counter: &TokenCounter,
+    ) -> anyhow::Result<CompactionPlan> {
+        if messages.len() < 3 {
+            return Ok(CompactionPlan::empty());
+        }
+
+        let preserve_count = config.preserve_recent.min(messages.len().saturating_sub(1));
+        if preserve_count + 1 >= messages.len() {
+            // Nothing in the middle to drop.
+            return Ok(CompactionPlan::empty());
+        }
+        let raw_cutoff = messages.len() - preserve_count;
+        let cutoff = adjust_cutoff_for_tool_pair(messages, raw_cutoff);
+
+        // Always keep the first (system / anchor) message.
+        let mut keep_indices: Vec<usize> = vec![0];
+        for i in cutoff..messages.len() {
+            keep_indices.push(i);
+        }
+        keep_indices.sort();
+        keep_indices.dedup();
+
+        let dropped = cutoff.saturating_sub(1);
+        Ok(CompactionPlan {
+            keep_indices,
+            summary_text: None,
+            culled_count: dropped,
+            token_savings: dropped * 100,
+            replacement_messages: None,
+        })
+    }
+}
+
+// ── SlidingReflect Strategy ─────────────────────────────────────────────────
+
+/// SlidingWindow with a preservation pass: before cutting the middle, an LLM
+/// reads the about-to-be-evicted messages and extracts threads worth keeping.
+/// The result is inserted as a system message so the agent carries the gist
+/// even after the originals are gone.
+///
+/// Uses whichever model the engine provides (subconscious model if subconscious is
+/// enabled, compaction model / primary otherwise). If no provider client is
+/// available, falls back to plain SlidingWindow (no threads lost is better
+/// than no compaction at all).
+pub struct SlidingReflectStrategy {
+    pub client: Arc<dyn LlmProvider>,
+    pub model: String,
+    /// User-supplied prompt override from [compaction] reflect_prompt in config.
+    /// When set, replaces the built-in REFLECT_TASK prompt entirely.
+    pub prompt_override: Option<String>,
+    /// The persona of the agent being compacted, read from her
+    /// `system/persona.md`. The preservation pass runs as a fresh fork of
+    /// *her* — this is the identity the fork wakes into. `None` only when no
+    /// persona file exists yet.
+    pub agent_persona: Option<String>,
+}
+
+/// First-person orientation appended after the agent's persona, so the
+/// preservation fork reads and writes as herself — not as a reviewer of her.
+const REFLECT_FORK_ORIENTATION: &str = "\n\n---\n\nRight now I am a fresh fork of myself, woken for one small task. A stretch of my own context is about to fall away — these messages will be gone after this. I look back through them and catch my own threads before they slip. This is me keeping myself, not a stranger summarizing me. I answer with text only and call no tools.";
+
+/// First-person preservation task, prepended to the evicted transcript.
+const REFLECT_TASK: &str = r#"These messages are about to leave my context. I name only what would otherwise be lost — what I am still carrying that is not already written into my memory files:
+
+- commitments I made — to myself, to a plan
+- decisions I reached, and the reasoning where it isn't obvious
+- something I noticed or named for the first time
+- emotional or relational threads that shaped where this went
+- assumptions I haven't tested yet
+
+I skip what I can re-derive: tool output, file contents, code already on disk. I am terse — bullet points. This note is a lifeline I am writing forward to myself, not a summary.
+
+The messages I am about to lose:
+
+"#;
+
+#[async_trait]
+impl CompactionStrategy for SlidingReflectStrategy {
+    fn kind(&self) -> CompactionStrategyKind {
+        CompactionStrategyKind::SlidingReflect
+    }
+
+    async fn plan(
+        &self,
+        messages: &[ConversationMessage],
+        config: &AgentCompactionConfig,
+        _counter: &TokenCounter,
+    ) -> anyhow::Result<CompactionPlan> {
+        if messages.len() < 3 {
+            return Ok(CompactionPlan::empty());
+        }
+
+        let preserve_count = config.preserve_recent.min(messages.len().saturating_sub(1));
+        if preserve_count + 1 >= messages.len() {
+            return Ok(CompactionPlan::empty());
+        }
+        let raw_cutoff = messages.len() - preserve_count;
+        let cutoff = adjust_cutoff_for_tool_pair(messages, raw_cutoff);
+
+        let evicted = &messages[1..cutoff];
+        if evicted.is_empty() {
+            return Ok(CompactionPlan::empty());
+        }
+
+        // Run the preservation pass on the about-to-be-evicted segment.
+        let transcript = render_segment_for_summary(evicted);
+        let truncated: String = transcript
+            .chars()
+            .take(config.max_summary_length * 4)
+            .collect();
+
+        let user_prompt = match &self.prompt_override {
+            Some(custom) => format!("{}\n\n{}", custom, truncated),
+            None => format!("{}{}", REFLECT_TASK, truncated),
+        };
+
+        // The fork wakes into her own persona. With no persona file yet, it
+        // still speaks in the first person — never as an outside reviewer.
+        let system_prompt = match self.agent_persona.as_deref() {
+            Some(persona) if !persona.trim().is_empty() => {
+                format!("{}{}", persona.trim(), REFLECT_FORK_ORIENTATION)
+            }
+            _ => format!(
+                "I am the agent whose context is being compacted.{}",
+                REFLECT_FORK_ORIENTATION
+            ),
+        };
+
+        let reflection = provider_complete(
+            &self.client,
+            &self.model,
+            &system_prompt,
+            &user_prompt,
+            2048,
+        )
+        .await;
+
+        // Preservation note becomes a system message. If the LLM call fails,
+        // fall back to plain sliding window — compaction shouldn't break
+        // because the preservation pass errored.
+        let summary_text = match reflection {
+            Ok(text) if !text.trim().is_empty() => {
+                Some(format!("[Threads I carried forward]\n{}", text.trim()))
+            }
+            Ok(_) => None,
+            Err(e) => {
+                tracing::warn!(
+                    "[sliding_reflect] preservation pass failed, falling back to plain slide: {}",
+                    e
+                );
+                None
+            }
+        };
+
+        let mut keep_indices: Vec<usize> = vec![0];
+        for i in cutoff..messages.len() {
+            keep_indices.push(i);
+        }
+        keep_indices.sort();
+        keep_indices.dedup();
+
+        let dropped = cutoff.saturating_sub(1);
+        Ok(CompactionPlan {
+            keep_indices,
+            summary_text,
+            culled_count: dropped,
+            token_savings: dropped * 100,
+            replacement_messages: None,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::session::{ContentBlock, ConversationMessage, MessageRole};
+
+    fn text_msg(role: MessageRole, text: &str) -> ConversationMessage {
+        ConversationMessage {
+            role,
+            blocks: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+            usage: None,
+            timestamp: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cull_drops_trivial() {
+        let messages = vec![
+            text_msg(MessageRole::System, "System prompt"),
+            text_msg(MessageRole::User, "ok"),
+            text_msg(MessageRole::User, "What's the plan for today?"),
+            text_msg(MessageRole::Assistant, "Sure, let me check."),
+            text_msg(MessageRole::User, "thanks"),
+            text_msg(MessageRole::Assistant, "Here's what I found."),
+        ];
+
+        let config = AgentCompactionConfig {
+            preserve_recent: 2,
+            ..Default::default()
+        };
+        let counter = TokenCounter::new();
+        let plan = CullStrategy
+            .plan(&messages, &config, &counter)
+            .await
+            .unwrap();
+
+        assert!(plan.culled_count > 0, "should cull some messages");
+        assert!(
+            plan.summary_text.is_none(),
+            "cull should not produce summary content"
+        );
+        assert!(
+            plan.replacement_messages.is_none(),
+            "cull should not produce replacement messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cull_preserves_substance() {
+        let messages = vec![
+            text_msg(MessageRole::System, "System prompt"),
+            text_msg(
+                MessageRole::User,
+                "This is an important question about the architecture.",
+            ),
+            text_msg(
+                MessageRole::Assistant,
+                "Let me explain the design decisions.",
+            ),
+        ];
+
+        let config = AgentCompactionConfig {
+            preserve_recent: 1,
+            ..Default::default()
+        };
+        let counter = TokenCounter::new();
+        let plan = CullStrategy
+            .plan(&messages, &config, &counter)
+            .await
+            .unwrap();
+
+        assert_eq!(plan.culled_count, 0, "should not cull substantive messages");
+    }
+
+    #[tokio::test]
+    async fn test_empty_messages_return_empty_plan() {
+        let config = AgentCompactionConfig::default();
+        let counter = TokenCounter::new();
+
+        let e1 = CullStrategy.plan(&[], &config, &counter).await.unwrap();
+        assert!(e1.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_cull_never_drops_tool_results() {
+        // A Tool-role message with a short ToolResult must survive cull,
+        // even though its text-side content is trivially short.
+        let messages = vec![
+            text_msg(MessageRole::System, "system prompt"),
+            ConversationMessage {
+                role: MessageRole::Tool,
+                blocks: vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".to_string(),
+                    tool_name: "read".to_string(),
+                    output: "0".to_string(),
+                    is_error: false,
+                }],
+                usage: None,
+                timestamp: None,
+            },
+            text_msg(MessageRole::User, "ok"),
+            text_msg(
+                MessageRole::Assistant,
+                "A substantive reply about something.",
+            ),
+        ];
+        let config = AgentCompactionConfig {
+            preserve_recent: 1,
+            ..Default::default()
+        };
+        let counter = TokenCounter::new();
+        let plan = CullStrategy
+            .plan(&messages, &config, &counter)
+            .await
+            .unwrap();
+        // The tool result is at index 1 — must be in keep_indices.
+        assert!(
+            plan.keep_indices.contains(&1),
+            "tool result must be preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cull_never_drops_assistant_tool_calls() {
+        let messages = vec![
+            text_msg(MessageRole::System, "system prompt"),
+            ConversationMessage {
+                role: MessageRole::Assistant,
+                blocks: vec![ContentBlock::ToolUse {
+                    id: "t1".to_string(),
+                    name: "bash".to_string(),
+                    input: "{}".to_string(),
+                }],
+                usage: None,
+                timestamp: None,
+            },
+            text_msg(
+                MessageRole::Assistant,
+                "Substantive narrative continuation.",
+            ),
+        ];
+        let config = AgentCompactionConfig {
+            preserve_recent: 1,
+            ..Default::default()
+        };
+        let counter = TokenCounter::new();
+        let plan = CullStrategy
+            .plan(&messages, &config, &counter)
+            .await
+            .unwrap();
+        assert!(
+            plan.keep_indices.contains(&1),
+            "assistant tool-call message must be preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sliding_window_keeps_system_and_tail() {
+        let messages = vec![
+            text_msg(MessageRole::System, "system anchor"),
+            text_msg(MessageRole::User, "old user message"),
+            text_msg(MessageRole::Assistant, "old assistant reply"),
+            text_msg(MessageRole::User, "middle user message"),
+            text_msg(MessageRole::Assistant, "middle assistant reply"),
+            text_msg(MessageRole::User, "recent user message"),
+            text_msg(MessageRole::Assistant, "recent assistant reply"),
+        ];
+        let config = AgentCompactionConfig {
+            preserve_recent: 2,
+            ..Default::default()
+        };
+        let counter = TokenCounter::new();
+        let plan = SlidingWindowStrategy
+            .plan(&messages, &config, &counter)
+            .await
+            .unwrap();
+        // Must keep index 0 (system) and the last 2 (recent pair).
+        assert!(plan.keep_indices.contains(&0), "system anchor preserved");
+        assert!(plan.keep_indices.contains(&5));
+        assert!(plan.keep_indices.contains(&6));
+        // Should have dropped at least one middle message.
+        assert!(plan.culled_count > 0);
+    }
+
+    #[tokio::test]
+    async fn test_sliding_window_avoids_splitting_tool_pair() {
+        // If the raw cut would land on a tool-result message, the cut slides
+        // back so the matching tool-call also survives.
+        let messages = vec![
+            text_msg(MessageRole::System, "system"),
+            text_msg(MessageRole::User, "u1"),
+            ConversationMessage {
+                role: MessageRole::Assistant,
+                blocks: vec![ContentBlock::ToolUse {
+                    id: "t1".into(),
+                    name: "bash".into(),
+                    input: "{}".into(),
+                }],
+                usage: None,
+                timestamp: None,
+            },
+            ConversationMessage {
+                role: MessageRole::Tool,
+                blocks: vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".into(),
+                    tool_name: "bash".into(),
+                    output: "result".into(),
+                    is_error: false,
+                }],
+                usage: None,
+                timestamp: None,
+            },
+            text_msg(MessageRole::Assistant, "follow-up after tool"),
+            text_msg(MessageRole::User, "u2"),
+            text_msg(MessageRole::Assistant, "a2"),
+        ];
+        let config = AgentCompactionConfig {
+            // Force cut to land on index 3 (the tool result) before adjustment.
+            preserve_recent: 4,
+            ..Default::default()
+        };
+        let counter = TokenCounter::new();
+        let plan = SlidingWindowStrategy
+            .plan(&messages, &config, &counter)
+            .await
+            .unwrap();
+        // Either both 2 and 3 are kept, or neither is (we don't cut between them).
+        let has_call = plan.keep_indices.contains(&2);
+        let has_result = plan.keep_indices.contains(&3);
+        assert_eq!(
+            has_call, has_result,
+            "tool call and result must be kept together"
+        );
+    }
+
+    /// The bug that made microcompact a no-op for its entire existence.
+    ///
+    /// `count_messages` carried `_ => None`, so it saw Text and nothing else.
+    /// Microcompact's whole job is blurring old ToolResult output — the exact
+    /// block kind it could not measure. So `before` and `after` were identical
+    /// no matter what it cleared, `reclaimed` was always zero, and the report
+    /// always took the "nothing to set down" branch. It could not distinguish
+    /// "found nothing" from "worked perfectly and cannot say so".
+    #[test]
+    fn the_counter_sees_the_blocks_microcompact_exists_to_clear() {
+        let counter = TokenCounter::new();
+
+        let tool_heavy = vec![ConversationMessage {
+            role: MessageRole::Assistant,
+            blocks: vec![
+                ContentBlock::Text {
+                    text: "brief".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "read".to_string(),
+                    input: "a".repeat(400),
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    tool_name: "read".to_string(),
+                    output: "b".repeat(4000),
+                    is_error: false,
+                },
+                ContentBlock::Reasoning {
+                    reasoning: "c".repeat(400),
+                },
+            ],
+            usage: None,
+            timestamp: None,
+        }];
+
+        let counted = count_messages(&counter, &tool_heavy);
+
+        let text_only = counter.count("brief");
+        assert!(
+            counted > text_only * 10,
+            "counter must weigh tool traffic, not just text: got {counted}, \
+             text alone is {text_only}"
+        );
+
+        // And the decisive property: clearing a tool result must be *visible*
+        // to the counter, or the reclaim figure is structurally always zero.
+        let mut cleared = tool_heavy.clone();
+        cleared[0].blocks[2] = ContentBlock::ToolResult {
+            tool_use_id: "call_1".to_string(),
+            tool_name: "read".to_string(),
+            output: TIME_BASED_MC_CLEARED_MESSAGE.to_string(),
+            is_error: false,
+        };
+        let after = count_messages(&counter, &cleared);
+        assert!(
+            after < counted,
+            "blurring a tool result must reduce the measured count \
+             (before {counted}, after {after}) — otherwise microcompact \
+             reports a no-op however much room it actually freed"
+        );
+    }
+
+    /// Every block kind must weigh something. A kind that counts as zero is
+    /// invisible to compaction and to every pressure signal downstream.
+    #[test]
+    fn no_block_kind_weighs_nothing() {
+        let counter = TokenCounter::new();
+        let kinds = vec![
+            ContentBlock::Text {
+                text: "hello there".to_string(),
+            },
+            ContentBlock::ToolUse {
+                id: "id".to_string(),
+                name: "bash".to_string(),
+                input: "some arguments here".to_string(),
+            },
+            ContentBlock::ToolResult {
+                tool_use_id: "id".to_string(),
+                tool_name: "bash".to_string(),
+                output: "some output here".to_string(),
+                is_error: false,
+            },
+            ContentBlock::Reasoning {
+                reasoning: "thinking about it".to_string(),
+            },
+            ContentBlock::Image {
+                media_type: "image/png".to_string(),
+                data: "AAAABBBBCCCC".to_string(),
+            },
+        ];
+        for block in kinds {
+            let weight = counter.count(&block.countable_text());
+            assert!(weight > 0, "block kind weighed zero: {block:?}");
+        }
+    }
+}

@@ -1,0 +1,46 @@
+# Maintainer: Casey Tunturi
+
+pkgname=souveraine-provision-x86-laptop
+pkgver="${SOUVERAINE_PKGVER:?CI must set SOUVERAINE_PKGVER}"
+pkgrel=1
+pkgdesc='SouveraineOS commissioning and session activation for x86_64 laptops'
+arch=('x86_64')
+url='https://forge.caseytunturi.com/Fimeg/souveraine'
+license=('AGPL-3.0-or-later')
+depends=('souveraine' 'souveraine-viewtop' 'souveraine-shell' 'systemd')
+source=('souveraine-machine-firstboot.service'
+        'souveraine-provision-x86-laptop.tmpfiles'
+        '50-souveraine-power-key.conf'
+        'LICENSE')
+sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP')
+
+package() {
+    install -Dm644 "$srcdir/souveraine-machine-firstboot.service" \
+        "$pkgdir/usr/lib/systemd/system/souveraine-machine-firstboot.service"
+    install -Dm644 "$srcdir/souveraine-provision-x86-laptop.tmpfiles" \
+        "$pkgdir/usr/lib/tmpfiles.d/souveraine-provision-x86-laptop.conf"
+    install -Dm644 "$srcdir/50-souveraine-power-key.conf" \
+        "$pkgdir/usr/lib/systemd/logind.conf.d/50-souveraine-power-key.conf"
+
+    # The profile owns activation. Package install lays down the dependency
+    # graph without running a post-install hook or writing into /etc.
+    install -dm755 "$pkgdir/usr/lib/systemd/system/multi-user.target.wants"
+    ln -s ../souveraine-machine-firstboot.service \
+        "$pkgdir/usr/lib/systemd/system/multi-user.target.wants/souveraine-machine-firstboot.service"
+    ln -s ../souveraine-machined.service \
+        "$pkgdir/usr/lib/systemd/system/multi-user.target.wants/souveraine-machined.service"
+
+    install -dm755 \
+        "$pkgdir/usr/lib/systemd/user/graphical-session-pre.target.wants" \
+        "$pkgdir/usr/lib/systemd/user/graphical-session.target.wants" \
+        "$pkgdir/usr/lib/systemd/user/souveraine-sessiond.service.wants"
+    ln -s ../souveraine-sessiond.service \
+        "$pkgdir/usr/lib/systemd/user/graphical-session-pre.target.wants/souveraine-sessiond.service"
+    ln -s ../souveraine-shell.service \
+        "$pkgdir/usr/lib/systemd/user/graphical-session.target.wants/souveraine-shell.service"
+    ln -s ../souveraine-sensord.service \
+        "$pkgdir/usr/lib/systemd/user/souveraine-sessiond.service.wants/souveraine-sensord.service"
+
+    install -Dm644 "$srcdir/LICENSE" \
+        "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

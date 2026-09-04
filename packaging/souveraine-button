@@ -1,0 +1,68 @@
+#!/bin/sh
+# Report a hardware button edge to the session authority. That is all it does.
+#
+# It replaces `blueline-power-button`, which was policy in shell script: it read
+# its own copy of the panel state, asked the SHELL to lock over `qs ipc`, polled
+# `session state` twenty times at 100 ms grepping JSON for `"locked": true`, and
+# then called `blueline-screen-toggle off` itself. Three separate problems:
+#
+#   1. It blanked the panel without going through sessiond's `request_blank()`,
+#      so LOCK-DPMS-LESSONS §1 ("every path to a dark panel routes through it —
+#      an invariant, not a coincidence") had a hole in it, and the hole was the
+#      most-used control on the device.
+#   2. It carried its own copy of the lock-then-blank ordering, which is the
+#      exact duplication DEVICE-STATE-MACHINE §1 is about: seven blind actors,
+#      three of which can turn the screen off.
+#   3. It could only ever see one edge, so it could never tell a tap from a
+#      hold. Gesture recognition needs time, and a process that exits cannot
+#      hold any.
+#
+# Now the machine owns all three. This reports `down` and `up`; sessiond
+# accumulates them into tap / double / triple / hold and decides what, if
+# anything, that means.
+#
+# Wire it up in hyprland.lua as a PAIR — press and release:
+#
+#   hl.bind( "XF86PowerOff", hl.dsp.exec_cmd("souveraine-button power down"), { locked = true })
+#   hl.bindr("XF86PowerOff", hl.dsp.exec_cmd("souveraine-button power up"),   { locked = true })
+#
+# Only reporting `down` gives you a machine that thinks the button is held
+# forever: the hold threshold passes, `Hold` fires, and no `Tap` ever resolves.
+set -eu
+
+button=${1:-power}
+edge=${2:-down}
+
+case "$edge" in
+    down | up) ;;
+    *)
+        echo "usage: souveraine-button <power|volume_up|volume_down> <down|up>" >&2
+        exit 2
+        ;;
+esac
+
+runtime=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+sock="$runtime/souveraine/sessiond.sock"
+
+line="{\"op\":\"button\",\"button\":\"$button\",\"edge\":\"$edge\"}"
+
+# Fire and forget, with a hard timeout. A button press must never block on the
+# authority being slow — the user is holding the button and the phone must not
+# feel stuck. Losing an edge degrades to a missed gesture, which is recoverable;
+# hanging here is not.
+#
+# No nc/socat on this device (checked), so this is Python's stdlib or nothing.
+exec timeout 1 python3 -c '
+import socket, sys
+sock, line = sys.argv[1], sys.argv[2]
+try:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(0.8)
+    s.connect(sock)
+    s.sendall((line + "\n").encode())
+except Exception:
+    # sessiond down. Say so in the journal and drop it: a button reporter that
+    # falls back to acting on its own is the thing this file exists to delete.
+    print("sessiond unreachable; button edge dropped: " + line, file=sys.stderr)
+    sys.exit(1)
+' "$sock" "$line"

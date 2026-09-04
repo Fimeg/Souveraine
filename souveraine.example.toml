@@ -1,0 +1,145 @@
+# Souveraine Configuration
+# Everything is modular — enable/disable components as needed
+
+# === INFERENCE PROVIDER ===
+# Select which provider answers model calls.
+#   "bifrost"      (default) — OpenAI-compatible gateway (see [bifrost] section below).
+#   "openai-oauth"           — ride the Codex CLI's ChatGPT login (run
+#                              `codex login` first); drives
+#                              chatgpt.com/backend-api/codex/responses with no
+#                              API key. [bifrost] base_url/api_key/virtual_key are ignored
+#                              in this mode; set primary_model to a ChatGPT model
+#                              (e.g. "gpt-5.5"). Bifrost-namespaced ids are
+#                              tolerated and mapped to the provider default.
+[inference]
+# provider = "bifrost"
+
+# === BIFROST PROVIDER ===
+[bifrost]
+# Bifrost is the OpenAI-compatible API gateway
+base_url = "http://127.0.0.1:3360"
+api_key = ""  # Set via `souveraine auth set` or BIFROST_KEY env var
+virtual_key = ""  # x-bf-vk header if required by provider
+
+# Default model for conversation.
+# Bifrost mode: a gateway route like "openai/kimi-k2.6".
+# openai-oauth mode: a ChatGPT model like "gpt-5.5".
+primary_model = "openai/kimi-k2.6"
+
+# Request timeout in seconds for each LLM call attempt (default: 120).
+# When exceeded, the attempt is retried up to 6 times with backoff.
+# timeout_secs = 120
+
+# Per-model configuration
+[bifrost.models.deepseek-v4-pro]
+context_limit = 128000
+output_limit = 8192
+archivist_threshold = 0.7
+
+[bifrost.models.kimi-k2.6]
+context_limit = 262000
+output_limit = 8192
+archivist_threshold = 0.7
+
+# === SUBCONSCIOUS (Inner Voice) ===
+[subconscious]
+n1_enabled = true
+n1_trigger = "EveryResponse"  # EveryResponse, EveryNResponses(5), TimeBased(60), Manual
+inbox_enabled = true
+
+# === REFLECTION (N+25 Deep Witness) ===
+[reflection]
+enabled = true
+message_interval = 25
+# Compaction trigger: "off", "step-count", or "compaction-event"
+trigger = "step-count"
+
+# === ARCHIVIST (N+100 Memory Compression) ===
+[archivist]
+enabled = true
+interval = 100
+threshold = 0.7
+# Can differ from conversation model
+compression_model = "auto"
+
+# === SUBAGENT (Fork/Spawn) ===
+[subagent]
+enabled = true
+max_concurrent = 3
+timeout = 300
+
+# === COMPACTION ===
+[compaction]
+enabled = true
+strategy = "cull"
+# Pressure thresholds for tiered warnings:
+#   tier 1 (80%)  — advisory notice, no body change
+#   tier 2 (90%)  — stronger advisory, no body change
+#   tier 3 (95%)  — body shifts: max_tokens collapses, reasoning budget shrinks
+warn_pressure = 0.80
+urgent_pressure = 0.90
+critical_pressure = 0.95
+
+# Available strategies (cheapest first):
+#   cull           — free, no LLM. Drops greetings & acknowledgments.
+#                    Never drops system/tool messages or tool-call carriers.
+#   microcompact   — free, no LLM. Replaces old tool-result content with
+#                    placeholders; keeps recent results intact.
+#   sliding_window — free, no LLM. Keeps first (system/anchor) message +
+#                    the last N messages. Drops the middle. Tool-pair aware.
+#   summary        — expensive (LLM call). Compresses oldest messages into
+#                    a single structured summary block.
+
+# Per-agent-type overrides — each type compacts differently
+# because their context shapes differ.
+
+[compaction.per_type.primary]
+# Ani — prose, episodic, narrative
+strategy = "sliding_window"
+preserve_recent = 20
+
+[compaction.per_type.subconscious]
+# Aster — terse, analytical, ledger-focused
+strategy = "sliding_window"
+preserve_recent = 4
+
+[compaction.per_type.subagent]
+# Vanguard / ephemeral — task-scoped, fast
+strategy = "cull"
+preserve_recent = 2
+
+# === MEMORY ===
+[memory]
+git_enabled = true
+auto_commit = true
+# base_path = "~/.souveraine/agents"
+
+# === WEBSOCKET SERVER ===
+[websocket]
+enabled = false
+port = 7373
+
+# === SENSORIUM ===
+[sensorium]
+primary_bandwidth = "high"
+
+[sensorium.discovery]
+low_urgency_only = true
+minimal_presence_mode = "breathing_color"
+
+# === AGENT (TOP-LEVEL) ===
+[agent]
+# Platform prompt — injected at the very top of the system prompt, before the
+# agent's own identity files. Operator-level context she reads but did not write.
+# Leave commented to use no platform prompt (agent's memory files speak for themselves).
+# system_prompt = """
+# You are running on the Souveraine substrate. Your memory is git-backed.
+# Your identity, covenant, and all system/ files are loaded at wakeup.
+# """
+
+# === TUI ===
+[tui]
+# Seconds without a backend event before the turn is declared stalled and reset.
+# Increase if your model needs longer for inference (e.g. after reading many large files).
+# Default: 90
+# stale_timeout_secs = 90

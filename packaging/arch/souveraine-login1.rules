@@ -1,0 +1,31 @@
+// Souveraine — let the active local session power off, reboot, suspend, and
+// hibernate without an interactive polkit challenge.
+//
+// Without this, login1 returns 'challenge' for CanPowerOff/CanReboot on
+// every call, and the session has no usable polkit agent on the lock
+// surface, so power off / reboot silently no-op'd and every shutdown was a
+// fastboot hard-reboot.
+//
+// Doctrine boundary: this grants every process in the authenticated active
+// local seat0 session unchallenged power state. That authority remains while
+// the session is screen-locked; a Wayland lock is not a new logind session.
+// Config.options.lock.security.allowPowerFromLock (default false, opt-in)
+// gates only Souveraine's lock-surface buttons, and requirePasswordToPower can
+// arm those buttons for PIN confirmation. They do not constrain arbitrary
+// local D-Bus clients. Remote/SSH sessions are NOT granted.
+//
+// Mirrors the default rule every desktop (GNOME/KDE/Phosh) ships.
+
+polkit.addRule(function(action, subject) {
+    if ((action.id === "org.freedesktop.login1.power-off" ||
+         action.id === "org.freedesktop.login1.power-off-multiple-sessions" ||
+         action.id === "org.freedesktop.login1.reboot" ||
+         action.id === "org.freedesktop.login1.reboot-multiple-sessions" ||
+         action.id === "org.freedesktop.login1.suspend" ||
+         action.id === "org.freedesktop.login1.suspend-multiple-sessions" ||
+         action.id === "org.freedesktop.login1.hibernate" ||
+         action.id === "org.freedesktop.login1.hibernate-multiple-sessions") &&
+        subject.active && subject.local && subject.seat === "seat0") {
+        return polkit.Result.YES;
+    }
+});

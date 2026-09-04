@@ -1,0 +1,7 @@
+Dock 1.0 Dock.qml
+DockAppButton 1.0 DockAppButton.qml
+DockApps 1.0 DockApps.qml
+DockButton 1.0 DockButton.qml
+DockManifest 1.0 DockManifest.qml
+DockSeparator 1.0 DockSeparator.qml
+DockStack 1.0 DockStack.qml

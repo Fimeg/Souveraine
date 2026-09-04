@@ -1,0 +1,14 @@
+#!/bin/bash
+# ponytail: cross pkg-config wrapper for aarch64-unknown-linux-gnu.
+# cargo's [env] block doesn't reliably reach build-script pkg-config probes,
+# so alsa-sys's built-in cross guard trips. This wrapper sets the vars itself
+# and is referenced via PKG_CONFIG in .cargo/config.toml — every pkg-config
+# probe in the tree (alsa-sys today, any future -sys crate) goes through it.
+SYSROOT="${SOUVERAINE_AARCH64_SYSROOT:-/usr/aarch64-linux-gnu}"
+export PKG_CONFIG_ALLOW_CROSS=1
+# Both dirs: udev.pc (and other systemd-shipped .pc files) live in
+# share/pkgconfig, not lib/pkgconfig. This wrapper OVERRIDES whatever the
+# caller exported, so widening it here is the only fix that takes effect.
+export PKG_CONFIG_LIBDIR="$SYSROOT/usr/lib/pkgconfig:$SYSROOT/usr/share/pkgconfig"
+export PKG_CONFIG_SYSROOT_DIR="$SYSROOT"
+exec /usr/bin/pkg-config "$@"

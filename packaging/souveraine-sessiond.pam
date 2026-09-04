@@ -1,0 +1,5 @@
+# souveraine-sessiond fallback unlock surface.
+# Same stack as console login (the shell's own lock uses quickshell's
+# default "login" service) — the fallback must accept exactly the
+# credentials the real lockscreen accepts, no more, no less.
+auth	include		login
